@@ -1,0 +1,198 @@
+= CDI Lifecycle Events
+
+include::./includes/attributes.adoc[]
+
+The extension fires CDI events at each TUS upload lifecycle point. Your application can observe these events to integrate upload processing into your business logic -- virus scanning, thumbnail generation, database persistence, notifications, and more.
+
+== Event Types
+
+All events are Java records in the `org.sitenetsoft.quarkus.tus.runtime.event` package.
+
+=== TusUploadCreatedEvent
+
+Fired when a new upload is created via POST.
+
+[cols="1,1,2"]
+|===
+| Field | Type | Description
+
+| `uploadId`
+| `String`
+| UUID of the created upload
+
+| `totalSize`
+| `long`
+| Declared upload size in bytes (-1 if deferred)
+
+| `deferredLength`
+| `boolean`
+| Whether the upload size is deferred
+
+| `partial`
+| `boolean`
+| Whether this is a partial upload (for concatenation)
+
+| `metadata`
+| `String`
+| Raw `Upload-Metadata` header value (Base64-encoded key-value pairs), or null
+|===
+
+=== TusChunkReceivedEvent
+
+Fired after each successful PATCH writes a chunk of data.
+
+[cols="1,1,2"]
+|===
+| Field | Type | Description
+
+| `uploadId`
+| `String`
+| UUID of the upload
+
+| `chunkSize`
+| `long`
+| Size of the received chunk in bytes
+
+| `newOffset`
+| `long`
+| New upload offset after writing the chunk
+
+| `totalSize`
+| `long`
+| Declared total upload size in bytes
+|===
+
+=== TusUploadCompletedEvent
+
+Fired when an upload is fully received (offset equals total size).
+
+[cols="1,1,2"]
+|===
+| Field | Type | Description
+
+| `uploadId`
+| `String`
+| UUID of the completed upload
+
+| `totalSize`
+| `long`
+| Total upload size in bytes
+
+| `metadata`
+| `String`
+| Raw `Upload-Metadata` header value, or null
+
+| `uploaderId`
+| `String`
+| Authenticated user ID who created the upload, or null
+|===
+
+=== TusUploadTerminatedEvent
+
+Fired when an upload is deleted via DELETE.
+
+[cols="1,1,2"]
+|===
+| Field | Type | Description
+
+| `uploadId`
+| `String`
+| UUID of the terminated upload
+|===
+
+=== TusConcatenationCompletedEvent
+
+Fired when a final concatenation merges partial uploads.
+
+[cols="1,1,2"]
+|===
+| Field | Type | Description
+
+| `finalUploadId`
+| `String`
+| UUID of the merged final upload
+
+| `partialUploadIds`
+| `String[]`
+| UUIDs of the partial uploads that were merged
+
+| `totalSize`
+| `long`
+| Total size of the merged upload in bytes
+
+| `metadata`
+| `String`
+| Raw `Upload-Metadata` header value, or null
+
+| `uploaderId`
+| `String`
+| Authenticated user ID, or null
+|===
+
+== Observing Events
+
+Use standard CDI `@Observes` to handle events:
+
+[source,java]
+----
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
+import org.sitenetsoft.quarkus.tus.runtime.event.*;
+
+@ApplicationScoped
+public class UploadProcessor {
+
+    void onCompleted(@Observes TusUploadCompletedEvent event) {
+        // Trigger virus scan
+        scanService.scanAsync(event.uploadId());
+    }
+
+    void onTerminated(@Observes TusUploadTerminatedEvent event) {
+        // Clean up any related database records
+        uploadRepository.deleteByUploadId(event.uploadId());
+    }
+}
+----
+
+=== Asynchronous Observation
+
+For long-running processing, use `@ObservesAsync` to avoid blocking the HTTP response:
+
+[source,java]
+----
+import jakarta.enterprise.event.ObservesAsync;
+
+@ApplicationScoped
+public class AsyncUploadProcessor {
+
+    void onCompleted(@ObservesAsync TusUploadCompletedEvent event) {
+        // This runs in a separate thread, doesn't block the HTTP response
+        thumbnailService.generate(event.uploadId());
+    }
+}
+----
+
+NOTE: When using `@ObservesAsync`, the event must be fired with `event.fireAsync()`. The extension fires events synchronously by default. To use async observation, you can create a synchronous observer that re-fires the event asynchronously.
+
+== Parsing Upload Metadata
+
+The `metadata` field in events contains the raw `Upload-Metadata` header value. TUS metadata is formatted as comma-separated key-value pairs where values are Base64-encoded:
+
+[source]
+----
+filename dGVzdC50eHQ=,filetype dGV4dC9wbGFpbg==
+----
+
+Use `TusUtils.parseMetadata()` to decode it:
+
+[source,java]
+----
+import org.sitenetsoft.quarkus.tus.runtime.TusUtils;
+import java.util.Map;
+
+void onCreated(@Observes TusUploadCreatedEvent event) {
+    Map<String, String> metadata = TusUtils.parseMetadata(event.metadata());
+    String filename = metadata.get("filename");  // "test.txt"
+    String filetype = metadata.get("filetype");  // "text/plain"
+}
+----

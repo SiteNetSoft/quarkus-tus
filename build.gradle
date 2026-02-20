@@ -1,0 +1,27 @@
+allprojects {
+    group = 'org.sitenetsoft'
+    version = '1.0.0-SNAPSHOT'
+
+    repositories {
+        mavenCentral()
+        mavenLocal()
+    }
+}
+
+subprojects {
+    apply plugin: 'java'
+
+    java {
+        sourceCompatibility = JavaVersion.VERSION_25
+        targetCompatibility = JavaVersion.VERSION_25
+    }
+
+    compileJava {
+        options.encoding = 'UTF-8'
+        options.compilerArgs << '-parameters'
+    }
+
+    compileTestJava {
+        options.encoding = 'UTF-8'
+    }
+}

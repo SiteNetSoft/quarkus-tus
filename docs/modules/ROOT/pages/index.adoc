@@ -1,0 +1,169 @@
+= Quarkus TUS
+
+include::./includes/attributes.adoc[]
+
+A Quarkus extension implementing the https://tus.io/protocols/resumable-upload[TUS resumable upload protocol] (v1.0.0). TUS is an open protocol for resumable file uploads, allowing interrupted uploads to be resumed without re-uploading the entire file.
+
+== Supported TUS Extensions
+
+[cols="1,3"]
+|===
+| Extension | Description
+
+| `creation`
+| Create new uploads via POST
+
+| `termination`
+| Delete incomplete uploads via DELETE
+
+| `checksum`
+| Validate data integrity with SHA-1, MD5, or SHA-256
+
+| `expiration`
+| Automatic cleanup of incomplete uploads after a configurable period
+
+| `concatenation`
+| Merge multiple partial uploads into a single final upload
+
+| `creation-with-upload`
+| Upload data inline with the creation POST request
+
+| `creation-defer-length`
+| Defer declaring the upload size until the first PATCH
+|===
+
+== Prerequisites
+
+* Java 25+
+* Quarkus 3.31.4+
+
+== Installation
+
+Add the extension dependency to your project.
+
+=== Gradle
+
+[source,kotlin]
+----
+implementation("org.sitenetsoft:quarkus-tus:1.0.0-SNAPSHOT")
+----
+
+=== Maven
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.sitenetsoft</groupId>
+    <artifactId>quarkus-tus</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+</dependency>
+----
+
+== Quick Start
+
+Once added, the extension automatically registers TUS protocol endpoints at `/tus` (configurable via `quarkus.tus.path`).
+
+=== Verify the Extension is Active
+
+[source,bash]
+----
+curl -X OPTIONS http://localhost:8080/tus -i
+----
+
+Expected response:
+
+[source]
+----
+HTTP/1.1 204 No Content
+Tus-Resumable: 1.0.0
+Tus-Version: 1.0.0
+Tus-Max-Size: 107374182400
+Tus-Extension: creation,termination,checksum,expiration,concatenation,creation-with-upload,creation-defer-length
+Tus-Checksum-Algorithm: sha1,md5,sha256
+----
+
+=== Upload a File
+
+Create an upload:
+
+[source,bash]
+----
+curl -X POST http://localhost:8080/tus \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Length: 1048576" \
+  -H "Upload-Metadata: filename dGVzdC50eHQ=" \
+  -i
+----
+
+The response includes a `Location` header with the upload URL:
+
+[source]
+----
+HTTP/1.1 201 Created
+Location: /tus/550e8400-e29b-41d4-a716-446655440000
+Tus-Resumable: 1.0.0
+----
+
+Upload data in chunks:
+
+[source,bash]
+----
+curl -X PATCH http://localhost:8080/tus/550e8400-e29b-41d4-a716-446655440000 \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Offset: 0" \
+  -H "Content-Type: application/offset+octet-stream" \
+  --data-binary @chunk1.bin \
+  -i
+----
+
+Check upload progress:
+
+[source,bash]
+----
+curl -X HEAD http://localhost:8080/tus/550e8400-e29b-41d4-a716-446655440000 \
+  -H "Tus-Resumable: 1.0.0" \
+  -i
+----
+
+=== React to Upload Events
+
+The extension fires CDI events at each lifecycle point. Observe them in your application code:
+
+[source,java]
+----
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
+import org.sitenetsoft.quarkus.tus.runtime.event.*;
+
+@ApplicationScoped
+public class UploadEventHandler {
+
+    void onCreated(@Observes TusUploadCreatedEvent event) {
+        Log.infof("Upload started: %s (%d bytes)", event.uploadId(), event.totalSize());
+    }
+
+    void onChunk(@Observes TusChunkReceivedEvent event) {
+        Log.infof("Chunk received for %s: %d bytes, offset now %d/%d",
+                event.uploadId(), event.chunkSize(), event.newOffset(), event.totalSize());
+    }
+
+    void onCompleted(@Observes TusUploadCompletedEvent event) {
+        Log.infof("Upload complete: %s (%d bytes)", event.uploadId(), event.totalSize());
+        // Trigger post-processing: virus scan, thumbnail generation, etc.
+    }
+
+    void onTerminated(@Observes TusUploadTerminatedEvent event) {
+        Log.infof("Upload terminated: %s", event.uploadId());
+    }
+}
+----
+
+See xref:cdi-events.adoc[CDI Lifecycle Events] for the full event reference.
+
+== What's Next?
+
+* xref:configuration.adoc[Configuration Reference] -- all available configuration properties
+* xref:cdi-events.adoc[CDI Lifecycle Events] -- integrate upload events into your application
+* xref:storage-spi.adoc[Custom Storage Backends] -- implement your own storage (S3, database, etc.)
+* xref:sse.adoc[SSE Upload Progress] -- real-time progress streaming to clients
+* xref:authentication.adoc[Authentication] -- protect upload endpoints

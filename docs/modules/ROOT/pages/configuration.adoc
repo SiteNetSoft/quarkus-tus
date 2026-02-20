@@ -1,0 +1,108 @@
+= Configuration Reference
+
+include::./includes/attributes.adoc[]
+
+All configuration properties are under the `quarkus.tus` prefix.
+
+== Build Time Properties
+
+Build time properties are fixed at application build and cannot be changed at runtime.
+
+[cols="3,1,1,3"]
+|===
+| Property | Type | Default | Description
+
+| `quarkus.tus.sse-enabled`
+| `boolean`
+| `true`
+| Whether SSE (Server-Sent Events) endpoints and beans are registered. When disabled, the `/tus/events/\{uploadId}` and `/tus/progress/\{uploadId}` endpoints are not available.
+
+| `quarkus.tus.auth-enabled`
+| `boolean`
+| `false`
+| Whether the authentication filter is registered. When enabled, all TUS endpoints (except OPTIONS) require an authenticated user principal.
+
+| `quarkus.tus.path`
+| `String`
+| `/tus`
+| URL path prefix for all TUS endpoints.
+|===
+
+== Runtime Properties
+
+Runtime properties can be overridden at startup via `application.properties`, environment variables, or system properties.
+
+[cols="3,1,1,3"]
+|===
+| Property | Type | Default | Description
+
+| `quarkus.tus.version`
+| `String`
+| `1.0.0`
+| TUS protocol version reported in `Tus-Resumable` and `Tus-Version` response headers.
+
+| `quarkus.tus.max-size`
+| `long`
+| `107374182400` (100 GB)
+| Maximum upload size in bytes. Reported in the `Tus-Max-Size` header. Uploads exceeding this size are rejected with 413.
+
+| `quarkus.tus.extensions`
+| `String`
+| `creation,termination,checksum,expiration,concatenation,creation-with-upload,creation-defer-length`
+| Comma-separated list of active TUS protocol extensions. Reported in the `Tus-Extension` header.
+
+| `quarkus.tus.expiration-hours`
+| `long`
+| `24`
+| Hours before an incomplete upload expires. Expired uploads are automatically cleaned up by the expiration scheduler (runs hourly).
+
+| `quarkus.tus.checksum-algorithms`
+| `String`
+| `sha1,md5,sha256`
+| Comma-separated list of supported checksum algorithms. Reported in the `Tus-Checksum-Algorithm` header.
+
+| `quarkus.tus.store.local.upload-dir`
+| `String`
+| `${java.io.tmpdir}/quarkus-tus-uploads`
+| Directory where the default local file store writes upload data. Created automatically if it does not exist.
+
+| `quarkus.tus.max-chunk-size`
+| `long`
+| `10485760` (10 MB)
+| Maximum chunk size per PATCH request in bytes.
+|===
+
+== Environment Variable Mapping
+
+Quarkus maps configuration properties to environment variables using the standard convention. Replace dots with underscores and convert to uppercase:
+
+[source,bash]
+----
+export QUARKUS_TUS_MAX_SIZE=1073741824
+export QUARKUS_TUS_STORE_LOCAL_UPLOAD_DIR=/var/uploads
+export QUARKUS_TUS_EXPIRATION_HOURS=48
+----
+
+== Example Configuration
+
+.application.properties
+[source,properties]
+----
+# Limit uploads to 1 GB
+quarkus.tus.max-size=1073741824
+
+# Store uploads in a dedicated directory
+quarkus.tus.store.local.upload-dir=/var/data/uploads
+
+# Expire incomplete uploads after 12 hours
+quarkus.tus.expiration-hours=12
+
+# Only support creation and termination extensions
+quarkus.tus.extensions=creation,termination
+
+# Disable SSE progress endpoints
+quarkus.tus.sse-enabled=false
+
+# Enable authentication
+quarkus.tus.auth-enabled=true
+----

@@ -1,0 +1,15 @@
+pluginManagement {
+    repositories {
+        mavenCentral()
+        gradlePluginPortal()
+        mavenLocal()
+    }
+    plugins {
+        id 'io.quarkus.extension' version "${quarkusPluginVersion}"
+        id 'io.quarkus' version "${quarkusPluginVersion}"
+    }
+}
+
+rootProject.name = 'quarkus-tus'
+
+include 'runtime', 'deployment', 'integration-tests'

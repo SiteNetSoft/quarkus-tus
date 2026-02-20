@@ -1,0 +1,2 @@
+:project-version: 1.0.0-SNAPSHOT
+:quarkus-version: 3.31.4
