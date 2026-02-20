@@ -1,0 +1,118 @@
+= SSE Upload Progress
+
+include::./includes/attributes.adoc[]
+
+The extension provides optional Server-Sent Events (SSE) endpoints for streaming real-time upload progress to clients. This is useful for building progress bars and upload status indicators in web applications.
+
+== Enabling SSE
+
+SSE is enabled by default. To disable it:
+
+[source,properties]
+----
+quarkus.tus.sse-enabled=false
+----
+
+When disabled, the SSE beans and endpoints are not registered at all (build-time decision).
+
+== SSE Endpoints
+
+=== Event Stream
+
+`GET /tus/events/{uploadId}`
+
+Opens an SSE connection for the given upload. The server sends a `connected` event immediately upon connection, followed by progress events as chunks are received.
+
+.Client-side JavaScript
+[source,javascript]
+----
+const uploadId = "550e8400-e29b-41d4-a716-446655440000";
+const eventSource = new EventSource(`/tus/events/${uploadId}`);
+
+eventSource.addEventListener("connected", (e) => {
+    console.log("Connected to upload stream");
+});
+
+eventSource.addEventListener("progress", (e) => {
+    const data = JSON.parse(e.data);
+    const percent = (data.bytesUploaded / data.totalBytes * 100).toFixed(1);
+    console.log(`Progress: ${percent}%`);
+});
+
+eventSource.addEventListener("complete", (e) => {
+    console.log("Upload complete!");
+    eventSource.close();
+});
+
+eventSource.addEventListener("error", (e) => {
+    console.log("Upload failed");
+    eventSource.close();
+});
+----
+
+=== Progress Snapshot
+
+`GET /tus/progress/{uploadId}`
+
+Returns the current upload progress as a JSON object (non-streaming, single response). Useful for polling-based clients.
+
+[source,bash]
+----
+curl http://localhost:8080/tus/progress/550e8400-e29b-41d4-a716-446655440000
+----
+
+.Response
+[source,json]
+----
+{
+    "uploadId": "550e8400-e29b-41d4-a716-446655440000",
+    "bytesUploaded": 524288,
+    "totalBytes": 1048576,
+    "percentComplete": 50.0,
+    "status": "uploading"
+}
+----
+
+== SSE Event Types
+
+[cols="1,2"]
+|===
+| Event | Description
+
+| `connected`
+| Sent immediately when the SSE connection is established
+
+| `progress`
+| Sent after each chunk is written; includes bytes uploaded, total bytes, and percentage
+
+| `complete`
+| Sent when the upload reaches 100%; the SSE connection closes after this event
+
+| `error`
+| Sent if an error occurs during the upload
+|===
+
+== Custom Events
+
+The `TusSseService` bean exposes a method for sending custom events to connected clients:
+
+[source,java]
+----
+@Inject
+TusSseService sseService;
+
+void notifyScanComplete(String uploadId) {
+    sseService.sendCustomEvent(uploadId, "scan-complete",
+            "{\"clean\": true, \"scanner\": \"clamav\"}");
+}
+----
+
+Clients can listen for custom events by name:
+
+[source,javascript]
+----
+eventSource.addEventListener("scan-complete", (e) => {
+    const result = JSON.parse(e.data);
+    console.log(`Scan result: ${result.clean ? "clean" : "infected"}`);
+});
+----

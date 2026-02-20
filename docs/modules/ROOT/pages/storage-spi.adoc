@@ -1,0 +1,125 @@
+= Custom Storage Backends
+
+include::./includes/attributes.adoc[]
+
+The extension ships with a local filesystem storage backend (`LocalFileUploadStore`). You can replace it with your own implementation (S3, database, distributed storage, etc.) via the `UploadStore` SPI.
+
+== The UploadStore Interface
+
+The `UploadStore` interface (`org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore`) defines all operations the TUS protocol requires:
+
+[source,java]
+----
+public interface UploadStore {
+
+    // Upload lifecycle
+    Optional<String> createUpload(Long totalLength, Optional<String> uploadMetadata, boolean isPartial);
+    Optional<String> createUploadDeferred(Optional<String> uploadMetadata, boolean isPartial);
+    Optional<UploadInfo> findUploadInfo(String id);
+    boolean discardUpload(String id);
+
+    // Data writing
+    Uni<Long> writeChunkAsync(String id, long offset, byte[] chunk, Optional<UploadInfo.ChecksumInfo> checksum);
+    long writeInitialData(String id, byte[] data);
+    boolean validateOffset(String id, long clientOffset);
+
+    // Deferred length
+    boolean setDeferredLength(String id, long length);
+    boolean hasDeferredLength(String id);
+
+    // Concatenation
+    Optional<String> mergePartialUploads(String[] ids, Optional<String> uploadMetadata);
+    Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata, String requiredOwnerId);
+    Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata);
+    boolean isConcatReady(String id);
+    boolean finalizeConcatenation(String id);
+
+    // Size constraints
+    boolean checkServerSizeConstraint(Long totalLength);
+
+    // Locking
+    boolean acquireLock(String id);
+    void releaseLock(String id);
+
+    // Ownership
+    void setUploaderId(String id, String uploaderId);
+    String getUploaderId(String id);
+
+    // Expiration
+    boolean isExpired(String id);
+    Optional<Instant> getExpiresAt(String id);
+    List<String> cleanupExpiredUploads();
+}
+----
+
+== Implementing a Custom Backend
+
+Create a CDI bean annotated with `@Alternative` and `@Priority` to override the default `LocalFileUploadStore`:
+
+[source,java]
+----
+import jakarta.annotation.Priority;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Alternative;
+import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
+
+@ApplicationScoped
+@Alternative
+@Priority(1)
+public class S3UploadStore implements UploadStore {
+
+    @Inject
+    S3Client s3;
+
+    @Override
+    public Optional<String> createUpload(Long totalLength, Optional<String> uploadMetadata, boolean isPartial) {
+        String uploadId = UUID.randomUUID().toString();
+        // Initialize multipart upload in S3
+        s3.createMultipartUpload(...);
+        // Return the location URL
+        return Optional.of("/tus/" + uploadId);
+    }
+
+    @Override
+    public Uni<Long> writeChunkAsync(String id, long offset, byte[] chunk,
+                                      Optional<UploadInfo.ChecksumInfo> checksum) {
+        return Uni.createFrom().item(() -> {
+            // Upload part to S3
+            s3.uploadPart(...);
+            return offset + chunk.length;
+        });
+    }
+
+    // ... implement remaining methods
+}
+----
+
+=== Key Implementation Notes
+
+writeChunkAsync:: Returns a `Uni<Long>` with the new offset after writing. Return `-1` if the upload was not found. Throw `LocalFileUploadStore.ChecksumMismatchException` if checksum validation fails (the extension handles the 460 response).
+
+createUpload / createUploadDeferred:: Must return the full location path (e.g., `/tus/{uploadId}`). The upload ID is extracted from the last path segment.
+
+acquireLock / releaseLock:: Must provide mutual exclusion for concurrent PATCH requests to the same upload. The default implementation uses `ConcurrentHashMap`-based locks.
+
+cleanupExpiredUploads:: Called hourly by the built-in `UploadExpirationScheduler`. Return the list of expired upload IDs that were cleaned up.
+
+== Default Local File Store
+
+The built-in `LocalFileUploadStore` stores upload data as files on disk:
+
+* Each upload gets a file named `{uploadId}.bin` in the configured directory
+* Upload metadata is kept in memory (`ConcurrentHashMap`)
+* Checksums are validated inline during write
+* Locks are in-memory (single-node only)
+
+Configure the storage directory:
+
+[source,properties]
+----
+quarkus.tus.store.local.upload-dir=/var/data/uploads
+----
+
+The directory is created automatically at startup if it does not exist.
+
+NOTE: The default local store is designed for single-node deployments. For clustered environments, implement a custom `UploadStore` with distributed locking (e.g., database-backed or Redis-backed).

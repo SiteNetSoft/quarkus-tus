@@ -1,0 +1,93 @@
+# Quarkus TUS
+
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+A [Quarkus](https://quarkus.io/) extension implementing the [TUS resumable upload protocol](https://tus.io/protocols/resumable-upload) (v1.0.0).
+
+## Features
+
+- Full TUS v1.0.0 protocol implementation (creation, termination, checksum, expiration, concatenation, creation-with-upload, creation-defer-length)
+- Pluggable storage backends via SPI (`UploadStore` interface)
+- CDI lifecycle events for upload created, chunk received, upload completed, upload terminated, and concatenation completed
+- Optional SSE (Server-Sent Events) for real-time upload progress
+- Optional authentication filter
+- Checksum validation (SHA-1, MD5, SHA-256)
+- Automatic expiration of incomplete uploads
+
+## Getting Started
+
+### Installation
+
+Add the extension to your Quarkus application:
+
+#### Gradle
+
+```kotlin
+implementation("org.sitenetsoft:quarkus-tus:1.0.0-SNAPSHOT")
+```
+
+#### Maven
+
+```xml
+<dependency>
+    <groupId>org.sitenetsoft</groupId>
+    <artifactId>quarkus-tus</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+### Minimal Configuration
+
+The extension works out of the box with sensible defaults. Add to `application.properties` to customize:
+
+```properties
+# Max upload size (default: 100 GB)
+quarkus.tus.max-size=1073741824
+
+# Upload storage directory (default: ${java.io.tmpdir}/quarkus-tus-uploads)
+quarkus.tus.store.local.upload-dir=/var/uploads
+
+# Expiration for incomplete uploads in hours (default: 24)
+quarkus.tus.expiration-hours=48
+```
+
+### Quick Example: Observing Upload Events
+
+```java
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
+import org.sitenetsoft.quarkus.tus.runtime.event.*;
+
+@ApplicationScoped
+public class UploadEventHandler {
+
+    void onCreated(@Observes TusUploadCreatedEvent event) {
+        Log.infof("Upload started: %s (%d bytes)", event.uploadId(), event.totalSize());
+    }
+
+    void onCompleted(@Observes TusUploadCompletedEvent event) {
+        Log.infof("Upload finished: %s", event.uploadId());
+        // Process the completed file...
+    }
+}
+```
+
+## Documentation
+
+Read the [full documentation](docs/modules/ROOT/pages/index.adoc) for detailed guides on:
+
+- [Configuration Reference](docs/modules/ROOT/pages/configuration.adoc)
+- [CDI Lifecycle Events](docs/modules/ROOT/pages/cdi-events.adoc)
+- [Custom Storage Backends](docs/modules/ROOT/pages/storage-spi.adoc)
+- [SSE Upload Progress](docs/modules/ROOT/pages/sse.adoc)
+- [Authentication](docs/modules/ROOT/pages/authentication.adoc)
+
+## Compatibility
+
+| Extension Version | Quarkus Version | Java Version |
+|---|---|---|
+| 1.0.0-SNAPSHOT | 3.31.4 | 25 |
+
+## License
+
+This project is licensed under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).

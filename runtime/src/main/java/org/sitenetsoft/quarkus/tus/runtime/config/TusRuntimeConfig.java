@@ -1,0 +1,67 @@
+package org.sitenetsoft.quarkus.tus.runtime.config;
+
+import io.quarkus.runtime.annotations.ConfigPhase;
+import io.quarkus.runtime.annotations.ConfigRoot;
+import io.smallrye.config.ConfigMapping;
+import io.smallrye.config.WithDefault;
+
+@ConfigMapping(prefix = "quarkus.tus")
+@ConfigRoot(phase = ConfigPhase.RUN_TIME)
+public interface TusRuntimeConfig {
+
+    /**
+     * TUS protocol version.
+     */
+    @WithDefault("1.0.0")
+    String version();
+
+    /**
+     * Maximum upload size in bytes.
+     */
+    @WithDefault("107374182400")
+    long maxSize();
+
+    /**
+     * Active TUS protocol extensions (comma-separated).
+     */
+    @WithDefault("creation,termination,checksum,expiration,concatenation,creation-with-upload,creation-defer-length")
+    String extensions();
+
+    /**
+     * Hours before an incomplete upload expires.
+     */
+    @WithDefault("24")
+    long expirationHours();
+
+    /**
+     * Supported checksum algorithms (comma-separated).
+     */
+    @WithDefault("sha1,md5,sha256")
+    String checksumAlgorithms();
+
+    /**
+     * Local store configuration.
+     */
+    StoreConfig store();
+
+    /**
+     * Maximum chunk size per PATCH request in bytes.
+     */
+    @WithDefault("10485760")
+    long maxChunkSize();
+
+    interface StoreConfig {
+        /**
+         * Local file store configuration.
+         */
+        LocalConfig local();
+
+        interface LocalConfig {
+            /**
+             * Directory for upload storage.
+             */
+            @WithDefault("${java.io.tmpdir}/quarkus-tus-uploads")
+            String uploadDir();
+        }
+    }
+}

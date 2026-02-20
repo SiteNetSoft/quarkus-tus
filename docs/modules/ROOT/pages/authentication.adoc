@@ -1,0 +1,94 @@
+= Authentication
+
+include::./includes/attributes.adoc[]
+
+The extension includes an optional authentication filter that protects TUS endpoints. When enabled, all requests (except OPTIONS, which is used for TUS capability discovery) require an authenticated user principal.
+
+== Enabling Authentication
+
+[source,properties]
+----
+quarkus.tus.auth-enabled=true
+----
+
+This is a build-time property. The filter is only registered when enabled.
+
+== How It Works
+
+The `TusAuthFilter` is a JAX-RS `ContainerRequestFilter` that checks `SecurityContext.getUserPrincipal()` on every request to TUS endpoints:
+
+* If a user principal is present, the request proceeds normally
+* If no principal is present, the filter responds with `401 Unauthorized`
+* OPTIONS requests are always allowed through (TUS protocol discovery must be accessible without authentication)
+
+== Integration with Quarkus Security
+
+The TUS auth filter relies on the standard Jakarta Security `SecurityContext`. It works with any Quarkus security extension that populates the security context:
+
+=== OpenID Connect (OIDC)
+
+[source,properties]
+----
+quarkus.tus.auth-enabled=true
+
+quarkus.oidc.auth-server-url=https://your-idp.example.com/realms/your-realm
+quarkus.oidc.client-id=your-client
+quarkus.oidc.credentials.secret=your-secret
+----
+
+=== HTTP Basic Authentication
+
+[source,properties]
+----
+quarkus.tus.auth-enabled=true
+
+quarkus.security.users.embedded.enabled=true
+quarkus.security.users.embedded.plain-text=true
+quarkus.security.users.embedded.users.admin=admin123
+quarkus.security.users.embedded.roles.admin=upload
+----
+
+=== JWT
+
+[source,properties]
+----
+quarkus.tus.auth-enabled=true
+
+mp.jwt.verify.publickey.location=publicKey.pem
+mp.jwt.verify.issuer=https://your-issuer.example.com
+----
+
+== Upload Ownership
+
+When authentication is enabled, the extension automatically records the authenticated user ID (from `SecurityContext.getUserPrincipal().getName()`) on each upload. This value is:
+
+* Available in `TusUploadCompletedEvent.uploaderId()` and `TusConcatenationCompletedEvent.uploaderId()`
+* Used by the concatenation endpoint to verify that all partial uploads belong to the same user
+* Accessible via `UploadStore.getUploaderId(uploadId)`
+
+== Custom Authentication
+
+If the built-in filter doesn't meet your needs (e.g., you need role-based access, per-upload authorization, or API key authentication), you can:
+
+1. Keep `quarkus.tus.auth-enabled=false`
+2. Implement your own `ContainerRequestFilter` targeting the TUS path:
+
+[source,java]
+----
+import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.container.ContainerRequestFilter;
+import jakarta.ws.rs.ext.Provider;
+import jakarta.ws.rs.NameBinding;
+
+@Provider
+public class CustomTusAuthFilter implements ContainerRequestFilter {
+
+    @Override
+    public void filter(ContainerRequestContext ctx) {
+        String apiKey = ctx.getHeaderString("X-API-Key");
+        if (apiKey == null || !isValidKey(apiKey)) {
+            ctx.abortWith(Response.status(401).build());
+        }
+    }
+}
+----
