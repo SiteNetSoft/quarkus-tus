@@ -21,7 +21,7 @@ When disabled, the SSE beans and endpoints are not registered at all (build-time
 
 `GET /tus/events/{uploadId}`
 
-Opens an SSE connection for the given upload. The server sends a `connected` event immediately upon connection, followed by progress events as chunks are received.
+Opens a persistent SSE connection for the given upload. The server sends a `connected` event immediately upon connection, followed by progress events as chunks are received. The connection stays open until the upload completes or the client disconnects.
 
 .Client-side JavaScript
 [source,javascript]
@@ -50,11 +50,11 @@ eventSource.addEventListener("error", (e) => {
 });
 ----
 
-=== Progress Snapshot
+=== Progress Stream
 
 `GET /tus/progress/{uploadId}`
 
-Returns the current upload progress as a JSON object (non-streaming, single response). Useful for polling-based clients.
+Opens an SSE connection that streams `upload-progress` events as chunks are written. Unlike the event stream above, this endpoint is focused specifically on progress data and delivers structured JSON payloads suitable for progress bars.
 
 [source,bash]
 ----

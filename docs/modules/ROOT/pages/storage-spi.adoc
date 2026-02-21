@@ -28,7 +28,6 @@ public interface UploadStore {
     boolean hasDeferredLength(String id);
 
     // Concatenation
-    Optional<String> mergePartialUploads(String[] ids, Optional<String> uploadMetadata);
     Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata, String requiredOwnerId);
     Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata);
     boolean isConcatReady(String id);
@@ -54,7 +53,7 @@ public interface UploadStore {
 
 == Implementing a Custom Backend
 
-Create a CDI bean annotated with `@Alternative` and `@Priority` to override the default `LocalFileUploadStore`:
+Create a CDI bean annotated with `@Alternative` and `@Priority` to override the default `LocalFileUploadStore`. The `@Priority` annotation globally enables the alternative -- use it for production replacements. For test-only alternatives, omit `@Priority` and enable via `QuarkusTestProfile.getEnabledAlternatives()` instead (see xref:testing.adoc[Testing]).
 
 [source,java]
 ----
@@ -96,7 +95,7 @@ public class S3UploadStore implements UploadStore {
 
 === Key Implementation Notes
 
-writeChunkAsync:: Returns a `Uni<Long>` with the new offset after writing. Return `-1` if the upload was not found. Throw `LocalFileUploadStore.ChecksumMismatchException` if checksum validation fails (the extension handles the 460 response).
+writeChunkAsync:: Returns a `Uni<Long>` with the new offset after writing. Return `-1` if the upload was not found. Throw `LocalFileUploadStore.ChecksumMismatchException` if checksum validation fails (the extension handles the 460 response). *Important:* Your implementation must fire `TusUploadCompletedEvent` when the upload is complete (i.e., `newOffset == entityLength`). Inject `Event<TusUploadCompletedEvent>` and fire it after updating the offset. See `LocalFileUploadStore` for the reference implementation.
 
 createUpload / createUploadDeferred:: Must return the full location path (e.g., `/tus/{uploadId}`). The upload ID is extracted from the last path segment.
 
@@ -108,7 +107,7 @@ cleanupExpiredUploads:: Called hourly by the built-in `UploadExpirationScheduler
 
 The built-in `LocalFileUploadStore` stores upload data as files on disk:
 
-* Each upload gets a file named `{uploadId}.bin` in the configured directory
+* Each upload gets a file named `{uploadId}` in the configured directory
 * Upload metadata is kept in memory (`ConcurrentHashMap`)
 * Checksums are validated inline during write
 * Locks are in-memory (single-node only)

@@ -1,0 +1,236 @@
+= Testing
+
+include::./includes/attributes.adoc[]
+
+This guide covers testing strategies for applications that use the Quarkus TUS extension.
+
+== @QuarkusTest (Dev Mode)
+
+`@QuarkusTest` starts your application in dev mode and allows full CDI injection. This is the primary way to test TUS upload behavior including CDI event observation.
+
+=== Basic Test Setup
+
+[source,java]
+----
+import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.Test;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.CoreMatchers.notNullValue;
+
+@QuarkusTest
+class MyTusTest {
+
+    @Test
+    void testCreateUpload() {
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", "1024")
+                .when().post("/tus")
+                .then()
+                .statusCode(201)
+                .header("Location", notNullValue());
+    }
+}
+----
+
+=== Observing CDI Events in Tests
+
+Create a test observer bean to capture CDI events fired during uploads:
+
+[source,java]
+----
+import io.quarkus.arc.Unremovable;
+import jakarta.enterprise.event.Observes;
+import jakarta.inject.Singleton;
+import org.sitenetsoft.quarkus.tus.runtime.event.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+@Singleton
+@Unremovable
+public class TusTestObserver {
+
+    public final CopyOnWriteArrayList<TusUploadCreatedEvent> createdEvents = new CopyOnWriteArrayList<>();
+    public final CopyOnWriteArrayList<TusUploadCompletedEvent> completedEvents = new CopyOnWriteArrayList<>();
+
+    public void onCreated(@Observes TusUploadCreatedEvent event) {
+        createdEvents.add(event);
+    }
+
+    public void onCompleted(@Observes TusUploadCompletedEvent event) {
+        completedEvents.add(event);
+    }
+
+    public void reset() {
+        createdEvents.clear();
+        completedEvents.clear();
+    }
+}
+----
+
+Then inject and assert on it in your test:
+
+[source,java]
+----
+@QuarkusTest
+class MyTusEventTest {
+
+    @Inject
+    TusTestObserver observer;
+
+    @BeforeEach
+    void setUp() {
+        observer.reset();
+    }
+
+    @Test
+    void testCompletedEventFired() {
+        byte[] data = "test".getBytes();
+        String location = given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", String.valueOf(data.length))
+                .when().post("/tus")
+                .then().statusCode(201)
+                .extract().header("Location");
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then().statusCode(204);
+
+        assertFalse(observer.completedEvents.isEmpty());
+    }
+}
+----
+
+TIP: Use `@Singleton` (not `@ApplicationScoped`) for test observers to avoid CDI client proxy issues when reading fields directly.
+
+=== @TestProfile for Configuration Overrides
+
+Use `@TestProfile` to override build-time or runtime configuration for specific test classes:
+
+[source,java]
+----
+import io.quarkus.test.junit.QuarkusTestProfile;
+import java.util.Map;
+
+public class AuthEnabledProfile implements QuarkusTestProfile {
+    @Override
+    public Map<String, String> getConfigOverrides() {
+        return Map.of("quarkus.tus.auth-enabled", "true");
+    }
+}
+----
+
+[source,java]
+----
+@QuarkusTest
+@TestProfile(AuthEnabledProfile.class)
+class TusAuthTest {
+    // Tests run with authentication enabled
+}
+----
+
+== Custom UploadStore in Tests
+
+To test a custom `UploadStore` implementation, use `@Alternative @Priority(1)` with `getEnabledAlternatives()` in a test profile:
+
+[source,java]
+----
+@ApplicationScoped
+@Alternative
+public class InMemoryUploadStore implements UploadStore {
+    // Full implementation backed by ConcurrentHashMap
+}
+----
+
+[source,java]
+----
+public class CustomStoreProfile implements QuarkusTestProfile {
+    @Override
+    public Set<Class<?>> getEnabledAlternatives() {
+        return Set.of(InMemoryUploadStore.class);
+    }
+}
+----
+
+[source,java]
+----
+@QuarkusTest
+@TestProfile(CustomStoreProfile.class)
+class TusCustomStoreTest {
+
+    @Inject
+    UploadStore uploadStore;
+
+    @Test
+    void testInjectedStoreIsInMemory() {
+        assertInstanceOf(InMemoryUploadStore.class, uploadStore);
+    }
+}
+----
+
+IMPORTANT: Your custom `UploadStore.writeChunkAsync()` must fire `TusUploadCompletedEvent` when the upload completes (`newOffset == entityLength`). Without this, the `TusUploadCompletedEvent` CDI event will not be fired.
+
+== @QuarkusIntegrationTest (Packaged JAR)
+
+`@QuarkusIntegrationTest` tests your extension against the *packaged* application JAR -- the same artifact you'd deploy to production. Unlike `@QuarkusTest`, CDI injection is not available; only HTTP-based tests work.
+
+=== Setting Up IT Tests
+
+Create test base classes with HTTP-only test methods, then extend them for both modes:
+
+[source,java]
+----
+// Base class — no @QuarkusTest, no @Inject
+abstract class TusUploadTestBase {
+
+    @Test
+    void testOptions() {
+        given().when().options("/tus")
+                .then().statusCode(204)
+                .header("Tus-Resumable", notNullValue());
+    }
+
+    // ... more HTTP-only tests
+}
+
+// Dev mode
+@QuarkusTest
+class TusUploadTest extends TusUploadTestBase {
+    // Add injection-dependent tests here
+}
+
+// Packaged JAR
+@QuarkusIntegrationTest
+class TusUploadIT extends TusUploadTestBase {
+    // Inherits all HTTP-only tests
+}
+----
+
+=== Running IT Tests
+
+The project provides dedicated Gradle tasks:
+
+[source,bash]
+----
+# Run @QuarkusIntegrationTest tests against the packaged JAR
+JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 ./gradlew :integration-tests:integrationTest
+----
+
+NOTE: `@QuarkusIntegrationTest` classes cannot use `@TestProfile` — they run against the packaged app with its built-in configuration.
+
+== Native Image Testing
+
+The same `@QuarkusIntegrationTest` classes can test a GraalVM native binary. No code changes are needed — just set the `quarkus.native.enabled` system property:
+
+[source,bash]
+----
+# Requires GraalVM or Mandrel installed
+JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 ./gradlew :integration-tests:nativeIntegrationTest
+----
+
+This builds a native binary and runs all `*IT` test classes against it.

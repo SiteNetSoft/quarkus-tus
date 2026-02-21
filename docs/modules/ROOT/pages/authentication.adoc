@@ -11,7 +11,7 @@ The extension includes an optional authentication filter that protects TUS endpo
 quarkus.tus.auth-enabled=true
 ----
 
-This is a build-time property. The filter is only registered when enabled.
+This is a build-time property. Note that the `TusAuthFilter` class is auto-discovered by Jandex regardless of this setting. When `auth-enabled` is `false`, the filter checks the config at runtime and short-circuits (passes all requests through).
 
 == How It Works
 

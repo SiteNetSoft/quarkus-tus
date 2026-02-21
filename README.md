@@ -51,6 +51,18 @@ quarkus.tus.store.local.upload-dir=/var/uploads
 quarkus.tus.expiration-hours=48
 ```
 
+### TUS Endpoints
+
+The extension registers the following endpoints at the configured path (default `/tus`):
+
+| Method | Path | Description |
+|---|---|---|
+| `OPTIONS` | `/tus` | TUS capability discovery (protocol version, extensions, max size, checksum algorithms) |
+| `POST` | `/tus` | Create a new upload (supports creation-with-upload and concatenation) |
+| `HEAD` | `/tus/{id}` | Query upload status (offset, length, expiration) |
+| `PATCH` | `/tus/{id}` | Upload a chunk of data (resumable) |
+| `DELETE` | `/tus/{id}` | Terminate and delete an upload |
+
 ### Quick Example: Observing Upload Events
 
 ```java
@@ -72,6 +84,21 @@ public class UploadEventHandler {
 }
 ```
 
+## Building from Source
+
+Requires **Java 25** and **Gradle 9.3.1** (wrapper included).
+
+```bash
+# Build all modules
+JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 ./gradlew build
+
+# Run @QuarkusTest integration tests only
+JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 ./gradlew :integration-tests:test
+
+# Run @QuarkusIntegrationTest tests against the packaged JAR
+JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 ./gradlew :integration-tests:integrationTest
+```
+
 ## Documentation
 
 Read the [full documentation](docs/modules/ROOT/pages/index.adoc) for detailed guides on:
@@ -81,6 +108,7 @@ Read the [full documentation](docs/modules/ROOT/pages/index.adoc) for detailed g
 - [Custom Storage Backends](docs/modules/ROOT/pages/storage-spi.adoc)
 - [SSE Upload Progress](docs/modules/ROOT/pages/sse.adoc)
 - [Authentication](docs/modules/ROOT/pages/authentication.adoc)
+- [Testing](docs/modules/ROOT/pages/testing.adoc)
 
 ## Compatibility
 
