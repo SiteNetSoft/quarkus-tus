@@ -299,6 +299,14 @@ public class TusUploadResource {
                         .build();
             }
 
+            if (body.length > tusRuntimeConfig.maxChunkSize()) {
+                uploadStore.discardUpload(uploadId);
+                return Response.status(REQUEST_ENTITY_TOO_LARGE)
+                        .header("Tus-Resumable", tusRuntimeConfig.version())
+                        .entity("Chunk size exceeds maximum allowed size")
+                        .build();
+            }
+
             initialOffset = uploadStore.writeInitialData(uploadId, body);
             if (initialOffset < 0) {
                 return Response.status(INTERNAL_SERVER_ERROR)

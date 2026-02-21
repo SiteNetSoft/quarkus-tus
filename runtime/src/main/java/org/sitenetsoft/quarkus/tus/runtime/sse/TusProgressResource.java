@@ -2,12 +2,14 @@ package org.sitenetsoft.quarkus.tus.runtime.sse;
 
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
+import jakarta.ws.rs.NotFoundException;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.sse.SseEventSink;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadProgress;
@@ -16,6 +18,9 @@ import org.sitenetsoft.quarkus.tus.runtime.model.UploadProgress;
 public class TusProgressResource {
 
     private static final Logger LOG = Logger.getLogger(TusProgressResource.class);
+
+    @ConfigProperty(name = "quarkus.tus.sse-enabled", defaultValue = "true")
+    boolean sseEnabled;
 
     @Inject
     TusSseService sseService;
@@ -30,6 +35,9 @@ public class TusProgressResource {
             @PathParam("uploadID") String uploadID,
             @Context SseEventSink eventSink
     ) {
+        if (!sseEnabled) {
+            throw new NotFoundException();
+        }
         LOG.infof("Registering SSE sink for uploadID=%s", uploadID);
         sseService.register(uploadID, eventSink);
 

@@ -13,9 +13,18 @@ public class TusAuthFilter implements ContainerRequestFilter {
     @ConfigProperty(name = "quarkus.tus.auth-enabled", defaultValue = "false")
     boolean authEnabled;
 
+    @ConfigProperty(name = "quarkus.tus.path", defaultValue = "/tus")
+    String tusPath;
+
     @Override
     public void filter(ContainerRequestContext requestContext) {
         if (!authEnabled) {
+            return;
+        }
+
+        // Only apply to TUS endpoints
+        String requestPath = requestContext.getUriInfo().getPath();
+        if (!requestPath.startsWith(tusPath)) {
             return;
         }
 

@@ -443,8 +443,12 @@ public class LocalFileUploadStore implements UploadStore {
 
         if (checksum.isPresent() && data.length > 0) {
             UploadInfo.ChecksumInfo checksumInfo = checksum.get();
-            if (!validateChecksum(data, checksumInfo)) {
-                return Uni.createFrom().failure(new ChecksumMismatchException("Checksum validation failed"));
+            try {
+                if (!validateChecksum(data, checksumInfo)) {
+                    return Uni.createFrom().failure(new ChecksumMismatchException("Checksum validation failed"));
+                }
+            } catch (ChecksumMismatchException e) {
+                return Uni.createFrom().failure(e);
             }
         }
 

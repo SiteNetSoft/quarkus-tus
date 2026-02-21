@@ -2,6 +2,7 @@ package org.sitenetsoft.quarkus.tus.runtime.sse;
 
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
+import jakarta.ws.rs.NotFoundException;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
@@ -9,6 +10,7 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.sse.Sse;
 import jakarta.ws.rs.sse.SseEventSink;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 import org.sitenetsoft.quarkus.tus.runtime.TusUtils;
 
@@ -16,6 +18,9 @@ import org.sitenetsoft.quarkus.tus.runtime.TusUtils;
 public class TusSseResource {
 
     private static final Logger LOG = Logger.getLogger(TusSseResource.class);
+
+    @ConfigProperty(name = "quarkus.tus.sse-enabled", defaultValue = "true")
+    boolean sseEnabled;
 
     @Inject
     TusSseService sseService;
@@ -30,6 +35,9 @@ public class TusSseResource {
             @PathParam("uploadId") String uploadId,
             @Context SseEventSink eventSink
     ) {
+        if (!sseEnabled) {
+            throw new NotFoundException();
+        }
         if (!TusUtils.isValidUuid(uploadId)) {
             try {
                 eventSink.send(sse.newEventBuilder()
