@@ -357,8 +357,7 @@ public class TusUploadResource {
             @HeaderParam("Content-Length") Long contentLengthHeader,
             @HeaderParam("Upload-Checksum") String uploadChecksum,
             @HeaderParam("Upload-Length") Long uploadLength,
-            byte[] body,
-            @Context io.vertx.ext.web.RoutingContext routingContext
+            byte[] body
     ) {
         if (tusResumable == null || !tusResumable.equals(tusRuntimeConfig.version())) {
             return Uni.createFrom().item(
@@ -477,17 +476,6 @@ public class TusUploadResource {
         Optional<UploadInfo.ChecksumInfo> checksumInfo;
         if (uploadChecksum != null) {
             checksumInfo = TusUtils.parseChecksumHeader(uploadChecksum);
-        } else if (routingContext != null) {
-            String trailerChecksum = null;
-            Object capturedTrailers = routingContext.get("http.trailers");
-            if (capturedTrailers instanceof io.vertx.core.MultiMap trailers) {
-                trailerChecksum = trailers.get("Upload-Checksum");
-            }
-            if (trailerChecksum != null) {
-                checksumInfo = TusUtils.parseChecksumHeader(trailerChecksum);
-            } else {
-                checksumInfo = Optional.empty();
-            }
         } else {
             checksumInfo = Optional.empty();
         }
