@@ -131,6 +131,8 @@ Fired when a final concatenation merges partial uploads.
 
 == Observing Events
 
+NOTE: Events are fired synchronously by default. A synchronous observer blocks the HTTP response until it returns. Keep observer logic fast, or use `@ObservesAsync` for long-running processing (see below).
+
 Use standard CDI `@Observes` to handle events:
 
 [source,java]

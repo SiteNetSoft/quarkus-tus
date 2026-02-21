@@ -4,3 +4,4 @@
 * xref:storage-spi.adoc[Custom Storage Backends]
 * xref:sse.adoc[SSE Upload Progress]
 * xref:authentication.adoc[Authentication]
+* xref:testing.adoc[Testing]
