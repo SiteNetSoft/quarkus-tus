@@ -754,6 +754,73 @@ class TusUploadTest {
                 .statusCode(413);
     }
 
+    // ---- PATCH edge case tests ----
+
+    @Test
+    void testPatchNonExistentUploadReturns404() {
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body("test".getBytes())
+                .when().patch("/tus/00000000-0000-0000-0000-000000000099")
+                .then()
+                .statusCode(404);
+    }
+
+    @Test
+    void testPatchOnLockedUploadReturns423() {
+        String location = createUpload(100);
+        String uploadId = extractId(location);
+
+        // Pre-acquire lock to simulate concurrent upload
+        assertTrue(uploadStore.acquireLock(uploadId), "Lock should be acquired");
+
+        try {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body("locked".getBytes())
+                    .when().patch(location)
+                    .then()
+                    .statusCode(423);
+        } finally {
+            uploadStore.releaseLock(uploadId);
+        }
+    }
+
+    @Test
+    void testUnsupportedChecksumAlgorithmReturns460() {
+        byte[] data = "checksum algo test".getBytes();
+        String location = createUpload(data.length);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .header("Upload-Checksum", "blake2b AAAAAAAAAAAAAAAAAAAAAA==")
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(460);
+    }
+
+    @Test
+    void testCreationWithUploadExceedingMaxChunkSizeReturns413() {
+        // max-chunk-size is 1024 in test config
+        byte[] largeBody = new byte[1025];
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", "10000")
+                .contentType("application/offset+octet-stream")
+                .body(largeBody)
+                .when().post("/tus")
+                .then()
+                .statusCode(413);
+    }
+
     // ---- Checksum algorithm tests ----
 
     @Test
