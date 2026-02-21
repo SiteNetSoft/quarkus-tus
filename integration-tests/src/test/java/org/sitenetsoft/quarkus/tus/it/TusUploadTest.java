@@ -5,6 +5,7 @@ import io.restassured.response.Response;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.sitenetsoft.quarkus.tus.runtime.UploadExpirationScheduler;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
@@ -28,6 +29,9 @@ class TusUploadTest {
 
     @Inject
     UploadStore uploadStore;
+
+    @Inject
+    UploadExpirationScheduler expirationScheduler;
 
     @BeforeEach
     void setUp() {
@@ -859,5 +863,28 @@ class TusUploadTest {
                 .when().patch(location)
                 .then()
                 .statusCode(204);
+    }
+
+    // ---- Scheduler tests ----
+
+    @Test
+    void testExpirationSchedulerDelegates() {
+        String loc1 = createUpload(100);
+        String loc2 = createUpload(100);
+        String id1 = extractId(loc1);
+        String id2 = extractId(loc2);
+
+        // Expire one of them
+        uploadStore.findUploadInfo(id1).ifPresent(
+                info -> info.setExpiresAt(Instant.now().minusSeconds(3600)));
+
+        // Invoke the scheduler's method directly
+        expirationScheduler.cleanupExpiredUploads();
+
+        // Verify delegation worked
+        assertTrue(uploadStore.findUploadInfo(id1).isEmpty(),
+                "Expired upload should be removed by scheduler");
+        assertTrue(uploadStore.findUploadInfo(id2).isPresent(),
+                "Non-expired upload should still exist");
     }
 }

@@ -17,7 +17,7 @@ public class UploadExpirationScheduler {
     UploadStore uploadStore;
 
     @Scheduled(every = "1h", delayed = "5m")
-    void cleanupExpiredUploads() {
+    public void cleanupExpiredUploads() {
         LOG.debug("Running scheduled cleanup of expired uploads");
         List<String> cleaned = uploadStore.cleanupExpiredUploads();
         if (!cleaned.isEmpty()) {
