@@ -27,7 +27,6 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantLock;
 
 @ApplicationScoped
 public class LocalFileUploadStore implements UploadStore {
@@ -35,7 +34,7 @@ public class LocalFileUploadStore implements UploadStore {
     private static final Logger LOG = Logger.getLogger(LocalFileUploadStore.class);
 
     private final Map<String, UploadInfo> uploads = new ConcurrentHashMap<>();
-    private final Map<String, ReentrantLock> locks = new ConcurrentHashMap<>();
+    private final Set<String> activeLocks = ConcurrentHashMap.newKeySet();
 
     private Path uploadBaseDir;
 
@@ -405,7 +404,7 @@ public class LocalFileUploadStore implements UploadStore {
     public boolean discardUpload(String id) {
         UploadInfo removed = uploads.remove(id);
         uploadProgressService.finishUpload(id);
-        locks.remove(id);
+        activeLocks.remove(id);
 
         Path file = uploadBaseDir.resolve(id);
         try {
@@ -419,16 +418,12 @@ public class LocalFileUploadStore implements UploadStore {
 
     @Override
     public boolean acquireLock(String id) {
-        ReentrantLock lock = locks.computeIfAbsent(id, k -> new ReentrantLock());
-        return lock.tryLock();
+        return activeLocks.add(id);
     }
 
     @Override
     public void releaseLock(String id) {
-        ReentrantLock lock = locks.get(id);
-        if (lock != null && lock.isHeldByCurrentThread()) {
-            lock.unlock();
-        }
+        activeLocks.remove(id);
     }
 
     @Override

@@ -92,6 +92,9 @@ public class TusUploadResource {
     Event<TusUploadTerminatedEvent> uploadTerminatedEvent;
 
     @Inject
+    Event<TusUploadCompletedEvent> uploadCompletedEvent;
+
+    @Inject
     Event<TusConcatenationCompletedEvent> concatenationCompletedEvent;
 
     // ---------- OPTIONS: server capabilities ----------
@@ -187,9 +190,9 @@ public class TusUploadResource {
             @HeaderParam("Upload-Concat") String uploadConcat,
             @HeaderParam("Upload-Metadata") String uploadMetadata,
             @HeaderParam("Upload-Defer-Length") Integer uploadDeferLength,
-            @HeaderParam("Content-Type") String contentType,
             @Context jakarta.ws.rs.core.UriInfo uriInfo,
             @Context SecurityContext securityContext,
+            @Context io.vertx.ext.web.RoutingContext routingContext,
             byte[] body
     ) {
         if (tusResumable == null || !tusResumable.equals(tusRuntimeConfig.version())) {
@@ -309,7 +312,9 @@ public class TusUploadResource {
         // Handle creation-with-upload
         long initialOffset = 0;
         if (body != null && body.length > 0 && !isDeferredLength) {
-            if (!"application/offset+octet-stream".equals(contentType)) {
+            String contentType = routingContext != null
+                    ? routingContext.request().getHeader("Content-Type") : null;
+            if (contentType == null || !contentType.startsWith("application/offset+octet-stream")) {
                 uploadStore.discardUpload(uploadId);
                 return Response.status(BAD_REQUEST)
                         .header("Tus-Resumable", tusRuntimeConfig.version())
@@ -330,6 +335,9 @@ public class TusUploadResource {
             Optional<UploadInfo> infoOpt = uploadStore.findUploadInfo(uploadId);
             if (infoOpt.isPresent() && infoOpt.get().getOffset() == infoOpt.get().getEntityLength()) {
                 uploadProgressService.finishUpload(uploadId);
+                uploadCompletedEvent.fire(new TusUploadCompletedEvent(
+                        uploadId, infoOpt.get().getEntityLength(), uploadMetadata,
+                        getCurrentUserId(securityContext)));
             }
         }
 
