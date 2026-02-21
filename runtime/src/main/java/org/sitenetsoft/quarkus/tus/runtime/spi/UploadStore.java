@@ -27,8 +27,6 @@ public interface UploadStore {
 
     boolean hasDeferredLength(String id);
 
-    Optional<String> mergePartialUploads(String[] ids, Optional<String> uploadMetadata);
-
     Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata, String requiredOwnerId);
 
     Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata);

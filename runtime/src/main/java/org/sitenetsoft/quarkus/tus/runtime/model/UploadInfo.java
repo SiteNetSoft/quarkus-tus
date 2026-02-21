@@ -8,7 +8,6 @@ public class UploadInfo {
     private long entityLength;
     private long offset;
     private String metadata;
-    private String creationUrl;
     private boolean isPartial;
     private String uploadConcatMergedValue;
     private Instant expiresAt;
@@ -25,9 +24,6 @@ public class UploadInfo {
 
     public String getMetadata() { return metadata; }
     public void setMetadata(String metadata) { this.metadata = metadata; }
-
-    public String getCreationUrl() { return creationUrl; }
-    public void setCreationUrl(String creationUrl) { this.creationUrl = creationUrl; }
 
     public boolean isPartial() { return isPartial; }
     public void setPartial(boolean partial) { isPartial = partial; }
@@ -74,7 +70,6 @@ public class UploadInfo {
                 "entityLength=" + entityLength +
                 ", offset=" + offset +
                 ", metadata='" + metadata + '\'' +
-                ", creationUrl='" + creationUrl + '\'' +
                 ", isPartial=" + isPartial +
                 '}';
     }
