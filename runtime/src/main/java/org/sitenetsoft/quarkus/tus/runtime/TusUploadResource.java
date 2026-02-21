@@ -1,16 +1,13 @@
 package org.sitenetsoft.quarkus.tus.runtime;
 
 import io.smallrye.mutiny.Uni;
-import io.vertx.mutiny.core.Vertx;
 import jakarta.enterprise.event.Event;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
-import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.SecurityContext;
-import jakarta.ws.rs.sse.Sse;
 import org.jboss.logging.Logger;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
@@ -21,9 +18,7 @@ import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 import org.sitenetsoft.quarkus.tus.runtime.sse.TusSseService;
 import org.sitenetsoft.quarkus.tus.runtime.store.LocalFileUploadStore;
 
-import java.util.Map;
 import java.util.Optional;
-import java.util.regex.Pattern;
 
 import static jakarta.ws.rs.core.Response.Status.*;
 
@@ -32,18 +27,6 @@ import static jakarta.ws.rs.core.Response.Status.*;
 public class TusUploadResource {
 
     private static final Logger LOG = Logger.getLogger(TusUploadResource.class);
-
-    private static final Pattern UUID_PATTERN = Pattern.compile(
-            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-            Pattern.CASE_INSENSITIVE
-    );
-
-    private boolean isInvalidUploadId(String uploadId) {
-        if (uploadId == null || uploadId.isBlank()) {
-            return true;
-        }
-        return !UUID_PATTERN.matcher(uploadId).matches();
-    }
 
     private static String extractUploadIdFromLocation(String location) {
         if (location == null || location.isBlank()) {
@@ -71,16 +54,10 @@ public class TusUploadResource {
     UploadStore uploadStore;
 
     @Inject
-    Vertx vertx;
-
-    @Inject
     Instance<TusSseService> sseServiceInstance;
 
     @Inject
     UploadProgressService uploadProgressService;
-
-    @Inject
-    Sse sse;
 
     @Inject
     Event<TusUploadCreatedEvent> uploadCreatedEvent;
@@ -124,7 +101,7 @@ public class TusUploadResource {
                     .build();
         }
 
-        if (isInvalidUploadId(uploadID)) {
+        if (!TusUtils.isValidUuid(uploadID)) {
             return Response.status(BAD_REQUEST)
                     .header("Tus-Resumable", tusRuntimeConfig.version())
                     .entity("Invalid upload ID format")
@@ -384,7 +361,7 @@ public class TusUploadResource {
             );
         }
 
-        if (isInvalidUploadId(uploadID)) {
+        if (!TusUtils.isValidUuid(uploadID)) {
             return Uni.createFrom().item(
                     Response.status(BAD_REQUEST)
                             .header("Tus-Resumable", tusRuntimeConfig.version())
@@ -460,6 +437,15 @@ public class TusUploadResource {
 
         byte[] chunk = (body != null) ? body : new byte[0];
         long actualChunkSize = chunk.length;
+
+        if (actualChunkSize > tusRuntimeConfig.maxChunkSize()) {
+            return Uni.createFrom().item(
+                    Response.status(REQUEST_ENTITY_TOO_LARGE)
+                            .header("Tus-Resumable", tusRuntimeConfig.version())
+                            .entity("Chunk size exceeds maximum allowed size")
+                            .build()
+            );
+        }
 
         if (!checkContentLengthWithCurrentOffset(actualChunkSize, uploadOffset, info.getEntityLength())) {
             return Uni.createFrom().item(
@@ -585,7 +571,7 @@ public class TusUploadResource {
                     .build();
         }
 
-        if (isInvalidUploadId(uploadID)) {
+        if (!TusUtils.isValidUuid(uploadID)) {
             return Response.status(BAD_REQUEST)
                     .header("Tus-Resumable", tusRuntimeConfig.version())
                     .entity("Invalid upload ID format")

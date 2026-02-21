@@ -179,11 +179,6 @@ public class LocalFileUploadStore implements UploadStore {
     }
 
     @Override
-    public Optional<String> mergePartialUploads(String[] ids, Optional<String> uploadMetadata) {
-        return mergePartialUploadsWithOwnership(ids, uploadMetadata, null);
-    }
-
-    @Override
     public Optional<String> mergePartialUploadsWithOwnership(String[] ids,
                                                               Optional<String> uploadMetadata,
                                                               String requiredOwnerId) {

@@ -709,4 +709,88 @@ class TusUploadTest {
                 .header("Upload-Length", "50")
                 .header("Upload-Offset", "0");
     }
+
+    // ---- Protocol enforcement tests ----
+
+    @Test
+    void testPostWithoutTusResumableReturns412() {
+        given()
+                .header("Upload-Length", "100")
+                .when().post("/tus")
+                .then()
+                .statusCode(412);
+    }
+
+    @Test
+    void testDeleteWithoutTusResumableReturns412() {
+        given()
+                .when().delete("/tus/550e8400-e29b-41d4-a716-446655440000")
+                .then()
+                .statusCode(412);
+    }
+
+    @Test
+    void testPostExceedingMaxSizeReturns413() {
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", "104857601")
+                .when().post("/tus")
+                .then()
+                .statusCode(413);
+    }
+
+    @Test
+    void testPatchExceedingMaxChunkSizeReturns413() {
+        byte[] largeChunk = new byte[1025];
+        String location = createUpload(10000);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(largeChunk)
+                .when().patch(location)
+                .then()
+                .statusCode(413);
+    }
+
+    // ---- Checksum algorithm tests ----
+
+    @Test
+    void testMd5Checksum() throws Exception {
+        byte[] data = "md5 checksum test".getBytes();
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        String checksum = "md5 " + Base64.getEncoder().encodeToString(md.digest(data));
+
+        String location = createUpload(data.length);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .header("Upload-Checksum", checksum)
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(204);
+    }
+
+    @Test
+    void testSha256Checksum() throws Exception {
+        byte[] data = "sha256 checksum test".getBytes();
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        String checksum = "sha256 " + Base64.getEncoder().encodeToString(md.digest(data));
+
+        String location = createUpload(data.length);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .header("Upload-Checksum", checksum)
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(204);
+    }
 }

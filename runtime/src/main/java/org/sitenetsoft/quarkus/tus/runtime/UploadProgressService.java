@@ -29,8 +29,4 @@ public class UploadProgressService {
     public void finishUpload(String uploadId) {
         uploads.remove(uploadId);
     }
-
-    public void cancelUpload(String uploadId) {
-        uploads.remove(uploadId);
-    }
 }

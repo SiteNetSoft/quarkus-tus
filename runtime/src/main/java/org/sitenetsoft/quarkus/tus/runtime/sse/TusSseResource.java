@@ -10,18 +10,12 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.sse.Sse;
 import jakarta.ws.rs.sse.SseEventSink;
 import org.jboss.logging.Logger;
-
-import java.util.regex.Pattern;
+import org.sitenetsoft.quarkus.tus.runtime.TusUtils;
 
 @Path("/tus/events")
 public class TusSseResource {
 
     private static final Logger LOG = Logger.getLogger(TusSseResource.class);
-
-    private static final Pattern UUID_PATTERN = Pattern.compile(
-            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-            Pattern.CASE_INSENSITIVE
-    );
 
     @Inject
     TusSseService sseService;
@@ -36,7 +30,7 @@ public class TusSseResource {
             @PathParam("uploadId") String uploadId,
             @Context SseEventSink eventSink
     ) {
-        if (uploadId == null || !UUID_PATTERN.matcher(uploadId).matches()) {
+        if (!TusUtils.isValidUuid(uploadId)) {
             try {
                 eventSink.send(sse.newEventBuilder()
                         .name("error")
