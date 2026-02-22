@@ -10,6 +10,8 @@ dependencies {
     implementation 'io.quarkus:quarkus-scheduler-deployment'
     implementation 'io.quarkus:quarkus-vertx-deployment'
     implementation project(':runtime')
+    implementation 'io.quarkus:quarkus-smallrye-health-deployment'
+    implementation 'io.quarkus:quarkus-vertx-http-dev-ui-spi'
 
     annotationProcessor enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
     annotationProcessor 'io.quarkus:quarkus-extension-processor'

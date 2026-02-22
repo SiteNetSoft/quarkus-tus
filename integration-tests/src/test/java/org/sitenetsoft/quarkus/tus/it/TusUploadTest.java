@@ -264,6 +264,31 @@ class TusUploadTest extends TusUploadTestBase {
     }
 
     @Test
+    void testConcurrentPatchReturns423ForSecondWriter() {
+        byte[] data = "concurrent test".getBytes();
+        String location = createUpload(data.length);
+        String uploadId = extractId(location);
+
+        assertTrue(uploadStore.acquireLock(uploadId), "Lock should be acquired");
+
+        try {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(423);
+        } finally {
+            uploadStore.releaseLock(uploadId);
+        }
+
+        // After releasing, a normal PATCH should succeed
+        uploadData(location, data, 0);
+    }
+
+    @Test
     void testExpirationSchedulerDelegates() {
         String loc1 = createUpload(100);
         String loc2 = createUpload(100);
