@@ -115,6 +115,70 @@ class TusCustomStoreTest {
     }
 
     @Test
+    void testConcatenationThroughCustomStore() {
+        byte[] data1 = "part one".getBytes();
+        byte[] data2 = " part two".getBytes();
+
+        // Create partial uploads
+        String loc1 = given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", String.valueOf(data1.length))
+                .header("Upload-Concat", "partial")
+                .when().post("/tus")
+                .then()
+                .statusCode(201)
+                .extract().header("Location");
+
+        String loc2 = given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", String.valueOf(data2.length))
+                .header("Upload-Concat", "partial")
+                .when().post("/tus")
+                .then()
+                .statusCode(201)
+                .extract().header("Location");
+
+        // Upload data to partials
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(data1)
+                .when().patch(loc1)
+                .then()
+                .statusCode(204);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(data2)
+                .when().patch(loc2)
+                .then()
+                .statusCode(204);
+
+        // Create final concatenation
+        String finalLocation = given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Concat", "final; " + loc1 + " " + loc2)
+                .when().post("/tus")
+                .then()
+                .statusCode(201)
+                .extract().header("Location");
+
+        String finalId = finalLocation.substring(finalLocation.lastIndexOf('/') + 1);
+
+        // Verify merged data in InMemoryUploadStore
+        InMemoryUploadStore inMemStore = (InMemoryUploadStore) uploadStore;
+        assertTrue(inMemStore.hasData(finalId), "Final upload data should exist");
+
+        byte[] expected = new byte[data1.length + data2.length];
+        System.arraycopy(data1, 0, expected, 0, data1.length);
+        System.arraycopy(data2, 0, expected, data1.length, data2.length);
+        assertArrayEquals(expected, inMemStore.getData(finalId), "Merged data should equal concatenation of partials");
+    }
+
+    @Test
     void testHeadThroughCustomStore() {
         byte[] data = "head test data".getBytes();
 

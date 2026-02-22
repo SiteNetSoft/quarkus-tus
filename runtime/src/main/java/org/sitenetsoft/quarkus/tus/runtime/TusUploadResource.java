@@ -8,6 +8,9 @@ import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.SecurityContext;
+import org.eclipse.microprofile.openapi.annotations.Operation;
+import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
+import org.eclipse.microprofile.openapi.annotations.tags.Tag;
 import org.jboss.logging.Logger;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
@@ -24,6 +27,7 @@ import static jakarta.ws.rs.core.Response.Status.*;
 
 @jakarta.enterprise.context.ApplicationScoped
 @jakarta.ws.rs.Path("/tus")
+@Tag(name = "TUS Upload", description = "TUS v1.0.0 resumable upload protocol")
 public class TusUploadResource {
 
     private static final Logger LOG = Logger.getLogger(TusUploadResource.class);
@@ -77,6 +81,8 @@ public class TusUploadResource {
     // ---------- OPTIONS: server capabilities ----------
 
     @OPTIONS
+    @Operation(summary = "TUS capability discovery")
+    @APIResponse(responseCode = "204", description = "Server capabilities returned in headers")
     public Response options() {
         return Response.noContent()
                 .header("Tus-Resumable", tusRuntimeConfig.version())
@@ -91,6 +97,10 @@ public class TusUploadResource {
 
     @HEAD
     @jakarta.ws.rs.Path("/{uploadID}")
+    @Operation(summary = "Query upload status")
+    @APIResponse(responseCode = "200", description = "Upload status returned in headers")
+    @APIResponse(responseCode = "404", description = "Upload not found")
+    @APIResponse(responseCode = "410", description = "Upload expired")
     public Response head(
             @PathParam("uploadID") String uploadID,
             @HeaderParam("Tus-Resumable") String tusResumable) {
@@ -161,6 +171,10 @@ public class TusUploadResource {
     // ---------- POST: create upload or final concat ----------
 
     @POST
+    @Operation(summary = "Create upload or concatenation")
+    @APIResponse(responseCode = "201", description = "Upload created")
+    @APIResponse(responseCode = "400", description = "Invalid request")
+    @APIResponse(responseCode = "413", description = "Upload size exceeds maximum")
     public Response postCreate(
             @HeaderParam("Tus-Resumable") String tusResumable,
             @HeaderParam("Upload-Length") Long uploadLength,
@@ -350,6 +364,13 @@ public class TusUploadResource {
     @PATCH
     @jakarta.ws.rs.Path("/{uploadID}")
     @Consumes("application/offset+octet-stream")
+    @Operation(summary = "Upload a chunk of data")
+    @APIResponse(responseCode = "204", description = "Chunk accepted")
+    @APIResponse(responseCode = "404", description = "Upload not found")
+    @APIResponse(responseCode = "409", description = "Offset mismatch")
+    @APIResponse(responseCode = "413", description = "Chunk size exceeds maximum")
+    @APIResponse(responseCode = "423", description = "Upload locked")
+    @APIResponse(responseCode = "460", description = "Checksum mismatch")
     public Uni<Response> patch(
             @PathParam("uploadID") String uploadID,
             @HeaderParam("Tus-Resumable") String tusResumable,
@@ -557,6 +578,8 @@ public class TusUploadResource {
 
     @DELETE
     @jakarta.ws.rs.Path("/{uploadID}")
+    @Operation(summary = "Terminate and delete upload")
+    @APIResponse(responseCode = "204", description = "Upload terminated")
     public Response delete(
             @PathParam("uploadID") String uploadID,
             @HeaderParam("Tus-Resumable") String tusResumable

@@ -9,6 +9,10 @@ dependencies {
     implementation 'io.quarkus:quarkus-scheduler'
     implementation 'io.quarkus:quarkus-vertx'
 
+    compileOnly 'io.quarkus:quarkus-micrometer'
+    compileOnly 'io.quarkus:quarkus-smallrye-health'
+    compileOnly 'org.eclipse.microprofile.openapi:microprofile-openapi-api:3.1'
+
     annotationProcessor enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
     annotationProcessor 'io.quarkus:quarkus-extension-processor'
 }
