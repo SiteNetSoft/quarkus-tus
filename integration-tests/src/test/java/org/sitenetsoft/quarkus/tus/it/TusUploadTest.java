@@ -289,6 +289,57 @@ class TusUploadTest extends TusUploadTestBase {
     }
 
     @Test
+    void testConcatenationUnfinishedAutoFinalize() {
+        byte[] data1 = "part-A".getBytes();
+        byte[] data2 = "part-B".getBytes();
+
+        // Create two partial uploads
+        String loc1 = createPartialUpload(data1.length);
+        String loc2 = createPartialUpload(data2.length);
+
+        // Only upload data for the first partial (leave second incomplete)
+        uploadData(loc1, data1, 0);
+
+        // Create an unfinished final concat — second partial not yet complete
+        String finalLocation = given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Concat", "final; " + loc1 + " " + loc2)
+                .when().post("/tus")
+                .then()
+                .statusCode(201)
+                .header("Location", notNullValue())
+                .extract().header("Location");
+
+        // HEAD on final should show offset=0 (unfinished)
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .when().head(finalLocation)
+                .then()
+                .statusCode(200)
+                .header("Upload-Offset", "0");
+
+        // Now complete the second partial
+        uploadData(loc2, data2, 0);
+
+        // HEAD on final should auto-finalize: offset == total length
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .when().head(finalLocation)
+                .then()
+                .statusCode(200)
+                .header("Upload-Offset", String.valueOf(data1.length + data2.length))
+                .header("Upload-Length", String.valueOf(data1.length + data2.length));
+
+        // Partials should be cleaned up after finalization
+        String id1 = extractId(loc1);
+        String id2 = extractId(loc2);
+        assertTrue(uploadStore.findUploadInfo(id1).isEmpty(),
+                "Partial 1 should be removed after finalization");
+        assertTrue(uploadStore.findUploadInfo(id2).isEmpty(),
+                "Partial 2 should be removed after finalization");
+    }
+
+    @Test
     void testExpirationSchedulerDelegates() {
         String loc1 = createUpload(100);
         String loc2 = createUpload(100);

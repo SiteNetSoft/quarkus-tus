@@ -509,6 +509,54 @@ abstract class TusUploadTestBase {
     }
 
     @Test
+    void testInvalidMetadataRejected() {
+        // Key with invalid characters (spaces in key)
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", "100")
+                .header("Upload-Metadata", "invalid key dGVzdA==")
+                .when().post("/tus")
+                .then()
+                .statusCode(400);
+    }
+
+    @Test
+    void testInvalidBase64MetadataRejected() {
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", "100")
+                .header("Upload-Metadata", "filename !!!not-base64!!!")
+                .when().post("/tus")
+                .then()
+                .statusCode(400);
+    }
+
+    @Test
+    void testValidMetadataAccepted() {
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", "100")
+                .header("Upload-Metadata", "filename dGVzdC50eHQ=, type dGV4dC9wbGFpbg==")
+                .when().post("/tus")
+                .then()
+                .statusCode(201);
+    }
+
+    @Test
+    void testOptionsIncludesChecksumTrailerExtension() {
+        String extensions = given()
+                .when().options("/tus")
+                .then()
+                .statusCode(204)
+                .extract().header("Tus-Extension");
+
+        assertTrue(extensions.contains("checksum-trailer"),
+                "Extensions should include checksum-trailer");
+        assertTrue(extensions.contains("concatenation-unfinished"),
+                "Extensions should include concatenation-unfinished");
+    }
+
+    @Test
     void testCreationWithUploadExceedingMaxChunkSizeReturns413() {
         byte[] largeBody = new byte[1025];
 

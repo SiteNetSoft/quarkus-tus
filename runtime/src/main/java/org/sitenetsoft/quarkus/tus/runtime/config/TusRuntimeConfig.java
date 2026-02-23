@@ -24,7 +24,7 @@ public interface TusRuntimeConfig {
     /**
      * Active TUS protocol extensions (comma-separated).
      */
-    @WithDefault("creation,termination,checksum,expiration,concatenation,creation-with-upload,creation-defer-length")
+    @WithDefault("creation,termination,checksum,checksum-trailer,expiration,concatenation,concatenation-unfinished,creation-with-upload,creation-defer-length")
     String extensions();
 
     /**
