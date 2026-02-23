@@ -135,6 +135,16 @@ public class TusUploadResource {
 
         UploadInfo info = infoOpt.get();
 
+        // Auto-finalize unfinished concatenation if all partials are now complete
+        if (info.isFinalConcat() && uploadStore.isConcatReady(uploadID)) {
+            if (uploadStore.finalizeConcatenation(uploadID)) {
+                Optional<UploadInfo> refreshed = uploadStore.findUploadInfo(uploadID);
+                if (refreshed.isPresent()) {
+                    info = refreshed.get();
+                }
+            }
+        }
+
         Response.ResponseBuilder builder = Response.ok()
                 .header("Tus-Resumable", tusRuntimeConfig.version())
                 .header("Cache-Control", "no-store")
@@ -244,6 +254,14 @@ public class TusUploadResource {
             return Response.status(BAD_REQUEST)
                     .header("Tus-Resumable", tusRuntimeConfig.version())
                     .entity("Failed to merge partial uploads - ensure all partials exist")
+                    .build();
+        }
+
+        // Validate metadata
+        if (uploadMetadata != null && TusUtils.parseMetadata(uploadMetadata).isEmpty()) {
+            return Response.status(BAD_REQUEST)
+                    .header("Tus-Resumable", tusRuntimeConfig.version())
+                    .entity("Invalid Upload-Metadata header")
                     .build();
         }
 
@@ -378,6 +396,7 @@ public class TusUploadResource {
             @HeaderParam("Content-Length") Long contentLengthHeader,
             @HeaderParam("Upload-Checksum") String uploadChecksum,
             @HeaderParam("Upload-Length") Long uploadLength,
+            @Context io.vertx.ext.web.RoutingContext routingContext,
             byte[] body
     ) {
         if (tusResumable == null || !tusResumable.equals(tusRuntimeConfig.version())) {
@@ -493,10 +512,18 @@ public class TusUploadResource {
             );
         }
 
-        // Parse checksum
+        // Parse checksum (header first, then fall back to trailers)
         Optional<UploadInfo.ChecksumInfo> checksumInfo;
         if (uploadChecksum != null) {
             checksumInfo = TusUtils.parseChecksumHeader(uploadChecksum);
+        } else if (routingContext != null) {
+            Object capturedTrailers = routingContext.get("http.trailers");
+            if (capturedTrailers instanceof io.vertx.core.MultiMap trailers) {
+                String trailerChecksum = trailers.get("Upload-Checksum");
+                checksumInfo = TusUtils.parseChecksumHeader(trailerChecksum);
+            } else {
+                checksumInfo = Optional.empty();
+            }
         } else {
             checksumInfo = Optional.empty();
         }
