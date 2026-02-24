@@ -27,14 +27,18 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @ApplicationScoped
 public class LocalFileUploadStore implements UploadStore {
 
     private static final Logger LOG = Logger.getLogger(LocalFileUploadStore.class);
 
+    private static final long LOCK_TIMEOUT_MS = 30_000;
+
     private final Map<String, UploadInfo> uploads = new ConcurrentHashMap<>();
-    private final Set<String> activeLocks = ConcurrentHashMap.newKeySet();
+    private final Map<String, Long> activeLocks = new ConcurrentHashMap<>();
+    private final AtomicBoolean initValidated = new AtomicBoolean(false);
 
     private Path uploadBaseDir;
 
@@ -55,13 +59,41 @@ public class LocalFileUploadStore implements UploadStore {
 
     @PostConstruct
     void init() {
-        this.uploadBaseDir = Path.of(tusRuntimeConfig.store().local().uploadDir());
+        this.uploadBaseDir = Path.of(tusRuntimeConfig.store().local().uploadDir()).normalize();
         try {
             Files.createDirectories(uploadBaseDir);
             LOG.infof("TUS uploads dir: %s", uploadBaseDir);
         } catch (IOException e) {
             throw new RuntimeException("Failed to create uploads directory " + uploadBaseDir, e);
         }
+
+        if (!Files.isWritable(uploadBaseDir)) {
+            throw new RuntimeException("TUS uploads directory is not writable: " + uploadBaseDir);
+        }
+
+        if (tusRuntimeConfig.maxChunkSize() > tusRuntimeConfig.maxSize()) {
+            throw new RuntimeException("quarkus.tus.max-chunk-size (" + tusRuntimeConfig.maxChunkSize()
+                    + ") must not exceed quarkus.tus.max-size (" + tusRuntimeConfig.maxSize() + ")");
+        }
+
+        String[] algorithms = tusRuntimeConfig.checksumAlgorithms().split(",");
+        Set<String> supported = Set.of("sha1", "md5", "sha256");
+        for (String alg : algorithms) {
+            String trimmed = alg.trim().toLowerCase();
+            if (!trimmed.isEmpty() && !supported.contains(trimmed)) {
+                LOG.warnf("Unsupported checksum algorithm configured: '%s' (supported: %s)", trimmed, supported);
+            }
+        }
+
+        initValidated.set(true);
+    }
+
+    private Path safePath(String id) {
+        Path resolved = uploadBaseDir.resolve(id).normalize();
+        if (!resolved.startsWith(uploadBaseDir)) {
+            throw new SecurityException("Path traversal attempt detected for id: " + id);
+        }
+        return resolved;
     }
 
     @Override
@@ -89,7 +121,7 @@ public class LocalFileUploadStore implements UploadStore {
         uploads.put(id, info);
         uploadProgressService.startUpload(id, totalLength);
 
-        Path file = uploadBaseDir.resolve(id);
+        Path file = safePath(id);
         try {
             if (!Files.exists(file)) {
                 Files.createFile(file);
@@ -134,7 +166,7 @@ public class LocalFileUploadStore implements UploadStore {
 
         uploads.put(id, info);
 
-        Path file = uploadBaseDir.resolve(id);
+        Path file = safePath(id);
         try {
             if (!Files.exists(file)) {
                 Files.createFile(file);
@@ -189,6 +221,29 @@ public class LocalFileUploadStore implements UploadStore {
         LOG.infof("Merging %d partial uploads: %s (requiredOwner=%s)",
                 ids.length, String.join(", ", ids), requiredOwnerId);
 
+        // Acquire locks on all partials to prevent concurrent modification
+        List<String> lockedIds = new ArrayList<>();
+        for (String partialId : ids) {
+            if (acquireLock(partialId)) {
+                lockedIds.add(partialId);
+            } else {
+                // Release already-acquired locks
+                lockedIds.forEach(this::releaseLock);
+                LOG.warnf("Could not acquire lock on partial %s for merge", partialId);
+                return Optional.empty();
+            }
+        }
+
+        try {
+            return doMergeWithOwnership(ids, uploadMetadata, requiredOwnerId);
+        } finally {
+            lockedIds.forEach(this::releaseLock);
+        }
+    }
+
+    private Optional<String> doMergeWithOwnership(String[] ids,
+                                                    Optional<String> uploadMetadata,
+                                                    String requiredOwnerId) {
         long totalLength = 0;
         for (String partialId : ids) {
             UploadInfo partialInfo = uploads.get(partialId);
@@ -221,14 +276,14 @@ public class LocalFileUploadStore implements UploadStore {
         }
 
         String finalId = UUID.randomUUID().toString();
-        Path finalFile = uploadBaseDir.resolve(finalId);
+        Path finalFile = safePath(finalId);
 
         try {
             try (var outputStream = Files.newOutputStream(finalFile,
                     StandardOpenOption.CREATE,
                     StandardOpenOption.TRUNCATE_EXISTING)) {
                 for (String partialId : ids) {
-                    Path partialFile = uploadBaseDir.resolve(partialId);
+                    Path partialFile = safePath(partialId);
                     if (Files.exists(partialFile)) {
                         Files.copy(partialFile, outputStream);
                     } else {
@@ -319,7 +374,7 @@ public class LocalFileUploadStore implements UploadStore {
 
         uploads.put(finalId, finalInfo);
 
-        Path finalFile = uploadBaseDir.resolve(finalId);
+        Path finalFile = safePath(finalId);
         try {
             if (!Files.exists(finalFile)) {
                 Files.createFile(finalFile);
@@ -357,35 +412,51 @@ public class LocalFileUploadStore implements UploadStore {
             return false;
         }
 
-        Path finalFile = uploadBaseDir.resolve(id);
+        // Acquire locks on all partials to prevent concurrent modification
+        List<String> lockedIds = new ArrayList<>();
+        for (String partialId : partialIds) {
+            if (acquireLock(partialId)) {
+                lockedIds.add(partialId);
+            } else {
+                lockedIds.forEach(this::releaseLock);
+                LOG.warnf("Could not acquire lock on partial %s for finalization", partialId);
+                return false;
+            }
+        }
 
         try {
-            try (var outputStream = Files.newOutputStream(finalFile,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.TRUNCATE_EXISTING)) {
-                for (String partialId : partialIds) {
-                    Path partialFile = uploadBaseDir.resolve(partialId);
-                    if (Files.exists(partialFile)) {
-                        Files.copy(partialFile, outputStream);
-                    } else {
-                        return false;
+            Path finalFile = safePath(id);
+
+            try {
+                try (var outputStream = Files.newOutputStream(finalFile,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING)) {
+                    for (String partialId : partialIds) {
+                        Path partialFile = safePath(partialId);
+                        if (Files.exists(partialFile)) {
+                            Files.copy(partialFile, outputStream);
+                        } else {
+                            return false;
+                        }
                     }
                 }
+
+                info.setOffset(info.getEntityLength());
+                info.setFinalConcat(false);
+
+                for (String partialId : partialIds) {
+                    discardUpload(partialId);
+                }
+                info.setPartialIds(null);
+
+                return true;
+
+            } catch (IOException e) {
+                LOG.errorf(e, "Failed to finalize concatenation %s", id);
+                return false;
             }
-
-            info.setOffset(info.getEntityLength());
-            info.setFinalConcat(false);
-
-            for (String partialId : partialIds) {
-                discardUpload(partialId);
-            }
-            info.setPartialIds(null);
-
-            return true;
-
-        } catch (IOException e) {
-            LOG.errorf(e, "Failed to finalize concatenation %s", id);
-            return false;
+        } finally {
+            lockedIds.forEach(this::releaseLock);
         }
     }
 
@@ -401,7 +472,7 @@ public class LocalFileUploadStore implements UploadStore {
         uploadProgressService.finishUpload(id);
         activeLocks.remove(id);
 
-        Path file = uploadBaseDir.resolve(id);
+        Path file = safePath(id);
         try {
             Files.deleteIfExists(file);
         } catch (IOException e) {
@@ -413,12 +484,35 @@ public class LocalFileUploadStore implements UploadStore {
 
     @Override
     public boolean acquireLock(String id) {
-        return activeLocks.add(id);
+        long now = System.currentTimeMillis();
+        Long existing = activeLocks.putIfAbsent(id, now);
+        if (existing == null) {
+            return true;
+        }
+        // Check if existing lock has timed out
+        if (now - existing > LOCK_TIMEOUT_MS) {
+            if (activeLocks.replace(id, existing, now)) {
+                LOG.warnf("Reclaimed stale lock for upload %s (held for %d ms)", id, now - existing);
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
     public void releaseLock(String id) {
         activeLocks.remove(id);
+    }
+
+    public void cleanupStaleLocks() {
+        long now = System.currentTimeMillis();
+        activeLocks.entrySet().removeIf(entry -> {
+            boolean stale = now - entry.getValue() > LOCK_TIMEOUT_MS;
+            if (stale) {
+                LOG.warnf("Removing stale lock for upload %s (held for %d ms)", entry.getKey(), now - entry.getValue());
+            }
+            return stale;
+        });
     }
 
     @Override
@@ -438,7 +532,7 @@ public class LocalFileUploadStore implements UploadStore {
             return Uni.createFrom().item(-1L);
         }
 
-        Path file = uploadBaseDir.resolve(id);
+        Path file = safePath(id);
         byte[] data = (chunk != null) ? chunk : new byte[0];
 
         if (checksum.isPresent() && data.length > 0) {
@@ -524,7 +618,7 @@ public class LocalFileUploadStore implements UploadStore {
             return -1;
         }
 
-        Path file = uploadBaseDir.resolve(id);
+        Path file = safePath(id);
 
         try (OutputStream out = Files.newOutputStream(file, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
             out.write(data);
