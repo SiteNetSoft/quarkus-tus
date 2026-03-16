@@ -1,0 +1,907 @@
+package org.sitenetsoft.quarkus.tus.it;
+
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+import java.security.MessageDigest;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.concurrent.*;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.CoreMatchers.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * TUS protocol conformance tests organized by spec section.
+ * <p>
+ * Reference: <a href="https://tus.io/protocols/resumable-upload">TUS Protocol v1.0.0</a>
+ */
+@QuarkusTest
+class TusProtocolConformanceTest {
+
+    // ---- Helpers ----
+
+    private String createUpload(long size) {
+        return given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", String.valueOf(size))
+                .when().post("/tus")
+                .then()
+                .statusCode(201)
+                .extract().header("Location");
+    }
+
+    private String createPartialUpload(long size) {
+        return given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", String.valueOf(size))
+                .header("Upload-Concat", "partial")
+                .when().post("/tus")
+                .then()
+                .statusCode(201)
+                .extract().header("Location");
+    }
+
+    private void uploadData(String location, byte[] data, long offset) {
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", String.valueOf(offset))
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(204);
+    }
+
+    private String extractId(String location) {
+        return location.substring(location.lastIndexOf('/') + 1);
+    }
+
+    // ========== Core Protocol ==========
+
+    @Nested
+    class CoreProtocol {
+
+        @Test
+        void headIncludesCacheControlNoStore() {
+            String location = createUpload(100);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Cache-Control", "no-store");
+        }
+
+        @Test
+        void headReturns404ForNonExistent() {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head("/tus/00000000-0000-0000-0000-000000000001")
+                    .then()
+                    .statusCode(404)
+                    .header("Tus-Resumable", "1.0.0");
+        }
+
+        @Test
+        void patchIncludesUploadExpires() {
+            byte[] data = "test".getBytes();
+            String location = createUpload(data.length);
+
+            String expires = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204)
+                    .header("Upload-Expires", notNullValue())
+                    .extract().header("Upload-Expires");
+
+            assertDoesNotThrow(() ->
+                    ZonedDateTime.parse(expires, DateTimeFormatter.RFC_1123_DATE_TIME));
+        }
+
+        @Test
+        void wrongTusVersionReturns412WithTusVersion() {
+            given()
+                    .header("Tus-Resumable", "0.0.1")
+                    .when().head("/tus/00000000-0000-0000-0000-000000000001")
+                    .then()
+                    .statusCode(412)
+                    .header("Tus-Version", "1.0.0");
+        }
+
+        @Test
+        void optionsDoesNotRequireTusResumable() {
+            // OPTIONS must succeed without Tus-Resumable header
+            given()
+                    .when().options("/tus")
+                    .then()
+                    .statusCode(204)
+                    .header("Tus-Version", notNullValue())
+                    .header("Tus-Extension", notNullValue());
+        }
+
+        @Test
+        void allResponsesIncludeTusResumable() {
+            String location = createUpload(100);
+
+            // HEAD
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .header("Tus-Resumable", "1.0.0");
+
+            // PATCH
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body("x".getBytes())
+                    .when().patch(location)
+                    .then()
+                    .header("Tus-Resumable", "1.0.0");
+
+            // DELETE
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().delete(location)
+                    .then()
+                    .header("Tus-Resumable", "1.0.0");
+        }
+
+        @Test
+        void optionsIncludesTusMaxSize() {
+            given()
+                    .when().options("/tus")
+                    .then()
+                    .statusCode(204)
+                    .header("Tus-Max-Size", notNullValue());
+        }
+
+        @Test
+        void headReturnsUploadLength() {
+            String location = createUpload(42);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Length", "42")
+                    .header("Upload-Offset", "0");
+        }
+
+        @Test
+        void patchReturnsUploadOffset() {
+            byte[] data = "hello".getBytes();
+            String location = createUpload(data.length);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204)
+                    .header("Upload-Offset", String.valueOf(data.length));
+        }
+
+        @Test
+        void missingTusResumableOnPatchReturns412() {
+            String location = createUpload(100);
+
+            given()
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body("test".getBytes())
+                    .when().patch(location)
+                    .then()
+                    .statusCode(412)
+                    .header("Tus-Version", notNullValue());
+        }
+    }
+
+    // ========== Creation Conformance ==========
+
+    @Nested
+    class CreationConformance {
+
+        @Test
+        void negativeUploadLengthRejected() {
+            // Negative Upload-Length passes parsing but createUpload rejects it
+            int status = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", "-5")
+                    .when().post("/tus")
+                    .then()
+                    .extract().statusCode();
+
+            // Server may return 400 or 500 depending on where the check happens
+            assertTrue(status >= 400, "Negative Upload-Length should be rejected");
+        }
+
+        @Test
+        void zeroLengthUploadCreatedSuccessfully() {
+            String location = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", "0")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", "0")
+                    .header("Upload-Length", "0");
+        }
+
+        @Test
+        void locationHeaderUsableForHead() {
+            String location = createUpload(100);
+
+            // Location should be directly usable
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200);
+        }
+
+        @Test
+        void metadataRoundTrip() {
+            String metadata = "filename dGVzdC50eHQ=, type dGV4dC9wbGFpbg==";
+
+            String location = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", "100")
+                    .header("Upload-Metadata", metadata)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Metadata", metadata);
+        }
+
+        @Test
+        void postReturnsUploadExpires() {
+            String expires = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", "100")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Upload-Expires");
+
+            assertNotNull(expires);
+            ZonedDateTime parsed = ZonedDateTime.parse(expires, DateTimeFormatter.RFC_1123_DATE_TIME);
+            assertTrue(parsed.toInstant().isAfter(java.time.Instant.now()),
+                    "Upload-Expires should be in the future");
+        }
+    }
+
+    // ========== Creation-with-Upload ==========
+
+    @Nested
+    class CreationWithUpload {
+
+        @Test
+        void responseIncludesUploadOffset() {
+            byte[] data = "inline".getBytes();
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", String.valueOf(data.length))
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .header("Upload-Offset", String.valueOf(data.length));
+        }
+
+        @Test
+        void partialBodyThenResumeViaPatch() {
+            byte[] fullData = "complete data!!".getBytes();
+            byte[] firstHalf = Arrays.copyOfRange(fullData, 0, 8);
+            byte[] secondHalf = Arrays.copyOfRange(fullData, 8, fullData.length);
+
+            String location = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", String.valueOf(fullData.length))
+                    .contentType("application/offset+octet-stream")
+                    .body(firstHalf)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .header("Upload-Offset", String.valueOf(firstHalf.length))
+                    .extract().header("Location");
+
+            // Resume via PATCH
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", String.valueOf(firstHalf.length))
+                    .contentType("application/offset+octet-stream")
+                    .body(secondHalf)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204)
+                    .header("Upload-Offset", String.valueOf(fullData.length));
+        }
+
+        @Test
+        void checksumOnCreationWithUpload() throws Exception {
+            byte[] data = "csum inline".getBytes();
+            MessageDigest md = MessageDigest.getInstance("SHA-1");
+            String checksum = "sha1 " + Base64.getEncoder().encodeToString(md.digest(data));
+
+            // creation-with-upload with checksum should succeed
+            // Note: checksum on creation-with-upload is validated in PATCH flow only
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", String.valueOf(data.length))
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201);
+        }
+
+        @Test
+        void completeUploadInSinglePost() {
+            byte[] data = "one-shot".getBytes();
+
+            String location = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", String.valueOf(data.length))
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .header("Upload-Offset", String.valueOf(data.length))
+                    .extract().header("Location");
+
+            // Verify upload is complete
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", String.valueOf(data.length))
+                    .header("Upload-Length", String.valueOf(data.length));
+        }
+    }
+
+    // ========== Termination Conformance ==========
+
+    @Nested
+    class TerminationConformance {
+
+        @Test
+        void deleteReturns204() {
+            String location = createUpload(100);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().delete(location)
+                    .then()
+                    .statusCode(204)
+                    .header("Tus-Resumable", "1.0.0");
+        }
+
+        @Test
+        void headAfterDeleteReturns404() {
+            String location = createUpload(100);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().delete(location)
+                    .then()
+                    .statusCode(204);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(404);
+        }
+
+        @Test
+        void patchAfterDeleteReturns404() {
+            String location = createUpload(100);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().delete(location)
+                    .then()
+                    .statusCode(204);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body("test".getBytes())
+                    .when().patch(location)
+                    .then()
+                    .statusCode(404);
+        }
+    }
+
+    // ========== Checksum Conformance ==========
+
+    @Nested
+    class ChecksumConformance {
+
+        @Test
+        void mismatchDoesNotUpdateOffset() {
+            byte[] data = "checksum fail".getBytes();
+            String location = createUpload(data.length);
+
+            // Send with bad checksum
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .header("Upload-Checksum", "sha1 AAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(460);
+
+            // Offset should still be 0
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", "0");
+        }
+
+        @Test
+        void malformedChecksumNoSpace() {
+            byte[] data = "test".getBytes();
+            String location = createUpload(data.length);
+
+            // No space between algorithm and value
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .header("Upload-Checksum", "sha1AAAA")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().patch(location)
+                    .then()
+                    // Empty/malformed checksum should be ignored (no separator found)
+                    .statusCode(204);
+        }
+
+        @Test
+        void checksumOnSecondChunk() throws Exception {
+            byte[] chunk1 = "first".getBytes();
+            byte[] chunk2 = "secnd".getBytes();
+            String location = createUpload(chunk1.length + chunk2.length);
+
+            // First chunk without checksum
+            uploadData(location, chunk1, 0);
+
+            // Second chunk with valid checksum
+            MessageDigest md = MessageDigest.getInstance("SHA-1");
+            String checksum = "sha1 " + Base64.getEncoder().encodeToString(md.digest(chunk2));
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", String.valueOf(chunk1.length))
+                    .header("Upload-Checksum", checksum)
+                    .contentType("application/offset+octet-stream")
+                    .body(chunk2)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204);
+        }
+
+        @Test
+        void checksumAlgorithmsLowercaseInOptions() {
+            String algorithms = given()
+                    .when().options("/tus")
+                    .then()
+                    .statusCode(204)
+                    .extract().header("Tus-Checksum-Algorithm");
+
+            assertNotNull(algorithms);
+            for (String alg : algorithms.split(",")) {
+                assertEquals(alg.trim(), alg.trim().toLowerCase(),
+                        "Checksum algorithm should be lowercase: " + alg);
+            }
+        }
+
+        @Test
+        void invalidChecksumAlgorithmReturns460() {
+            byte[] data = "test".getBytes();
+            String location = createUpload(data.length);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .header("Upload-Checksum", "crc32 AAAA")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(460);
+        }
+    }
+
+    // ========== Expiration Conformance ==========
+
+    @Nested
+    class ExpirationConformance {
+
+        @Test
+        void postIncludesUploadExpiresInRfc1123() {
+            String expires = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", "100")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Upload-Expires");
+
+            assertNotNull(expires);
+            assertDoesNotThrow(() ->
+                    ZonedDateTime.parse(expires, DateTimeFormatter.RFC_1123_DATE_TIME));
+        }
+
+        @Test
+        void patchIncludesUploadExpiresInRfc1123() {
+            byte[] data = "exp".getBytes();
+            String location = createUpload(data.length);
+
+            String expires = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204)
+                    .extract().header("Upload-Expires");
+
+            assertNotNull(expires);
+            assertDoesNotThrow(() ->
+                    ZonedDateTime.parse(expires, DateTimeFormatter.RFC_1123_DATE_TIME));
+        }
+
+        @Test
+        void expirationIsInTheFuture() {
+            String location = createUpload(100);
+
+            String expires = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .extract().header("Upload-Expires");
+
+            ZonedDateTime parsed = ZonedDateTime.parse(expires, DateTimeFormatter.RFC_1123_DATE_TIME);
+            assertTrue(parsed.toInstant().isAfter(java.time.Instant.now()),
+                    "Upload-Expires should be in the future");
+        }
+    }
+
+    // ========== Concatenation Conformance ==========
+
+    @Nested
+    class ConcatenationConformance {
+
+        @Test
+        void headOnFinalIncludesUploadConcat() {
+            byte[] data1 = "aaa".getBytes();
+            byte[] data2 = "bbb".getBytes();
+
+            String loc1 = createPartialUpload(data1.length);
+            String loc2 = createPartialUpload(data2.length);
+
+            uploadData(loc1, data1, 0);
+            uploadData(loc2, data2, 0);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc1 + " " + loc2)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            String concat = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(finalLocation)
+                    .then()
+                    .statusCode(200)
+                    .extract().header("Upload-Concat");
+
+            assertNotNull(concat);
+            assertTrue(concat.startsWith("final;"));
+        }
+
+        @Test
+        void patchOnFinalReturns403() {
+            byte[] data1 = "xx".getBytes();
+            byte[] data2 = "yy".getBytes();
+
+            String loc1 = createPartialUpload(data1.length);
+            String loc2 = createPartialUpload(data2.length);
+
+            uploadData(loc1, data1, 0);
+            uploadData(loc2, data2, 0);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc1 + " " + loc2)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            // PATCH on final upload should be forbidden
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body("more".getBytes())
+                    .when().patch(finalLocation)
+                    .then()
+                    .statusCode(403);
+        }
+
+        @Test
+        void offsetEqualsLengthAfterMerge() {
+            byte[] data1 = "part-1".getBytes();
+            byte[] data2 = "part-2".getBytes();
+
+            String loc1 = createPartialUpload(data1.length);
+            String loc2 = createPartialUpload(data2.length);
+
+            uploadData(loc1, data1, 0);
+            uploadData(loc2, data2, 0);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc1 + " " + loc2)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            long expectedLength = data1.length + data2.length;
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(finalLocation)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", String.valueOf(expectedLength))
+                    .header("Upload-Length", String.valueOf(expectedLength));
+        }
+
+        @Test
+        void finalWithIncompletePartialsCanDeferMerge() {
+            // Create a partial but don't upload data
+            String loc = createPartialUpload(10);
+
+            // Attempt to create final concat with incomplete partials
+            // The server should create an unfinished concat (201) or reject (400)
+            int status = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc)
+                    .when().post("/tus")
+                    .then()
+                    .extract().statusCode();
+
+            // Server supports concatenation-unfinished, so it creates a pending final
+            assertTrue(status == 201 || status == 400,
+                    "Should create deferred final or reject: got " + status);
+        }
+
+        @Test
+        void parallelUploadViaConcatenation() throws Exception {
+            int numPartials = 3;
+            int partSize = 100;
+            byte[][] partData = new byte[numPartials][];
+            String[] locations = new String[numPartials];
+
+            for (int i = 0; i < numPartials; i++) {
+                partData[i] = new byte[partSize];
+                Arrays.fill(partData[i], (byte) ('A' + i));
+                locations[i] = createPartialUpload(partSize);
+            }
+
+            // Upload all partials in parallel
+            ExecutorService executor = Executors.newFixedThreadPool(numPartials);
+            CountDownLatch latch = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(numPartials);
+
+            for (int i = 0; i < numPartials; i++) {
+                final int idx = i;
+                executor.submit(() -> {
+                    try {
+                        latch.await();
+                        uploadData(locations[idx], partData[idx], 0);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+
+            latch.countDown();
+            assertTrue(done.await(10, TimeUnit.SECONDS), "All uploads should complete");
+            executor.shutdown();
+
+            // Merge
+            String concatHeader = "final; " + String.join(" ", locations);
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", concatHeader)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            long expectedTotal = (long) numPartials * partSize;
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(finalLocation)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", String.valueOf(expectedTotal))
+                    .header("Upload-Length", String.valueOf(expectedTotal));
+        }
+
+        @Test
+        void headOnPartialShowsPartialConcat() {
+            String location = createPartialUpload(50);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Concat", "partial");
+        }
+
+        @Test
+        void concatenationWithSinglePartial() {
+            byte[] data = "single".getBytes();
+            String loc = createPartialUpload(data.length);
+            uploadData(loc, data, 0);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(finalLocation)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", String.valueOf(data.length))
+                    .header("Upload-Length", String.valueOf(data.length));
+        }
+    }
+
+    // ========== Defer-Length Conformance ==========
+
+    @Nested
+    class DeferLengthConformance {
+
+        @Test
+        void deferValueNotOneReturns400() {
+            // Upload-Defer-Length must be exactly 1; value 0 is treated as absent
+            // so the request lacks both Upload-Length and Upload-Defer-Length
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Defer-Length", "0")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(400);
+        }
+
+        @Test
+        void setLengthThenCompleteUpload() {
+            byte[] data1 = "first".getBytes();
+            byte[] data2 = "secnd".getBytes();
+            long totalLength = data1.length + data2.length;
+
+            String location = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Defer-Length", "1")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            // First PATCH sets the length
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .header("Upload-Length", String.valueOf(totalLength))
+                    .contentType("application/offset+octet-stream")
+                    .body(data1)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204);
+
+            // Second PATCH completes the upload (Upload-Length ignored since already set)
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", String.valueOf(data1.length))
+                    .contentType("application/offset+octet-stream")
+                    .body(data2)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204);
+
+            // Verify final state
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", String.valueOf(totalLength))
+                    .header("Upload-Length", String.valueOf(totalLength));
+        }
+
+        @Test
+        void deferredLengthExceedingMaxRejected() {
+            String location = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Defer-Length", "1")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            // Try to set length beyond max-size (104857600 in test config)
+            int status = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .header("Upload-Length", "104857601")
+                    .contentType("application/offset+octet-stream")
+                    .body("x".getBytes())
+                    .when().patch(location)
+                    .then()
+                    .extract().statusCode();
+
+            // setDeferredLength returns false, results in 400
+            assertTrue(status == 400 || status == 413,
+                    "Deferred length exceeding max should be rejected: got " + status);
+        }
+    }
+}

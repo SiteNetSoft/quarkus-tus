@@ -447,6 +447,16 @@ public class TusUploadResource {
 
         UploadInfo info = uploadInfoOpt.get();
 
+        // TUS spec: PATCH on a final concatenated upload is forbidden
+        if (info.getUploadConcatMergedValue() != null && !info.isFinalConcat()) {
+            return Uni.createFrom().item(
+                    Response.status(FORBIDDEN)
+                            .header("Tus-Resumable", tusRuntimeConfig.version())
+                            .entity("Cannot patch a final concatenated upload")
+                            .build()
+            );
+        }
+
         // Handle deferred length
         if (uploadLength != null && uploadStore.hasDeferredLength(uploadID)) {
             if (!uploadStore.setDeferredLength(uploadID, uploadLength)) {

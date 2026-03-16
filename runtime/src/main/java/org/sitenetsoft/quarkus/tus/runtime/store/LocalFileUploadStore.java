@@ -18,8 +18,10 @@ import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -35,6 +37,8 @@ public class LocalFileUploadStore implements UploadStore {
     private static final Logger LOG = Logger.getLogger(LocalFileUploadStore.class);
 
     private static final long LOCK_TIMEOUT_MS = 30_000;
+    private static final String META_SUFFIX = ".meta";
+    private static final String META_TMP_SUFFIX = ".meta.tmp";
 
     private final Map<String, UploadInfo> uploads = new ConcurrentHashMap<>();
     private final Map<String, Long> activeLocks = new ConcurrentHashMap<>();
@@ -86,6 +90,93 @@ public class LocalFileUploadStore implements UploadStore {
         }
 
         initValidated.set(true);
+
+        reloadPersistedUploads();
+    }
+
+    private void persistMetadata(String id, UploadInfo info) {
+        try {
+            Path tmpFile = uploadBaseDir.resolve(id + META_TMP_SUFFIX);
+            Path metaFile = uploadBaseDir.resolve(id + META_SUFFIX);
+            Files.writeString(tmpFile, info.toJson(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            Files.move(tmpFile, metaFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            LOG.warnf(e, "Failed to persist metadata for upload %s", id);
+        }
+    }
+
+    private void deleteMetadata(String id) {
+        try {
+            Files.deleteIfExists(uploadBaseDir.resolve(id + META_SUFFIX));
+            Files.deleteIfExists(uploadBaseDir.resolve(id + META_TMP_SUFFIX));
+        } catch (IOException e) {
+            LOG.warnf(e, "Failed to delete metadata for upload %s", id);
+        }
+    }
+
+    private void reloadPersistedUploads() {
+        int loaded = 0, expired = 0, skipped = 0;
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(uploadBaseDir, "*" + META_SUFFIX)) {
+            for (Path metaFile : stream) {
+                String fileName = metaFile.getFileName().toString();
+                String id = fileName.substring(0, fileName.length() - META_SUFFIX.length());
+
+                if (!org.sitenetsoft.quarkus.tus.runtime.TusUtils.isValidUuid(id)) {
+                    skipped++;
+                    continue;
+                }
+
+                Path dataFile = safePath(id);
+                if (!Files.exists(dataFile)) {
+                    LOG.warnf("Orphaned metadata file (no data file): %s — removing", fileName);
+                    deleteMetadata(id);
+                    skipped++;
+                    continue;
+                }
+
+                try {
+                    String json = Files.readString(metaFile);
+                    UploadInfo info = UploadInfo.fromJson(json);
+
+                    // Remove expired uploads
+                    if (info.getExpiresAt() != null && Instant.now().isAfter(info.getExpiresAt())) {
+                        Files.deleteIfExists(dataFile);
+                        deleteMetadata(id);
+                        expired++;
+                        continue;
+                    }
+
+                    // Reconcile offset with actual file size
+                    long fileSize = Files.size(dataFile);
+                    if (info.getOffset() != fileSize && !info.isFinalConcat()) {
+                        LOG.warnf("Offset mismatch for upload %s: meta=%d, file=%d — trusting file size",
+                                id, info.getOffset(), fileSize);
+                        info.setOffset(fileSize);
+                    }
+
+                    uploads.put(id, info);
+                    loaded++;
+                } catch (Exception e) {
+                    LOG.warnf(e, "Corrupt metadata file %s — skipping", fileName);
+                    skipped++;
+                }
+            }
+        } catch (IOException e) {
+            LOG.warnf(e, "Failed to scan for persisted uploads in %s", uploadBaseDir);
+        }
+
+        // Clean up orphaned .meta.tmp files
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(uploadBaseDir, "*" + META_TMP_SUFFIX)) {
+            for (Path tmpFile : stream) {
+                Files.deleteIfExists(tmpFile);
+            }
+        } catch (IOException e) {
+            LOG.warnf(e, "Failed to clean up tmp metadata files");
+        }
+
+        if (loaded > 0 || expired > 0 || skipped > 0) {
+            LOG.infof("Reloaded persisted uploads: loaded=%d, expired=%d, skipped=%d", loaded, expired, skipped);
+        }
     }
 
     private Path safePath(String id) {
@@ -133,6 +224,7 @@ public class LocalFileUploadStore implements UploadStore {
             return Optional.empty();
         }
 
+        persistMetadata(id, info);
         return Optional.of(tusBuildTimeConfig.path() + "/" + id);
     }
 
@@ -141,6 +233,7 @@ public class LocalFileUploadStore implements UploadStore {
         UploadInfo info = uploads.get(id);
         if (info != null) {
             info.setUploaderId(uploaderId);
+            persistMetadata(id, info);
         }
     }
 
@@ -177,6 +270,7 @@ public class LocalFileUploadStore implements UploadStore {
             return Optional.empty();
         }
 
+        persistMetadata(id, info);
         LOG.infof("Created deferred-length upload %s", id);
         return Optional.of(tusBuildTimeConfig.path() + "/" + id);
     }
@@ -200,6 +294,7 @@ public class LocalFileUploadStore implements UploadStore {
         info.setEntityLength(length);
         info.setDeferredLength(false);
         uploadProgressService.startUpload(id, length);
+        persistMetadata(id, info);
         LOG.infof("Set deferred length for upload %s to %d", id, length);
         return true;
     }
@@ -307,6 +402,7 @@ public class LocalFileUploadStore implements UploadStore {
             finalInfo.setUploadConcatMergedValue(concatValue.toString());
 
             uploads.put(finalId, finalInfo);
+            persistMetadata(finalId, finalInfo);
 
             for (String partialId : ids) {
                 discardUpload(partialId);
@@ -385,6 +481,7 @@ public class LocalFileUploadStore implements UploadStore {
             return Optional.empty();
         }
 
+        persistMetadata(finalId, finalInfo);
         return Optional.of(tusBuildTimeConfig.path() + "/" + finalId);
     }
 
@@ -448,6 +545,7 @@ public class LocalFileUploadStore implements UploadStore {
                     discardUpload(partialId);
                 }
                 info.setPartialIds(null);
+                persistMetadata(id, info);
 
                 return true;
 
@@ -478,6 +576,7 @@ public class LocalFileUploadStore implements UploadStore {
         } catch (IOException e) {
             LOG.warnf(e, "Failed to delete upload file for %s", id);
         }
+        deleteMetadata(id);
 
         return removed != null;
     }
@@ -566,6 +665,7 @@ public class LocalFileUploadStore implements UploadStore {
                 )
                 .onItem().invoke(newOffset -> {
                     info.setOffset(newOffset);
+                    persistMetadata(id, info);
                 })
                 .emitOn(Infrastructure.getDefaultWorkerPool())
                 .onItem().invoke(newOffset -> {
@@ -624,6 +724,7 @@ public class LocalFileUploadStore implements UploadStore {
             out.write(data);
             long newOffset = Math.min(data.length, info.getEntityLength());
             info.setOffset(newOffset);
+            persistMetadata(id, info);
             return newOffset;
         } catch (IOException e) {
             LOG.errorf(e, "Failed to write initial data for upload %s", id);

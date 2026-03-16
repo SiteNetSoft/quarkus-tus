@@ -1,0 +1,166 @@
+= Parallel Uploads via Concatenation
+
+include::./includes/attributes.adoc[]
+
+The TUS `concatenation` extension enables parallel uploads by splitting a large file into multiple parts, uploading them concurrently, and merging them server-side into a single final upload. This can significantly speed up uploads on high-bandwidth connections.
+
+== How It Works
+
+[source,text]
+----
+Client                                          Server
+  |                                               |
+  |--- POST (partial, part1) -------------------->|  201 + Location /tus/{id1}
+  |--- POST (partial, part2) -------------------->|  201 + Location /tus/{id2}
+  |--- POST (partial, part3) -------------------->|  201 + Location /tus/{id3}
+  |                                               |
+  |--- PATCH /tus/{id1} (bytes 0-N) ------------>|  204 (concurrent)
+  |--- PATCH /tus/{id2} (bytes 0-N) ------------>|  204 (concurrent)
+  |--- PATCH /tus/{id3} (bytes 0-N) ------------>|  204 (concurrent)
+  |                                               |
+  |--- POST (final; /tus/{id1} /tus/{id2} ...) ->|  201 + Location /tus/{finalId}
+  |                                               |
+  |--- HEAD /tus/{finalId} --------------------->|  200 (merged, complete)
+----
+
+1. **Create partial uploads** -- one POST per part, each with `Upload-Concat: partial`
+2. **Upload data in parallel** -- each part can be uploaded concurrently via PATCH
+3. **Merge** -- a single POST with `Upload-Concat: final; /tus/{id1} /tus/{id2} /tus/{id3}` merges all parts
+
+== Step-by-Step with curl
+
+=== 1. Create Partial Uploads
+
+[source,bash]
+----
+# Part 1 (first 1MB)
+curl -X POST http://localhost:8080/tus \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Length: 1048576" \
+  -H "Upload-Concat: partial" \
+  -i
+# -> Location: /tus/aaa-...
+
+# Part 2 (second 1MB)
+curl -X POST http://localhost:8080/tus \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Length: 1048576" \
+  -H "Upload-Concat: partial" \
+  -i
+# -> Location: /tus/bbb-...
+
+# Part 3 (final 500KB)
+curl -X POST http://localhost:8080/tus \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Length: 512000" \
+  -H "Upload-Concat: partial" \
+  -i
+# -> Location: /tus/ccc-...
+----
+
+=== 2. Upload Data in Parallel
+
+Run these in separate terminals or as background processes:
+
+[source,bash]
+----
+# Upload part 1
+curl -X PATCH http://localhost:8080/tus/aaa-... \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Offset: 0" \
+  -H "Content-Type: application/offset+octet-stream" \
+  --data-binary @part1.bin &
+
+# Upload part 2
+curl -X PATCH http://localhost:8080/tus/bbb-... \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Offset: 0" \
+  -H "Content-Type: application/offset+octet-stream" \
+  --data-binary @part2.bin &
+
+# Upload part 3
+curl -X PATCH http://localhost:8080/tus/ccc-... \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Offset: 0" \
+  -H "Content-Type: application/offset+octet-stream" \
+  --data-binary @part3.bin &
+
+wait  # Wait for all uploads to complete
+----
+
+=== 3. Merge into Final Upload
+
+[source,bash]
+----
+curl -X POST http://localhost:8080/tus \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Concat: final; /tus/aaa-... /tus/bbb-... /tus/ccc-..." \
+  -i
+# -> 201 Created
+# -> Location: /tus/final-...
+----
+
+=== 4. Verify the Result
+
+[source,bash]
+----
+curl -X HEAD http://localhost:8080/tus/final-... \
+  -H "Tus-Resumable: 1.0.0" \
+  -i
+# -> Upload-Offset: 2609152
+# -> Upload-Length: 2609152
+# -> Upload-Concat: final;/tus/aaa-... /tus/bbb-... /tus/ccc-...
+----
+
+== JavaScript Client Example
+
+Using the official https://github.com/tus/tus-js-client[tus-js-client] with parallel uploads:
+
+[source,javascript]
+----
+import * as tus from "tus-js-client";
+
+const file = document.getElementById("fileInput").files[0];
+
+const upload = new tus.Upload(file, {
+  endpoint: "http://localhost:8080/tus",
+  chunkSize: 5 * 1024 * 1024,    // 5MB chunks
+  parallelUploads: 3,             // Upload 3 parts concurrently
+  retryDelays: [0, 1000, 3000],
+  metadata: {
+    filename: file.name,
+    filetype: file.type,
+  },
+  onProgress: (bytesUploaded, bytesTotal) => {
+    const pct = ((bytesUploaded / bytesTotal) * 100).toFixed(1);
+    console.log(`${pct}% uploaded`);
+  },
+  onSuccess: () => {
+    console.log("Upload complete:", upload.url);
+  },
+  onError: (error) => {
+    console.error("Upload failed:", error);
+  },
+});
+
+upload.start();
+----
+
+When `parallelUploads > 1`, tus-js-client automatically:
+
+1. Splits the file into parts
+2. Creates partial uploads for each
+3. Uploads parts concurrently
+4. Sends the final concatenation request
+
+== Unfinished Concatenation
+
+If some partial uploads are still in progress when you send the final concatenation request, the server supports **concatenation-unfinished**: it creates a pending final upload and auto-merges when all partials complete. Check progress via HEAD on the final upload ID.
+
+== Performance Tips
+
+* **Part count:** 3-5 parts is typically optimal. More parts add overhead; fewer parts limit parallelism.
+* **Part sizing:** Equal-sized parts maximize throughput. Make the last part smaller if the file size isn't evenly divisible.
+* **Chunk size:** Each partial upload can itself use chunked PATCH requests for resumability. Set `quarkus.tus.max-chunk-size` appropriately.
+* **Network:** Parallel uploads help most on high-bandwidth, high-latency connections where a single TCP stream can't saturate the link.
+* **Server-side merge:** The merge operation copies data sequentially. For very large uploads (> 1GB), ensure sufficient disk I/O capacity and temporary storage.
