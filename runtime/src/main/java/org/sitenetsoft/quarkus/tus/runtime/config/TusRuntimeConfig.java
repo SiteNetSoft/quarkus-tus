@@ -40,6 +40,18 @@ public interface TusRuntimeConfig {
     String checksumAlgorithms();
 
     /**
+     * Maximum requests per minute per client for rate limiting.
+     */
+    @WithDefault("60")
+    int rateLimitRequestsPerMinute();
+
+    /**
+     * Maximum burst size for rate limiting (initial token count).
+     */
+    @WithDefault("10")
+    int rateLimitBurstSize();
+
+    /**
      * Local store configuration.
      */
     StoreConfig store();

@@ -17,27 +17,31 @@ subprojects {
         targetCompatibility = JavaVersion.VERSION_25
     }
 
-    compileJava {
+    // Gradle 10 readiness: use task configuration avoidance APIs
+    tasks.withType(JavaCompile).configureEach {
         options.encoding = 'UTF-8'
-        options.compilerArgs << '-parameters'
     }
 
-    compileTestJava {
-        options.encoding = 'UTF-8'
+    tasks.named('compileJava') {
+        options.compilerArgs << '-parameters'
     }
 
     jacoco {
         toolVersion = '0.8.14'
     }
 
-    jacocoTestReport {
+    tasks.named('jacocoTestReport') {
         reports {
             xml.required = true
             html.required = true
         }
     }
 
-    test {
-        finalizedBy jacocoTestReport
+    tasks.named('test') {
+        finalizedBy tasks.named('jacocoTestReport')
     }
+
+    // Note: The remaining Gradle deprecation warning about Task.project at execution time
+    // comes from the io.quarkus.extension plugin's validateExtension task and must be fixed
+    // upstream in Quarkus. It is not addressable in project code.
 }

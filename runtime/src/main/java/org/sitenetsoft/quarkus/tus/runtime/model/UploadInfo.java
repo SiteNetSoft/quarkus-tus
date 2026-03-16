@@ -1,6 +1,13 @@
 package org.sitenetsoft.quarkus.tus.runtime.model;
 
+import jakarta.json.Json;
+import jakarta.json.JsonArrayBuilder;
+import jakarta.json.JsonObject;
+import jakarta.json.JsonReader;
+import jakarta.json.JsonString;
+import java.io.StringReader;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 
 public class UploadInfo {
@@ -62,6 +69,67 @@ public class UploadInfo {
             }
         }
         return true;
+    }
+
+    public String toJson() {
+        var builder = Json.createObjectBuilder()
+                .add("entityLength", entityLength)
+                .add("offset", offset)
+                .add("isPartial", isPartial)
+                .add("deferredLength", deferredLength)
+                .add("isFinalConcat", isFinalConcat);
+
+        if (metadata != null) {
+            builder.add("metadata", metadata);
+        }
+        if (uploadConcatMergedValue != null) {
+            builder.add("uploadConcatMergedValue", uploadConcatMergedValue);
+        }
+        if (expiresAt != null) {
+            builder.add("expiresAt", expiresAt.toString());
+        }
+        if (partialIds != null) {
+            JsonArrayBuilder arr = Json.createArrayBuilder();
+            partialIds.forEach(arr::add);
+            builder.add("partialIds", arr);
+        }
+        if (uploaderId != null) {
+            builder.add("uploaderId", uploaderId);
+        }
+
+        return builder.build().toString();
+    }
+
+    public static UploadInfo fromJson(String json) {
+        try (JsonReader reader = Json.createReader(new StringReader(json))) {
+            JsonObject obj = reader.readObject();
+            UploadInfo info = new UploadInfo();
+            info.setEntityLength(obj.getJsonNumber("entityLength").longValue());
+            info.setOffset(obj.getJsonNumber("offset").longValue());
+            info.setPartial(obj.getBoolean("isPartial", false));
+            info.setDeferredLength(obj.getBoolean("deferredLength", false));
+            info.setFinalConcat(obj.getBoolean("isFinalConcat", false));
+
+            if (obj.containsKey("metadata") && !obj.isNull("metadata")) {
+                info.setMetadata(obj.getString("metadata"));
+            }
+            if (obj.containsKey("uploadConcatMergedValue") && !obj.isNull("uploadConcatMergedValue")) {
+                info.setUploadConcatMergedValue(obj.getString("uploadConcatMergedValue"));
+            }
+            if (obj.containsKey("expiresAt") && !obj.isNull("expiresAt")) {
+                info.setExpiresAt(Instant.parse(obj.getString("expiresAt")));
+            }
+            if (obj.containsKey("partialIds") && !obj.isNull("partialIds")) {
+                List<String> ids = new ArrayList<>();
+                obj.getJsonArray("partialIds").forEach(v -> ids.add(((JsonString) v).getString()));
+                info.setPartialIds(ids);
+            }
+            if (obj.containsKey("uploaderId") && !obj.isNull("uploaderId")) {
+                info.setUploaderId(obj.getString("uploaderId"));
+            }
+
+            return info;
+        }
     }
 
     @Override

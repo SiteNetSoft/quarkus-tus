@@ -11,6 +11,8 @@ import org.sitenetsoft.quarkus.tus.runtime.UploadExpirationScheduler;
 import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
 import org.sitenetsoft.quarkus.tus.runtime.auth.TusAuthFilter;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
+import org.sitenetsoft.quarkus.tus.runtime.ratelimit.TusRateLimitFilter;
+import org.sitenetsoft.quarkus.tus.runtime.ratelimit.TusRateLimitService;
 import org.sitenetsoft.quarkus.tus.runtime.devui.TusDevUIJsonRpcService;
 import org.sitenetsoft.quarkus.tus.runtime.health.TusHealthCheck;
 import org.sitenetsoft.quarkus.tus.runtime.metrics.TusMetricsService;
@@ -55,7 +57,8 @@ class TusProcessor {
                         UploadProgressService.class,
                         UploadExpirationScheduler.class,
                         TusMetricsService.class,
-                        TusDevUIJsonRpcService.class
+                        TusDevUIJsonRpcService.class,
+                        TusRateLimitService.class
                 )
                 .build();
     }
@@ -83,6 +86,17 @@ class TusProcessor {
         return AdditionalBeanBuildItem.builder()
                 .setUnremovable()
                 .addBeanClasses(TusHealthCheck.class)
+                .build();
+    }
+
+    @BuildStep
+    AdditionalBeanBuildItem tusRateLimitFilter(TusBuildTimeConfig config) {
+        if (!config.rateLimitEnabled()) {
+            return new AdditionalBeanBuildItem.Builder().build();
+        }
+        return AdditionalBeanBuildItem.builder()
+                .setUnremovable()
+                .addBeanClasses(TusRateLimitFilter.class)
                 .build();
     }
 

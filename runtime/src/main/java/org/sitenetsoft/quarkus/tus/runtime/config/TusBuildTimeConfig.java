@@ -22,6 +22,12 @@ public interface TusBuildTimeConfig {
     boolean authEnabled();
 
     /**
+     * Whether the rate limit filter is registered.
+     */
+    @WithDefault("false")
+    boolean rateLimitEnabled();
+
+    /**
      * URL path for TUS endpoints.
      */
     @WithDefault("/tus")
