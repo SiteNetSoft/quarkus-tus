@@ -62,6 +62,13 @@ public interface TusRuntimeConfig {
     @WithDefault("10485760")
     long maxChunkSize();
 
+    /**
+     * Hours of inactivity before an incomplete upload is considered stale and eligible for cleanup.
+     * Set to 0 to disable stale upload cleanup.
+     */
+    @WithDefault("6")
+    long staleUploadHours();
+
     interface StoreConfig {
         /**
          * Local file store configuration.

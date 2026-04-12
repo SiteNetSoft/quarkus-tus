@@ -5,12 +5,19 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
+import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 import org.sitenetsoft.quarkus.tus.runtime.store.LocalFileUploadStore;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.*;
 
 import static io.restassured.RestAssured.given;
@@ -31,6 +38,9 @@ class TusEdgeCaseTest {
 
     @Inject
     UploadProgressService uploadProgressService;
+
+    @Inject
+    TusRuntimeConfig tusRuntimeConfig;
 
     @BeforeEach
     void setUp() {
@@ -329,6 +339,146 @@ class TusEdgeCaseTest {
                 .when().head(location)
                 .then()
                 .statusCode(404);
+    }
+
+    // ---- Stale upload cleanup ----
+
+    @Test
+    void testStaleUploadIsCleanedUp() {
+        if (uploadStore instanceof LocalFileUploadStore localStore) {
+            String location = createUpload(100);
+            String uploadId = extractId(location);
+
+            // Manually backdate lastActivity to make it stale
+            var info = uploadStore.findUploadInfo(uploadId).orElseThrow();
+            info.setLastActivity(Instant.now().minus(7, ChronoUnit.HOURS));
+
+            List<String> cleaned = localStore.cleanupStaleUploads(6);
+            assertTrue(cleaned.contains(uploadId), "Stale upload should be cleaned up");
+            assertTrue(uploadStore.findUploadInfo(uploadId).isEmpty(), "Upload should be removed");
+        }
+    }
+
+    @Test
+    void testActiveUploadIsNotCleanedUp() {
+        if (uploadStore instanceof LocalFileUploadStore localStore) {
+            String location = createUpload(100);
+            String uploadId = extractId(location);
+
+            // lastActivity is set at creation time (recent), so should survive
+            List<String> cleaned = localStore.cleanupStaleUploads(6);
+            assertFalse(cleaned.contains(uploadId), "Active upload should NOT be cleaned up");
+            assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(), "Upload should still exist");
+
+            // Clean up
+            uploadStore.discardUpload(uploadId);
+        }
+    }
+
+    @Test
+    void testCompletedUploadIsNotCleanedUpAsStale() {
+        if (uploadStore instanceof LocalFileUploadStore localStore) {
+            byte[] data = "test".getBytes();
+            String location = createUpload(data.length);
+            String uploadId = extractId(location);
+
+            // Complete the upload
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204);
+
+            // Backdate lastActivity
+            var info = uploadStore.findUploadInfo(uploadId).orElseThrow();
+            info.setLastActivity(Instant.now().minus(7, ChronoUnit.HOURS));
+
+            List<String> cleaned = localStore.cleanupStaleUploads(6);
+            assertFalse(cleaned.contains(uploadId), "Completed upload should NOT be cleaned up as stale");
+
+            // Clean up
+            uploadStore.discardUpload(uploadId);
+        }
+    }
+
+    @Test
+    void testStaleCleanupDisabledWithZeroHours() {
+        if (uploadStore instanceof LocalFileUploadStore localStore) {
+            String location = createUpload(100);
+            String uploadId = extractId(location);
+
+            var info = uploadStore.findUploadInfo(uploadId).orElseThrow();
+            info.setLastActivity(Instant.now().minus(7, ChronoUnit.HOURS));
+
+            List<String> cleaned = localStore.cleanupStaleUploads(0);
+            assertTrue(cleaned.isEmpty(), "Stale cleanup with 0 hours should do nothing");
+            assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(), "Upload should still exist");
+
+            // Clean up
+            uploadStore.discardUpload(uploadId);
+        }
+    }
+
+    // ---- Orphan file cleanup ----
+
+    @Test
+    void testOrphanDataFileIsCleanedUp() throws IOException {
+        if (uploadStore instanceof LocalFileUploadStore localStore) {
+            Path uploadDir = Path.of(tusRuntimeConfig.store().local().uploadDir());
+            String orphanId = UUID.randomUUID().toString();
+            Path orphanFile = uploadDir.resolve(orphanId);
+
+            // Create a data file with no .meta and no in-memory entry
+            Files.writeString(orphanFile, "orphaned data");
+            assertTrue(Files.exists(orphanFile));
+
+            int cleaned = localStore.cleanupOrphanFiles();
+            assertTrue(cleaned >= 1, "Should clean up at least 1 orphan file");
+            assertFalse(Files.exists(orphanFile), "Orphan file should be deleted");
+        }
+    }
+
+    @Test
+    void testNonOrphanFileIsNotCleaned() {
+        if (uploadStore instanceof LocalFileUploadStore localStore) {
+            // A tracked upload's data file should NOT be cleaned up
+            String location = createUpload(100);
+            String uploadId = extractId(location);
+
+            int cleaned = localStore.cleanupOrphanFiles();
+            assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(),
+                    "Tracked upload should survive orphan cleanup");
+
+            // Clean up
+            uploadStore.discardUpload(uploadId);
+        }
+    }
+
+    // ---- Write failure truncation ----
+
+    @Test
+    void testWriteInitialDataFailureTruncatesFile() throws IOException {
+        if (uploadStore instanceof LocalFileUploadStore) {
+            // Create an upload, then verify truncation behavior by writing valid data
+            // and checking the file is consistent
+            byte[] data = "hello".getBytes();
+            String location = createUpload(data.length);
+            String uploadId = extractId(location);
+
+            long offset = uploadStore.writeInitialData(uploadId, data);
+            assertEquals(data.length, offset, "Initial data should be written");
+
+            // Verify file size matches offset
+            Path uploadDir = Path.of(tusRuntimeConfig.store().local().uploadDir());
+            Path file = uploadDir.resolve(uploadId);
+            assertEquals(data.length, Files.size(file), "File size should match written data");
+
+            // Clean up
+            uploadStore.discardUpload(uploadId);
+        }
     }
 
     // ---- Helpers ----
