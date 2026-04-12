@@ -22,6 +22,7 @@ public class UploadInfo {
     private boolean isFinalConcat;
     private List<String> partialIds;
     private String uploaderId;
+    private Instant lastActivity;
 
     public long getEntityLength() { return entityLength; }
     public void setEntityLength(long entityLength) { this.entityLength = entityLength; }
@@ -54,6 +55,9 @@ public class UploadInfo {
 
     public String getUploaderId() { return uploaderId; }
     public void setUploaderId(String uploaderId) { this.uploaderId = uploaderId; }
+
+    public Instant getLastActivity() { return lastActivity; }
+    public void setLastActivity(Instant lastActivity) { this.lastActivity = lastActivity; }
 
     /**
      * Checks if all partial uploads for this final concat are complete.
@@ -96,6 +100,9 @@ public class UploadInfo {
         if (uploaderId != null) {
             builder.add("uploaderId", uploaderId);
         }
+        if (lastActivity != null) {
+            builder.add("lastActivity", lastActivity.toString());
+        }
 
         return builder.build().toString();
     }
@@ -126,6 +133,9 @@ public class UploadInfo {
             }
             if (obj.containsKey("uploaderId") && !obj.isNull("uploaderId")) {
                 info.setUploaderId(obj.getString("uploaderId"));
+            }
+            if (obj.containsKey("lastActivity") && !obj.isNull("lastActivity")) {
+                info.setLastActivity(Instant.parse(obj.getString("lastActivity")));
             }
 
             return info;

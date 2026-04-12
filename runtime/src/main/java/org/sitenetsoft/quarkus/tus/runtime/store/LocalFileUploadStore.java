@@ -18,6 +18,7 @@ import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.channels.FileChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -204,6 +205,7 @@ public class LocalFileUploadStore implements UploadStore {
         info.setEntityLength(totalLength);
         info.setOffset(0L);
         info.setPartial(isPartial);
+        info.setLastActivity(Instant.now());
         uploadMetadata.ifPresent(info::setMetadata);
 
         Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
@@ -252,6 +254,7 @@ public class LocalFileUploadStore implements UploadStore {
         info.setOffset(0L);
         info.setPartial(isPartial);
         info.setDeferredLength(true);
+        info.setLastActivity(Instant.now());
         uploadMetadata.ifPresent(info::setMetadata);
 
         Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
@@ -550,7 +553,8 @@ public class LocalFileUploadStore implements UploadStore {
                 return true;
 
             } catch (IOException e) {
-                LOG.errorf(e, "Failed to finalize concatenation %s", id);
+                LOG.errorf(e, "Failed to finalize concatenation %s — truncating partial merge", id);
+                truncateToOffset(finalFile, 0);
                 return false;
             }
         } finally {
@@ -665,6 +669,7 @@ public class LocalFileUploadStore implements UploadStore {
                 )
                 .onItem().invoke(newOffset -> {
                     info.setOffset(newOffset);
+                    info.setLastActivity(Instant.now());
                     persistMetadata(id, info);
                 })
                 .emitOn(Infrastructure.getDefaultWorkerPool())
@@ -675,7 +680,10 @@ public class LocalFileUploadStore implements UploadStore {
                                 id, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));
                     }
                 })
-                .onFailure().invoke(e -> LOG.errorf(e, "Error while writing upload %s to %s", id, file));
+                .onFailure().invoke(e -> {
+                    LOG.errorf(e, "Error writing upload %s to %s — truncating to safe offset %d", id, file, offset);
+                    truncateToOffset(file, offset);
+                });
     }
 
     private boolean validateChecksum(byte[] data, UploadInfo.ChecksumInfo checksumInfo) {
@@ -724,10 +732,12 @@ public class LocalFileUploadStore implements UploadStore {
             out.write(data);
             long newOffset = Math.min(data.length, info.getEntityLength());
             info.setOffset(newOffset);
+            info.setLastActivity(Instant.now());
             persistMetadata(id, info);
             return newOffset;
         } catch (IOException e) {
-            LOG.errorf(e, "Failed to write initial data for upload %s", id);
+            LOG.errorf(e, "Failed to write initial data for upload %s — truncating to 0", id);
+            truncateToOffset(file, 0);
             return -1;
         }
     }
@@ -754,6 +764,14 @@ public class LocalFileUploadStore implements UploadStore {
         return Optional.ofNullable(info.getExpiresAt());
     }
 
+    private void truncateToOffset(Path file, long safeOffset) {
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
+            channel.truncate(safeOffset);
+        } catch (IOException truncErr) {
+            LOG.warnf(truncErr, "Failed to truncate file %s to offset %d", file, safeOffset);
+        }
+    }
+
     @Override
     public List<String> cleanupExpiredUploads() {
         List<String> expiredIds = new ArrayList<>();
@@ -777,5 +795,74 @@ public class LocalFileUploadStore implements UploadStore {
         }
 
         return expiredIds;
+    }
+
+    /**
+     * Removes incomplete uploads that have had no activity for the given number of hours.
+     */
+    public List<String> cleanupStaleUploads(long staleHours) {
+        if (staleHours <= 0) {
+            return List.of();
+        }
+
+        Instant cutoff = Instant.now().minus(staleHours, ChronoUnit.HOURS);
+        List<String> staleIds = new ArrayList<>();
+
+        for (Map.Entry<String, UploadInfo> entry : uploads.entrySet()) {
+            UploadInfo info = entry.getValue();
+            // Only clean up incomplete uploads
+            if (info.getOffset() >= info.getEntityLength() && info.getEntityLength() >= 0) {
+                continue;
+            }
+            Instant lastActivity = info.getLastActivity();
+            if (lastActivity != null && lastActivity.isBefore(cutoff)) {
+                staleIds.add(entry.getKey());
+            }
+        }
+
+        for (String id : staleIds) {
+            LOG.infof("Cleaning up stale upload %s (no activity since %s)", id,
+                    uploads.get(id) != null ? uploads.get(id).getLastActivity() : "unknown");
+            discardUpload(id);
+        }
+
+        if (!staleIds.isEmpty()) {
+            LOG.infof("Cleaned up %d stale uploads", staleIds.size());
+        }
+
+        return staleIds;
+    }
+
+    /**
+     * Scans the upload directory for data files with no matching in-memory entry
+     * and no .meta sidecar file. These are orphans from crashes or incomplete cleanup.
+     */
+    public int cleanupOrphanFiles() {
+        int cleaned = 0;
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(uploadBaseDir)) {
+            for (Path file : stream) {
+                String name = file.getFileName().toString();
+                // Skip metadata files
+                if (name.endsWith(META_SUFFIX) || name.endsWith(META_TMP_SUFFIX)) {
+                    continue;
+                }
+                // Only consider UUID-named files
+                if (!org.sitenetsoft.quarkus.tus.runtime.TusUtils.isValidUuid(name)) {
+                    continue;
+                }
+                // If there's no in-memory entry and no .meta file, it's an orphan
+                if (!uploads.containsKey(name) && !Files.exists(uploadBaseDir.resolve(name + META_SUFFIX))) {
+                    LOG.infof("Removing orphan data file: %s", name);
+                    Files.deleteIfExists(file);
+                    cleaned++;
+                }
+            }
+        } catch (IOException e) {
+            LOG.warnf(e, "Failed to scan for orphan files in %s", uploadBaseDir);
+        }
+        if (cleaned > 0) {
+            LOG.infof("Cleaned up %d orphan files", cleaned);
+        }
+        return cleaned;
     }
 }
