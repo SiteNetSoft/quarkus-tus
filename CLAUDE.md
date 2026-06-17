@@ -24,7 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Tech Stack & Versions
 
-- **Quarkus 3.35.3** (via quarkus-bom)
+- **Quarkus 3.36.2** (via quarkus-bom)
 - **Java 25** (source and target compatibility)
 - **Gradle 9.5.1** (wrapper)
 - **quarkus-arc**, **quarkus-rest**, **quarkus-scheduler**, **quarkus-vertx** (runtime deps)
