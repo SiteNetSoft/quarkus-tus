@@ -673,6 +673,65 @@ class TusProtocolConformanceTest {
             assertTrue(concat.startsWith("final;"));
         }
 
+        /**
+         * The spec requires HEAD on a final upload to return Upload-Concat "as received in
+         * the upload creation request", so a client that sent absolute URLs must get its own
+         * value back rather than one rebuilt from the parsed IDs.
+         */
+        @Test
+        void headOnFinalEchoesUploadConcatAsReceived() {
+            byte[] data1 = "aa".getBytes();
+            byte[] data2 = "bb".getBytes();
+
+            String loc1 = createPartialUpload(data1.length);
+            String loc2 = createPartialUpload(data2.length);
+            uploadData(loc1, data1, 0);
+            uploadData(loc2, data2, 0);
+
+            String sent = "final; https://example.com/tus/" + extractId(loc1)
+                    + " https://example.com/tus/" + extractId(loc2);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", sent)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(finalLocation)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Concat", equalTo(sent));
+        }
+
+        /**
+         * The same applies to a final whose partials are still incomplete, which takes the
+         * separate unfinished-merge path.
+         */
+        @Test
+        void headOnUnfinishedFinalEchoesUploadConcatAsReceived() {
+            String loc = createPartialUpload(10);
+            String sent = "final; https://example.com/tus/" + extractId(loc);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", sent)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(finalLocation)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Concat", equalTo(sent));
+        }
+
         @Test
         void patchOnFinalReturns403() {
             byte[] data1 = "xx".getBytes();

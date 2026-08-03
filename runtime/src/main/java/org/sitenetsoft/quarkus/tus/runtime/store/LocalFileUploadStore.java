@@ -311,7 +311,8 @@ public class LocalFileUploadStore implements UploadStore {
     @Override
     public Optional<String> mergePartialUploadsWithOwnership(String[] ids,
                                                               Optional<String> uploadMetadata,
-                                                              String requiredOwnerId) {
+                                                              String requiredOwnerId,
+                                                              String uploadConcatHeader) {
         if (ids == null || ids.length == 0) {
             return Optional.empty();
         }
@@ -333,7 +334,7 @@ public class LocalFileUploadStore implements UploadStore {
         }
 
         try {
-            return doMergeWithOwnership(ids, uploadMetadata, requiredOwnerId);
+            return doMergeWithOwnership(ids, uploadMetadata, requiredOwnerId, uploadConcatHeader);
         } finally {
             lockedIds.forEach(this::releaseLock);
         }
@@ -341,7 +342,8 @@ public class LocalFileUploadStore implements UploadStore {
 
     private Optional<String> doMergeWithOwnership(String[] ids,
                                                     Optional<String> uploadMetadata,
-                                                    String requiredOwnerId) {
+                                                    String requiredOwnerId,
+                                                    String uploadConcatHeader) {
         long totalLength = 0;
         for (String partialId : ids) {
             UploadInfo partialInfo = uploads.get(partialId);
@@ -400,12 +402,7 @@ public class LocalFileUploadStore implements UploadStore {
             finalInfo.setExpiresAt(Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS));
             uploadMetadata.ifPresent(finalInfo::setMetadata);
 
-            StringBuilder concatValue = new StringBuilder("final;");
-            for (int i = 0; i < ids.length; i++) {
-                if (i > 0) concatValue.append(" ");
-                concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
-            }
-            finalInfo.setUploadConcatMergedValue(concatValue.toString());
+            finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
 
             uploads.put(finalId, finalInfo);
             persistMetadata(finalId, finalInfo);
@@ -432,7 +429,7 @@ public class LocalFileUploadStore implements UploadStore {
 
     @Override
     public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata,
-                                                          String requiredOwnerId) {
+                                                          String requiredOwnerId, String uploadConcatHeader) {
         if (ids == null || ids.length == 0) {
             return Optional.empty();
         }
@@ -478,12 +475,7 @@ public class LocalFileUploadStore implements UploadStore {
         Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
         finalInfo.setExpiresAt(expiresAt);
 
-        StringBuilder concatValue = new StringBuilder("final;");
-        for (int i = 0; i < ids.length; i++) {
-            if (i > 0) concatValue.append(" ");
-            concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
-        }
-        finalInfo.setUploadConcatMergedValue(concatValue.toString());
+        finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
 
         uploads.put(finalId, finalInfo);
 
@@ -500,6 +492,23 @@ public class LocalFileUploadStore implements UploadStore {
 
         persistMetadata(finalId, finalInfo);
         return Optional.of(tusBuildTimeConfig.path() + "/" + finalId);
+    }
+
+    /**
+     * The protocol requires HEAD on a final upload to return {@code Upload-Concat} exactly as
+     * the client sent it, so the raw header wins. Rebuilding from the parsed IDs is only a
+     * fallback for callers that reach the SPI without one.
+     */
+    private String concatValueFor(String[] ids, String uploadConcatHeader) {
+        if (uploadConcatHeader != null && !uploadConcatHeader.isBlank()) {
+            return uploadConcatHeader;
+        }
+        StringBuilder concatValue = new StringBuilder("final;");
+        for (int i = 0; i < ids.length; i++) {
+            if (i > 0) concatValue.append(" ");
+            concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
+        }
+        return concatValue.toString();
     }
 
     @Override
