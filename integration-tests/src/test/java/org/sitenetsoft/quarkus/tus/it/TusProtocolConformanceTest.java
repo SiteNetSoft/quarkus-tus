@@ -67,6 +67,59 @@ class TusProtocolConformanceTest {
     @Nested
     class CoreProtocol {
 
+        /**
+         * Tus-Resumable is required on every response except OPTIONS. The resource methods set
+         * it themselves, but responses the container produces — a media-type mismatch, an
+         * unsupported method, an unmatched path — bypass them entirely.
+         */
+        @Test
+        void wrongContentTypeOnPatchStillIncludesTusResumable() {
+            String location = createUpload(10);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("text/plain")
+                    .body("x")
+                    .when().patch(location)
+                    .then()
+                    .statusCode(415)
+                    .header("Tus-Resumable", "1.0.0");
+        }
+
+        @Test
+        void unsupportedMethodStillIncludesTusResumable() {
+            String location = createUpload(10);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().put(location)
+                    .then()
+                    .statusCode(405)
+                    .header("Tus-Resumable", "1.0.0");
+        }
+
+        @Test
+        void unsupportedMethodOnCollectionStillIncludesTusResumable() {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().put("/tus")
+                    .then()
+                    .statusCode(405)
+                    .header("Tus-Resumable", "1.0.0");
+        }
+
+        @Test
+        void versionMismatchStillIncludesTusVersion() {
+            given()
+                    .header("Tus-Resumable", "0.0.1")
+                    .header("Upload-Length", "10")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(412)
+                    .header("Tus-Version", "1.0.0");
+        }
+
         @Test
         void headIncludesCacheControlNoStore() {
             String location = createUpload(100);

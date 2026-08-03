@@ -10,6 +10,7 @@ import io.quarkus.deployment.Capabilities;
 import io.quarkus.deployment.Capability;
 import io.quarkus.runtime.configuration.ConfigurationException;
 import org.sitenetsoft.quarkus.tus.runtime.TusMethodOverrideFilter;
+import org.sitenetsoft.quarkus.tus.runtime.TusResumableResponseFilter;
 import org.sitenetsoft.quarkus.tus.runtime.TusUploadAuthorizer;
 import org.sitenetsoft.quarkus.tus.runtime.TusUploadResource;
 import org.sitenetsoft.quarkus.tus.runtime.UploadExpirationScheduler;
@@ -85,6 +86,7 @@ class TusProcessor {
 
         List<String> classNames = new ArrayList<>();
         classNames.add(TusUploadResource.class.getName());
+        classNames.add(TusResumableResponseFilter.class.getName());
 
         if (config.sseEnabled()) {
             classNames.add(TusSseResource.class.getName());
@@ -113,6 +115,7 @@ class TusProcessor {
                 .addBeanClasses(
                         TusUploadResource.class,
                         TusUploadAuthorizer.class,
+                        TusResumableResponseFilter.class,
                         LocalFileUploadStore.class,
                         UploadProgressService.class,
                         UploadExpirationScheduler.class,
