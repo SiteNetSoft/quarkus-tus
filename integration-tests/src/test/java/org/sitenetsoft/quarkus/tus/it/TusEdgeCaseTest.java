@@ -171,6 +171,76 @@ class TusEdgeCaseTest {
                 .statusCode(204);
     }
 
+    // ---- Discard must not run while a write holds the lock ----
+
+    /**
+     * discardUpload used to delete the data file and forcibly drop another thread's lock. A
+     * DELETE landing mid-write therefore unlinked the file underneath the in-flight write,
+     * which went on to report success for bytes that were never durably stored.
+     */
+    @Test
+    void testDeleteWhileLockedReturns423() {
+        String location = createUpload(100);
+        String uploadId = extractId(location);
+
+        assertTrue(uploadStore.acquireLock(uploadId), "Test needs to hold the lock");
+        try {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().delete(location)
+                    .then()
+                    .statusCode(423);
+        } finally {
+            uploadStore.releaseLock(uploadId);
+        }
+
+        // The upload must have survived the attempt, and be deletable once unlocked.
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .when().head(location)
+                .then()
+                .statusCode(200);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .when().delete(location)
+                .then()
+                .statusCode(204);
+    }
+
+    @Test
+    void testDiscardUploadRefusesWhileLockedAndKeepsData() throws Exception {
+        byte[] data = "keep me".getBytes();
+        String location = createUpload(data.length);
+        String uploadId = extractId(location);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(204);
+
+        Path dataFile = Path.of(tusRuntimeConfig.store().local().uploadDir(), uploadId);
+
+        assertTrue(uploadStore.acquireLock(uploadId), "Test needs to hold the lock");
+        try {
+            assertFalse(uploadStore.discardUpload(uploadId),
+                    "discardUpload must refuse while the upload is locked");
+            assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(),
+                    "Upload entry must survive a refused discard");
+            assertTrue(Files.exists(dataFile), "Data file must survive a refused discard");
+            assertArrayEquals(data, Files.readAllBytes(dataFile), "Data must be intact");
+        } finally {
+            uploadStore.releaseLock(uploadId);
+        }
+
+        assertTrue(uploadStore.discardUpload(uploadId), "Discard must succeed once unlocked");
+        assertFalse(Files.exists(dataFile), "Data file must be gone after a successful discard");
+    }
+
     // ---- Concurrent PATCH on same upload ----
 
     /**

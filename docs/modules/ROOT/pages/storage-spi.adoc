@@ -103,7 +103,11 @@ mergePartialUploadsWithOwnership / mergePartialUploadsUnfinished:: Both take a `
 +
 Both also take `uploadConcatHeader`, the raw `Upload-Concat` request header. Store it verbatim on the final upload: the protocol requires `HEAD` on a final upload to return the value as the client sent it, so rebuilding it from the parsed IDs would return a different string to clients that sent absolute URLs or different spacing.
 
-acquireLock / releaseLock:: Must provide mutual exclusion for concurrent PATCH requests to the same upload. The default implementation uses `ConcurrentHashMap`-based locks.
+acquireLock / releaseLock:: Must provide mutual exclusion for concurrent PATCH requests to the same upload. The default implementation uses `ConcurrentHashMap`-based locks. Acquisition is not reentrant.
+
+discardUpload:: Must respect the lock: return `false` without deleting anything if the upload is currently being written, rather than removing the data file underneath an in-flight write. The extension answers `423` when a `DELETE` is refused for this reason, and cleanup jobs retry on their next run.
+
+cleanupExpiredUploads:: Return only the uploads actually removed. Reporting one that was skipped because it was in use makes the scheduler log claim work it did not do.
 
 cleanupExpiredUploads:: Called hourly by the built-in `UploadExpirationScheduler`. Return the list of expired upload IDs that were cleaned up.
 

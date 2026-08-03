@@ -739,7 +739,18 @@ public class TusUploadResource {
                     .build();
         }
 
+        boolean existed = uploadStore.findUploadInfo(uploadID).isPresent();
         boolean deleted = uploadStore.discardUpload(uploadID);
+
+        // Deleting something that was never there stays idempotent, but refusing to delete an
+        // upload that exists means a write holds its lock — the client should retry.
+        if (!deleted && existed) {
+            return Response.status(423)
+                    .header("Tus-Resumable", tusRuntimeConfig.version())
+                    .entity("Upload is currently being processed")
+                    .build();
+        }
+
         LOG.infof("UploadID %s deleted=%s", uploadID, deleted);
 
         uploadProgressService.finishUpload(uploadID);

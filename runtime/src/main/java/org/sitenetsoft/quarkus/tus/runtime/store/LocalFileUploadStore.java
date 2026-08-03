@@ -408,8 +408,9 @@ public class LocalFileUploadStore implements UploadStore {
             uploads.put(finalId, finalInfo);
             persistMetadata(finalId, finalInfo);
 
+            // The caller holds every partial's lock for the duration of the merge.
             for (String partialId : ids) {
-                discardUpload(partialId);
+                discardLockedUpload(partialId);
             }
 
             LOG.infof("Successfully merged %d partials into final upload %s (size=%d)",
@@ -568,8 +569,9 @@ public class LocalFileUploadStore implements UploadStore {
                 info.setOffset(info.getEntityLength());
                 info.setFinalConcat(false);
 
+                // The caller holds every partial's lock for the duration of the finalization.
                 for (String partialId : partialIds) {
-                    discardUpload(partialId);
+                    discardLockedUpload(partialId);
                 }
                 info.setPartialIds(null);
                 persistMetadata(id, info);
@@ -592,11 +594,34 @@ public class LocalFileUploadStore implements UploadStore {
         return totalLength <= tusRuntimeConfig.maxSize();
     }
 
+    /**
+     * Deletes an upload, refusing while another thread holds its lock.
+     * <p>
+     * This used to delete the data file and drop the lock unconditionally, so a DELETE or a
+     * cleanup job landing mid-write unlinked the file underneath an in-flight write — which
+     * then reported success for bytes that were no longer stored anywhere. Callers that
+     * already hold the lock must use {@link #discardLockedUpload} instead; acquisition is not
+     * reentrant.
+     *
+     * @return true if an upload was removed; false if it did not exist or is locked
+     */
     @Override
     public boolean discardUpload(String id) {
+        if (!acquireLock(id)) {
+            LOG.warnf("Refusing to discard upload %s: currently being written", id);
+            return false;
+        }
+        try {
+            return discardLockedUpload(id);
+        } finally {
+            releaseLock(id);
+        }
+    }
+
+    /** Discards an upload whose lock the calling thread already holds. */
+    private boolean discardLockedUpload(String id) {
         UploadInfo removed = uploads.remove(id);
         uploadProgressService.finishUpload(id);
-        activeLocks.remove(id);
 
         Path file = safePath(id);
         try {
@@ -702,13 +727,19 @@ public class LocalFileUploadStore implements UploadStore {
                         }).eventually(asyncFile::close)
                 )
                 .onItem().invoke(newOffset -> {
+                    // If the upload was discarded while this write was in flight, persisting
+                    // would recreate a .meta for an upload whose data file is gone.
+                    if (uploads.get(id) != info) {
+                        LOG.warnf("Upload %s was discarded during a write; discarding its result", id);
+                        return;
+                    }
                     info.setOffset(newOffset);
                     info.setLastActivity(Instant.now());
                     persistMetadata(id, info);
                 })
                 .emitOn(Infrastructure.getDefaultWorkerPool())
                 .onItem().invoke(newOffset -> {
-                    if (newOffset == info.getEntityLength()) {
+                    if (uploads.get(id) == info && newOffset == info.getEntityLength()) {
                         uploadProgressService.finishUpload(id);
                         uploadCompletedEvent.fire(new TusUploadCompletedEvent(
                                 id, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));
@@ -827,16 +858,22 @@ public class LocalFileUploadStore implements UploadStore {
             }
         }
 
+        // An upload being written is skipped rather than deleted underneath the write, and is
+        // retried on the next run. Only what was actually removed is reported as cleaned.
+        List<String> cleanedIds = new ArrayList<>();
         for (String id : expiredIds) {
-            LOG.infof("Cleaning up expired upload: %s", id);
-            discardUpload(id);
+            if (discardUpload(id)) {
+                cleanedIds.add(id);
+            } else {
+                LOG.infof("Skipped expired upload %s: in use, will retry next run", id);
+            }
         }
 
-        if (!expiredIds.isEmpty()) {
-            LOG.infof("Cleaned up %d expired uploads: %s", expiredIds.size(), String.join(", ", expiredIds));
+        if (!cleanedIds.isEmpty()) {
+            LOG.infof("Cleaned up %d expired uploads: %s", cleanedIds.size(), String.join(", ", cleanedIds));
         }
 
-        return expiredIds;
+        return cleanedIds;
     }
 
     /**
@@ -862,17 +899,22 @@ public class LocalFileUploadStore implements UploadStore {
             }
         }
 
+        List<String> cleanedIds = new ArrayList<>();
         for (String id : staleIds) {
             LOG.infof("Cleaning up stale upload %s (no activity since %s)", id,
                     uploads.get(id) != null ? uploads.get(id).getLastActivity() : "unknown");
-            discardUpload(id);
+            if (discardUpload(id)) {
+                cleanedIds.add(id);
+            } else {
+                LOG.infof("Skipped stale upload %s: in use, will retry next run", id);
+            }
         }
 
-        if (!staleIds.isEmpty()) {
-            LOG.infof("Cleaned up %d stale uploads", staleIds.size());
+        if (!cleanedIds.isEmpty()) {
+            LOG.infof("Cleaned up %d stale uploads", cleanedIds.size());
         }
 
-        return staleIds;
+        return cleanedIds;
     }
 
     /**
