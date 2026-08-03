@@ -260,7 +260,7 @@ public class TusUploadResource {
 
             if (allPartialsComplete) {
                 Optional<String> locationOpt = uploadStore.mergePartialUploadsWithOwnership(
-                        ids, uploadMetadataHeader, currentUserId);
+                        ids, uploadMetadataHeader, currentUserId, value);
 
                 if (locationOpt.isEmpty()) {
                     return mergeFailureResponse();
@@ -282,7 +282,7 @@ public class TusUploadResource {
             }
 
             Optional<String> unfinishedOpt = uploadStore.mergePartialUploadsUnfinished(
-                    ids, uploadMetadataHeader, currentUserId);
+                    ids, uploadMetadataHeader, currentUserId, value);
             if (unfinishedOpt.isPresent()) {
                 return Response.status(CREATED)
                         .header("Tus-Resumable", tusRuntimeConfig.version())

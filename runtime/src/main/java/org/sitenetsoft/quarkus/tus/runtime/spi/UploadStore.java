@@ -27,7 +27,15 @@ public interface UploadStore {
 
     boolean hasDeferredLength(String id);
 
-    Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata, String requiredOwnerId);
+    /**
+     * Merges complete partial uploads into a final one.
+     * <p>
+     * {@code uploadConcatHeader} is the raw {@code Upload-Concat} request header. It must be
+     * stored verbatim rather than rebuilt from {@code ids}, because the protocol requires HEAD
+     * on a final upload to return the value as the client sent it.
+     */
+    Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata,
+                                                      String requiredOwnerId, String uploadConcatHeader);
 
     /**
      * Creates a final concatenation whose partials are not all complete yet.
@@ -36,7 +44,7 @@ public interface UploadStore {
      * must match the uploader of every referenced partial that has one.
      */
     Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata,
-                                                   String requiredOwnerId);
+                                                   String requiredOwnerId, String uploadConcatHeader);
 
     boolean isConcatReady(String id);
 
