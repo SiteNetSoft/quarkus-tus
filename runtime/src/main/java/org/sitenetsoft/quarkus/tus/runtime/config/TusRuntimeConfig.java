@@ -73,6 +73,14 @@ public interface TusRuntimeConfig {
     @WithDefault("6")
     long staleUploadHours();
 
+    /**
+     * Maximum number of partial uploads a single {@code Upload-Concat: final} request may
+     * reference. Bounds how much copying one request can schedule; without it the only ceiling
+     * is the HTTP header size limit, which is not a deliberate bound.
+     */
+    @WithDefault("1000")
+    int maxConcatParts();
+
     interface StoreConfig {
         /**
          * Local file store configuration.

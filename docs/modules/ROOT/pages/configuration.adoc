@@ -83,6 +83,11 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `10485760` (10 MB)
 | Maximum chunk size per PATCH request in bytes. Enforced on both PATCH uploads and creation-with-upload POST requests. Requests exceeding this limit receive a 413 response.
 
+| `quarkus.tus.max-concat-parts`
+| `int`
+| `1000`
+| Maximum number of partial uploads a single `Upload-Concat: final` request may reference. Requests exceeding it are rejected with 400. Referencing the same partial more than once is always rejected, regardless of this limit.
+
 | `quarkus.tus.rate-limit-requests-per-minute`
 | `int`
 | `60`

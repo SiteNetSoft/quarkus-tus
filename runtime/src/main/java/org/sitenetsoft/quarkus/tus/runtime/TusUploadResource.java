@@ -21,7 +21,9 @@ import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 import org.sitenetsoft.quarkus.tus.runtime.sse.TusSseService;
 import org.sitenetsoft.quarkus.tus.runtime.store.LocalFileUploadStore;
 
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.Set;
 
 import static jakarta.ws.rs.core.Response.Status.*;
 
@@ -240,14 +242,37 @@ public class TusUploadResource {
                         .build();
             }
 
+            // Bounds the work one request can schedule; otherwise the only ceiling is the
+            // HTTP header size limit, which is not a deliberate bound.
+            if (ids.length > tusRuntimeConfig.maxConcatParts()) {
+                return Response.status(BAD_REQUEST)
+                        .header("Tus-Resumable", tusRuntimeConfig.version())
+                        .entity("Upload-Concat references more than " + tusRuntimeConfig.maxConcatParts()
+                                + " partial uploads")
+                        .build();
+            }
+
             String currentUserId = getCurrentUserId(securityContext);
 
             // Validate every referenced partial up front so that an ownership failure
             // cannot fall through to a merge path that skips the check. Denied and
             // missing partials share one response so it cannot be used to probe for
             // other users' upload IDs.
+            //
+            // Repeating a reference is rejected rather than de-duplicated: each occurrence
+            // used to be summed and copied, so one uploaded partial could be inflated into a
+            // file many times its size. The complete-partial path happened to fail anyway
+            // because locking the same partial twice does not succeed, but relying on that is
+            // fragile, and the deferred path had no such accident protecting it.
+            Set<String> seen = new HashSet<>();
             boolean allPartialsComplete = true;
             for (String partialId : ids) {
+                if (!seen.add(partialId)) {
+                    return Response.status(BAD_REQUEST)
+                            .header("Tus-Resumable", tusRuntimeConfig.version())
+                            .entity("Upload-Concat references the same partial upload more than once")
+                            .build();
+                }
                 Optional<UploadInfo> partialOpt = uploadStore.findUploadInfo(partialId);
                 if (partialOpt.isEmpty() || isOwnershipDenied(partialId, currentUserId)) {
                     return mergeFailureResponse();

@@ -907,6 +907,49 @@ class TusProtocolConformanceTest {
                     .statusCode(403);
         }
 
+        /**
+         * Referencing the same partial repeatedly used to copy it once per occurrence, so a
+         * single small request could turn one uploaded partial into a file many times its
+         * size — amplification bounded only by the HTTP header limit.
+         */
+        @Test
+        void duplicatePartialReferenceIsRejected() {
+            byte[] data = "amplify".getBytes();
+            String loc = createPartialUpload(data.length);
+            uploadData(loc, data, 0);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc + " " + loc + " " + loc)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(400);
+
+            // The partial must not have been consumed by the rejected request.
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(loc)
+                    .then()
+                    .statusCode(200);
+        }
+
+        /**
+         * The deferred-merge path takes no locks, so unlike the complete-partial case above it
+         * had nothing incidentally stopping duplicates: the final's declared length was the
+         * sum of the repeated references, claiming more bytes than were ever uploaded.
+         */
+        @Test
+        void duplicateIncompletePartialReferenceIsRejected() {
+            String loc = createPartialUpload(10);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc + " " + loc + " " + loc)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(400);
+        }
+
         @Test
         void concatWithInvalidPartialReferenceIsRejected() {
             byte[] data = "abc".getBytes();
