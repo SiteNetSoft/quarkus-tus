@@ -503,41 +503,6 @@ public class TusUploadResource {
             );
         }
 
-        // Handle deferred length
-        if (uploadLength != null && uploadStore.hasDeferredLength(uploadID)) {
-            if (!uploadStore.setDeferredLength(uploadID, uploadLength)) {
-                return Uni.createFrom().item(
-                        Response.status(BAD_REQUEST)
-                                .header("Tus-Resumable", tusRuntimeConfig.version())
-                                .entity("Failed to set upload length")
-                                .build()
-                );
-            }
-            Optional<UploadInfo> updatedInfo = uploadStore.findUploadInfo(uploadID);
-            if (updatedInfo.isPresent()) {
-                info = updatedInfo.get();
-            }
-        }
-
-        if (uploadStore.hasDeferredLength(uploadID)) {
-            return Uni.createFrom().item(
-                    Response.status(BAD_REQUEST)
-                            .header("Tus-Resumable", tusRuntimeConfig.version())
-                            .entity("Upload-Length must be set before uploading data")
-                            .build()
-            );
-        }
-
-        if (!uploadStore.validateOffset(uploadID, uploadOffset)) {
-            return Uni.createFrom().item(
-                    Response.status(CONFLICT)
-                            .header("Tus-Resumable", tusRuntimeConfig.version())
-                            .header("Upload-Offset", String.valueOf(info.getOffset()))
-                            .entity("Upload offset mismatch")
-                            .build()
-            );
-        }
-
         byte[] chunk = (body != null) ? body : new byte[0];
         long actualChunkSize = chunk.length;
 
@@ -546,15 +511,6 @@ public class TusUploadResource {
                     Response.status(REQUEST_ENTITY_TOO_LARGE)
                             .header("Tus-Resumable", tusRuntimeConfig.version())
                             .entity("Chunk size exceeds maximum allowed size")
-                            .build()
-            );
-        }
-
-        if (!checkContentLengthWithCurrentOffset(actualChunkSize, uploadOffset, info.getEntityLength())) {
-            return Uni.createFrom().item(
-                    Response.status(CONFLICT)
-                            .header("Tus-Resumable", tusRuntimeConfig.version())
-                            .entity("Chunk exceeds declared upload size")
                             .build()
             );
         }
@@ -592,6 +548,83 @@ public class TusUploadResource {
             );
         }
 
+        // Everything from here until the write is handed off runs under the lock. Validating
+        // the offset outside it allowed two requests to both pass validation and then write in
+        // turn, the second silently overwriting the first. The flag hands lock ownership to
+        // the async chain, whose eventually() releases it; every earlier exit releases here.
+        boolean releaseLockOnExit = true;
+        try {
+            Optional<UploadInfo> lockedInfoOpt = uploadStore.findUploadInfo(uploadID);
+            if (lockedInfoOpt.isEmpty()) {
+                return Uni.createFrom().item(
+                        Response.status(NOT_FOUND)
+                                .header("Tus-Resumable", tusRuntimeConfig.version())
+                                .build()
+                );
+            }
+            info = lockedInfoOpt.get();
+
+            if (uploadLength != null && uploadStore.hasDeferredLength(uploadID)) {
+                if (!uploadStore.setDeferredLength(uploadID, uploadLength)) {
+                    return Uni.createFrom().item(
+                            Response.status(BAD_REQUEST)
+                                    .header("Tus-Resumable", tusRuntimeConfig.version())
+                                    .entity("Failed to set upload length")
+                                    .build()
+                    );
+                }
+                info = uploadStore.findUploadInfo(uploadID).orElse(info);
+            }
+
+            if (uploadStore.hasDeferredLength(uploadID)) {
+                return Uni.createFrom().item(
+                        Response.status(BAD_REQUEST)
+                                .header("Tus-Resumable", tusRuntimeConfig.version())
+                                .entity("Upload-Length must be set before uploading data")
+                                .build()
+                );
+            }
+
+            if (!uploadStore.validateOffset(uploadID, uploadOffset)) {
+                return Uni.createFrom().item(
+                        Response.status(CONFLICT)
+                                .header("Tus-Resumable", tusRuntimeConfig.version())
+                                .header("Upload-Offset", String.valueOf(info.getOffset()))
+                                .entity("Upload offset mismatch")
+                                .build()
+                );
+            }
+
+            if (!checkContentLengthWithCurrentOffset(actualChunkSize, uploadOffset, info.getEntityLength())) {
+                return Uni.createFrom().item(
+                        Response.status(CONFLICT)
+                                .header("Tus-Resumable", tusRuntimeConfig.version())
+                                .entity("Chunk exceeds declared upload size")
+                                .build()
+                );
+            }
+
+            Uni<Response> result = writeChunkUnderLock(
+                    uploadID, uploadOffset, chunk, actualChunkSize, checksumInfo, info);
+            releaseLockOnExit = false;
+            return result;
+        } finally {
+            if (releaseLockOnExit) {
+                uploadStore.releaseLock(uploadID);
+            }
+        }
+    }
+
+    /**
+     * Performs the write and builds the response. The caller must hold the upload's lock;
+     * ownership passes to the returned pipeline, which releases it on termination.
+     */
+    private Uni<Response> writeChunkUnderLock(String uploadID,
+                                              long uploadOffset,
+                                              byte[] chunk,
+                                              long actualChunkSize,
+                                              Optional<UploadInfo.ChecksumInfo> checksumInfo,
+                                              UploadInfo info) {
         final String expiresHeader = info.getExpiresAt() != null
                 ? java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
                         .withZone(java.time.ZoneOffset.UTC)
@@ -633,6 +666,17 @@ public class TusUploadResource {
                     }
 
                     return responseBuilder.build();
+                })
+                .onFailure(org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException.class)
+                .recoverWithItem(e -> {
+                    long expected = ((org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException) e)
+                            .getExpectedOffset();
+                    LOG.warnf("Rejected write to upload %s at stale offset: %s", uploadID, e.getMessage());
+                    return Response.status(CONFLICT)
+                            .header("Tus-Resumable", tusRuntimeConfig.version())
+                            .header("Upload-Offset", String.valueOf(expected))
+                            .entity("Upload offset mismatch")
+                            .build();
                 })
                 .onFailure(LocalFileUploadStore.ChecksumMismatchException.class).recoverWithItem(e -> {
                     LOG.warnf("Checksum mismatch for upload %s: %s", uploadID, e.getMessage());

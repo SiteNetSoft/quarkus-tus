@@ -14,6 +14,7 @@ import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.event.TusUploadCompletedEvent;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
+import org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 import java.io.IOException;
@@ -656,6 +657,16 @@ public class LocalFileUploadStore implements UploadStore {
         UploadInfo info = uploads.get(id);
         if (info == null) {
             return Uni.createFrom().item(-1L);
+        }
+
+        // The caller's offset is never trusted: writing at a stale one would overwrite bytes
+        // that were already stored and acknowledged. Callers holding the upload's lock have
+        // already validated this, so a mismatch here means the write raced past validation.
+        if (offset != info.getOffset()) {
+            return Uni.createFrom().failure(new OffsetMismatchException(
+                    "Write at offset " + offset + " but upload " + id
+                            + " is at offset " + info.getOffset(),
+                    info.getOffset()));
         }
 
         Path file = safePath(id);
