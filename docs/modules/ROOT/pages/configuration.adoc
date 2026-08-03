@@ -22,6 +22,11 @@ Build time properties are fixed at application build and cannot be changed at ru
 | `false`
 | Whether the authentication filter is registered. When enabled, all TUS endpoints (except OPTIONS) require an authenticated user principal.
 
+| `quarkus.tus.method-override-enabled`
+| `boolean`
+| `true`
+| Whether the `X-HTTP-Method-Override` filter is registered. Required by the TUS core protocol so that clients behind proxies which block `PATCH` and `DELETE` can still upload. Disable it only if something in front of the application enforces rules based on the HTTP method.
+
 | `quarkus.tus.path`
 | `String`
 | `/tus`

@@ -62,7 +62,8 @@ integration-tests/ — @QuarkusTest integration tests (io.quarkus plugin)
 - **Storage SPI:** `UploadStore` interface; override `LocalFileUploadStore` via `@Alternative @Priority(1)` for custom backends
 - **SSE** endpoints at `/tus/events/{uploadId}` and `/tus/progress/{uploadId}` — conditionally enabled via `quarkus.tus.sse-enabled`
 - **Auth filter** — conditionally enabled via `quarkus.tus.auth-enabled`, checks `SecurityContext.getUserPrincipal()`
-- **TUS extensions supported:** creation, termination, checksum, expiration, concatenation, creation-with-upload, creation-defer-length
+- **Method override** — `TusMethodOverrideFilter` is `@PreMatching`, so the rewritten method drives resource matching and every later filter (auth, rate limit) sees the effective method. Conditionally enabled via `quarkus.tus.method-override-enabled`.
+- **TUS extensions supported:** creation, termination, checksum, expiration, concatenation, concatenation-unfinished, creation-with-upload, creation-defer-length. Not supported: `checksum-trailer` (trailers are never read, so it is deliberately not advertised).
 - The `-parameters` compiler flag is set, which Quarkus requires for proper CDI and REST parameter injection
 
 ## Configuration Properties
@@ -71,6 +72,7 @@ integration-tests/ — @QuarkusTest integration tests (io.quarkus plugin)
 |---|---|---|
 | `quarkus.tus.sse-enabled` | Build time | `true` |
 | `quarkus.tus.auth-enabled` | Build time | `false` |
+| `quarkus.tus.method-override-enabled` | Build time | `true` |
 | `quarkus.tus.path` | Build time | `/tus` (endpoints are fixed at `/tus`; any other value fails the build) |
 | `quarkus.tus.version` | Runtime | `1.0.0` |
 | `quarkus.tus.max-size` | Runtime | `107374182400` |

@@ -145,6 +145,26 @@ class TusOwnershipTest {
                 .statusCode(200);
     }
 
+    /**
+     * X-HTTP-Method-Override rewrites the method before resource matching, so the ownership
+     * check must still see the effective method rather than the wire method.
+     */
+    @Test
+    void otherUserCannotDeleteViaMethodOverride() {
+        String location = aliceCreatesUpload(100);
+
+        asBob()
+                .header("X-HTTP-Method-Override", "DELETE")
+                .when().post(location)
+                .then()
+                .statusCode(404);
+
+        asAlice()
+                .when().head(location)
+                .then()
+                .statusCode(200);
+    }
+
     // ---- Concatenation must not be a way around the ownership check ----
 
     @Test

@@ -975,4 +975,101 @@ class TusProtocolConformanceTest {
                     "Deferred length exceeding max should be rejected: got " + status);
         }
     }
+
+    // ========== X-HTTP-Method-Override (core protocol) ==========
+
+    /**
+     * The core spec requires the server to interpret X-HTTP-Method-Override as the request
+     * method, so clients behind proxies that block PATCH and DELETE can still upload.
+     */
+    @Nested
+    class MethodOverride {
+
+        @Test
+        void overridePatchUploadsChunk() {
+            byte[] data = "override".getBytes();
+            String location = createUpload(data.length);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "PATCH")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().post(location)
+                    .then()
+                    .statusCode(204)
+                    .header("Upload-Offset", String.valueOf(data.length));
+        }
+
+        @Test
+        void overrideHeadReturnsUploadStatus() {
+            String location = createUpload(42);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "HEAD")
+                    .when().post(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", "0")
+                    .header("Upload-Length", "42");
+        }
+
+        @Test
+        void overrideDeleteTerminatesUpload() {
+            String location = createUpload(50);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "DELETE")
+                    .when().post(location)
+                    .then()
+                    .statusCode(204);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(404);
+        }
+
+        @Test
+        void overrideValueIsCaseInsensitive() {
+            byte[] data = "lower".getBytes();
+            String location = createUpload(data.length);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "patch")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().post(location)
+                    .then()
+                    .statusCode(204);
+        }
+
+        @Test
+        void unsupportedOverrideValueReturns400() {
+            String location = createUpload(10);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "TRACE")
+                    .when().post(location)
+                    .then()
+                    .statusCode(400);
+        }
+
+        @Test
+        void requestWithoutOverrideHeaderIsUnaffected() {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", "10")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201);
+        }
+    }
 }
