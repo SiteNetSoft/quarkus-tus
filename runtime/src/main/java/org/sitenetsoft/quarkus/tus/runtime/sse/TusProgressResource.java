@@ -8,11 +8,15 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.SecurityContext;
 import jakarta.ws.rs.sse.SseEventSink;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
+import org.sitenetsoft.quarkus.tus.runtime.TusUploadAuthorizer;
+import org.sitenetsoft.quarkus.tus.runtime.TusUtils;
 import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadProgress;
+import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 @Path("/tus/progress")
 public class TusProgressResource {
@@ -28,16 +32,33 @@ public class TusProgressResource {
     @Inject
     UploadProgressService uploadProgressService;
 
+    @Inject
+    UploadStore uploadStore;
+
+    @Inject
+    TusUploadAuthorizer authorizer;
+
     @GET
     @Path("/{uploadID}")
     @Produces(MediaType.SERVER_SENT_EVENTS)
     public void streamProgress(
             @PathParam("uploadID") String uploadID,
+            @Context SecurityContext securityContext,
             @Context SseEventSink eventSink
     ) {
         if (!sseEnabled) {
             throw new NotFoundException();
         }
+
+        // The stream reveals an upload's size and live byte counts, and registering a sink
+        // displaces any existing subscriber — so an unknown or unowned ID must not get this
+        // far. 404 rather than 403 keeps a denial indistinguishable from a missing upload.
+        if (!TusUtils.isValidUuid(uploadID)
+                || uploadStore.findUploadInfo(uploadID).isEmpty()
+                || authorizer.isDenied(uploadID, securityContext)) {
+            throw new NotFoundException();
+        }
+
         LOG.infof("Registering SSE sink for uploadID=%s", uploadID);
         sseService.register(uploadID, eventSink);
 

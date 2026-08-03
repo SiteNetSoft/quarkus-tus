@@ -65,6 +65,9 @@ public class TusUploadResource {
     UploadStore uploadStore;
 
     @Inject
+    TusUploadAuthorizer authorizer;
+
+    @Inject
     Instance<TusSseService> sseServiceInstance;
 
     @Inject
@@ -768,23 +771,11 @@ public class TusUploadResource {
     }
 
     private String getCurrentUserId(SecurityContext securityContext) {
-        if (securityContext != null && securityContext.getUserPrincipal() != null) {
-            return securityContext.getUserPrincipal().getName();
-        }
-        return null;
+        return authorizer.currentUserId(securityContext);
     }
 
-    /**
-     * Whether {@code currentUserId} may not act on the given upload. Uploads with no
-     * recorded uploader (created while auth was disabled) stay accessible so that
-     * enabling auth does not strand them.
-     */
     private boolean isOwnershipDenied(String uploadID, String currentUserId) {
-        if (!tusBuildTimeConfig.authEnabled()) {
-            return false;
-        }
-        String ownerId = uploadStore.getUploaderId(uploadID);
-        return ownerId != null && !ownerId.equals(currentUserId);
+        return authorizer.isDenied(uploadID, currentUserId);
     }
 
     private boolean isSupportedChecksumAlgorithm(String algorithm) {
