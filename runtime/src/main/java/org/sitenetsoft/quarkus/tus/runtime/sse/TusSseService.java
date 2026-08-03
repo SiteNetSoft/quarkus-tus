@@ -25,7 +25,24 @@ public class TusSseService {
         if (clientId == null || sink == null) {
             return;
         }
-        sinks.put(clientId, sink);
+        closeDisplaced(sinks.put(clientId, sink), sink, clientId);
+    }
+
+    /**
+     * Closes a sink that a new registration replaced. Overwriting the map entry alone left the
+     * previous subscriber's connection open but unreachable, so it was never closed.
+     */
+    private void closeDisplaced(SseEventSink previous, SseEventSink replacement, String key) {
+        if (previous == null || previous == replacement) {
+            return;
+        }
+        try {
+            if (!previous.isClosed()) {
+                previous.close();
+            }
+        } catch (Exception e) {
+            LOG.debugf("Error closing displaced SSE sink for %s: %s", key, e.getMessage());
+        }
     }
 
     public void unregister(String clientId) {
@@ -73,7 +90,7 @@ public class TusSseService {
         if (uploadId == null || sink == null) {
             return;
         }
-        uploadSinks.put(uploadId, sink);
+        closeDisplaced(uploadSinks.put(uploadId, sink), sink, uploadId);
     }
 
     public void unregisterUpload(String uploadId) {
