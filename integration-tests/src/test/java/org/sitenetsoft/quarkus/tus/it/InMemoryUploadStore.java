@@ -199,7 +199,8 @@ public class InMemoryUploadStore implements UploadStore {
     }
 
     @Override
-    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata) {
+    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata,
+                                                          String requiredOwnerId) {
         if (ids == null || ids.length == 0) {
             return Optional.empty();
         }
@@ -213,6 +214,12 @@ public class InMemoryUploadStore implements UploadStore {
             }
             if (partialInfo.getEntityLength() < 0) {
                 return Optional.empty();
+            }
+            if (requiredOwnerId != null) {
+                String ownerId = partialInfo.getUploaderId();
+                if (ownerId != null && !ownerId.equals(requiredOwnerId)) {
+                    return Optional.empty();
+                }
             }
             totalLength += partialInfo.getEntityLength();
             partialIdList.add(partialId);

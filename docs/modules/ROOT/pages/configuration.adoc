@@ -25,8 +25,10 @@ Build time properties are fixed at application build and cannot be changed at ru
 | `quarkus.tus.path`
 | `String`
 | `/tus`
-| URL path prefix for all TUS endpoints.
+| Path prefix used when building `Location` and `Upload-Concat` header values. The endpoints themselves are fixed at `/tus`, so setting this to any other value fails the build. To serve TUS under a different prefix, put the application behind a reverse proxy that rewrites it.
 |===
+
+NOTE: Authorization is per upload. When `quarkus.tus.auth-enabled` is `true`, the principal that created an upload is recorded, and HEAD, PATCH, DELETE and concatenation requests from any other principal are answered with `404 Not Found`. Uploads created while auth was disabled have no recorded owner and stay accessible to everyone.
 
 == Runtime Properties
 

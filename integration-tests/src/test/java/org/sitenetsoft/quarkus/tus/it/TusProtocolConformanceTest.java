@@ -320,6 +320,22 @@ class TusProtocolConformanceTest {
                     .header("Upload-Offset", String.valueOf(data.length));
         }
 
+        /**
+         * A body longer than Upload-Length used to be written to disk in full while the
+         * recorded offset was clamped, producing a "complete" upload with trailing garbage.
+         */
+        @Test
+        void bodyLongerThanUploadLengthIsRejected() {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", "5")
+                    .contentType("application/offset+octet-stream")
+                    .body("far more than five bytes".getBytes())
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(413);
+        }
+
         @Test
         void partialBodyThenResumeViaPatch() {
             byte[] fullData = "complete data!!".getBytes();
@@ -492,8 +508,9 @@ class TusProtocolConformanceTest {
                     .body(data)
                     .when().patch(location)
                     .then()
-                    // Empty/malformed checksum should be ignored (no separator found)
-                    .statusCode(204);
+                    // A client that sent a checksum expects verification; accepting the chunk
+                    // unverified would silently break that expectation.
+                    .statusCode(400);
         }
 
         @Test
@@ -535,8 +552,12 @@ class TusProtocolConformanceTest {
             }
         }
 
+        /**
+         * The checksum extension specifies 400 for an unsupported algorithm; 460 is reserved
+         * for a genuine mismatch and would mislead a client into retrying.
+         */
         @Test
-        void invalidChecksumAlgorithmReturns460() {
+        void unsupportedChecksumAlgorithmReturns400() {
             byte[] data = "test".getBytes();
             String location = createUpload(data.length);
 
@@ -548,7 +569,15 @@ class TusProtocolConformanceTest {
                     .body(data)
                     .when().patch(location)
                     .then()
-                    .statusCode(460);
+                    .statusCode(400);
+
+            // The chunk must not have been stored.
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", "0");
         }
     }
 
@@ -790,6 +819,48 @@ class TusProtocolConformanceTest {
                     .then()
                     .statusCode(200)
                     .header("Upload-Concat", "partial");
+        }
+
+        /**
+         * The spec forbids PATCH against a final upload URL without distinguishing whether
+         * the concatenation has finished. An unfinished final used to accept writes, which
+         * finalizeConcatenation would then silently overwrite.
+         */
+        @Test
+        void patchOnUnfinishedFinalReturns403() {
+            String partial = createPartialUpload(10);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + partial)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body("injected".getBytes())
+                    .when().patch(finalLocation)
+                    .then()
+                    .statusCode(403);
+        }
+
+        @Test
+        void concatWithInvalidPartialReferenceIsRejected() {
+            byte[] data = "abc".getBytes();
+            String loc = createPartialUpload(data.length);
+            uploadData(loc, data, 0);
+
+            // A non-UUID reference used to be filtered out silently, merging a subset.
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc + " /tus/not-a-uuid")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(400);
         }
 
         @Test

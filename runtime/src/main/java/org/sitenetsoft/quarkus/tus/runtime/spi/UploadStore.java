@@ -29,7 +29,14 @@ public interface UploadStore {
 
     Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata, String requiredOwnerId);
 
-    Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata);
+    /**
+     * Creates a final concatenation whose partials are not all complete yet.
+     * Implementations must apply the same ownership validation as
+     * {@link #mergePartialUploadsWithOwnership}: a non-null {@code requiredOwnerId}
+     * must match the uploader of every referenced partial that has one.
+     */
+    Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata,
+                                                   String requiredOwnerId);
 
     boolean isConcatReady(String id);
 

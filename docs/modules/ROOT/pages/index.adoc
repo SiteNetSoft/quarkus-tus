@@ -61,7 +61,7 @@ implementation("org.sitenetsoft:quarkus-tus:1.0.0-SNAPSHOT")
 
 == Quick Start
 
-Once added, the extension automatically registers TUS protocol endpoints at `/tus` (configurable via `quarkus.tus.path`).
+Once added, the extension automatically registers TUS protocol endpoints at `/tus`.
 
 === Verify the Extension is Active
 

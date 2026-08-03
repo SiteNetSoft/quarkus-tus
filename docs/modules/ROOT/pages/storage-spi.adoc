@@ -99,6 +99,8 @@ writeChunkAsync:: Returns a `Uni<Long>` with the new offset after writing. Retur
 
 createUpload / createUploadDeferred:: Must return the full location path (e.g., `/tus/{uploadId}`). The upload ID is extracted from the last path segment.
 
+mergePartialUploadsWithOwnership / mergePartialUploadsUnfinished:: Both take a `requiredOwnerId`. When it is non-null, every referenced partial that has an uploader must match it, and the method must return `Optional.empty()` otherwise. Skipping this check in either method allows one user to concatenate — and thereby consume and delete — another user's partial uploads.
+
 acquireLock / releaseLock:: Must provide mutual exclusion for concurrent PATCH requests to the same upload. The default implementation uses `ConcurrentHashMap`-based locks.
 
 cleanupExpiredUploads:: Called hourly by the built-in `UploadExpirationScheduler`. Return the list of expired upload IDs that were cleaned up.
