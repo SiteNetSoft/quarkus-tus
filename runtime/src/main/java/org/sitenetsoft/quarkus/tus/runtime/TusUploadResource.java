@@ -394,7 +394,9 @@ public class TusUploadResource {
             uploadProgressService.updateProgress(uploadId, body.length);
 
             Optional<UploadInfo> infoOpt = uploadStore.findUploadInfo(uploadId);
-            if (infoOpt.isPresent() && infoOpt.get().getOffset() == infoOpt.get().getEntityLength()) {
+            if (infoOpt.isPresent()
+                    && infoOpt.get().getOffset() == infoOpt.get().getEntityLength()
+                    && infoOpt.get().markCompletionFired()) {
                 uploadProgressService.finishUpload(uploadId);
                 uploadCompletedEvent.fire(new TusUploadCompletedEvent(
                         uploadId, infoOpt.get().getEntityLength(), uploadMetadata,

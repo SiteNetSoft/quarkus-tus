@@ -66,6 +66,8 @@ Fired after each successful PATCH writes a chunk of data.
 
 Fired when an upload is fully received (offset equals total size).
 
+Fired at most once per upload. The event is latched on the upload's state and the latch is persisted, so re-sending a PATCH at the final offset — or restarting the application — does not fire it again. Observers that move files, insert rows, call webhooks or bill for an upload can rely on this.
+
 [cols="1,1,2"]
 |===
 | Field | Type | Description

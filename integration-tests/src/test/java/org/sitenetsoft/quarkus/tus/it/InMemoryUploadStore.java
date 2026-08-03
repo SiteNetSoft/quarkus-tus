@@ -374,7 +374,8 @@ public class InMemoryUploadStore implements UploadStore {
         }
         info.setOffset(newOffset);
 
-        if (newOffset == info.getEntityLength()) {
+        // Latched so that re-patching a complete upload cannot replay the event.
+        if (newOffset == info.getEntityLength() && info.markCompletionFired()) {
             uploadProgressService.finishUpload(id);
             uploadCompletedEvent.fire(new TusUploadCompletedEvent(
                     id, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));

@@ -739,10 +739,13 @@ public class LocalFileUploadStore implements UploadStore {
                 })
                 .emitOn(Infrastructure.getDefaultWorkerPool())
                 .onItem().invoke(newOffset -> {
-                    if (uploads.get(id) == info && newOffset == info.getEntityLength()) {
+                    if (uploads.get(id) == info
+                            && newOffset == info.getEntityLength()
+                            && info.markCompletionFired()) {
                         uploadProgressService.finishUpload(id);
                         uploadCompletedEvent.fire(new TusUploadCompletedEvent(
                                 id, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));
+                        persistMetadata(id, info);
                     }
                 })
                 .onFailure().invoke(e -> {
