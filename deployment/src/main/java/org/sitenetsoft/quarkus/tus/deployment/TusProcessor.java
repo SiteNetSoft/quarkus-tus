@@ -9,6 +9,7 @@ import io.quarkus.deployment.builditem.nativeimage.ReflectiveClassBuildItem;
 import io.quarkus.deployment.Capabilities;
 import io.quarkus.deployment.Capability;
 import io.quarkus.runtime.configuration.ConfigurationException;
+import org.sitenetsoft.quarkus.tus.runtime.TusMethodOverrideFilter;
 import org.sitenetsoft.quarkus.tus.runtime.TusUploadResource;
 import org.sitenetsoft.quarkus.tus.runtime.UploadExpirationScheduler;
 import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
@@ -94,6 +95,9 @@ class TusProcessor {
         if (config.rateLimitEnabled()) {
             classNames.add(TusRateLimitFilter.class.getName());
         }
+        if (config.methodOverrideEnabled()) {
+            classNames.add(TusMethodOverrideFilter.class.getName());
+        }
         if (capabilities.isPresent(Capability.SMALLRYE_HEALTH)) {
             classNames.add(TusHealthCheck.class.getName());
         }
@@ -166,6 +170,17 @@ class TusProcessor {
         return AdditionalBeanBuildItem.builder()
                 .setUnremovable()
                 .addBeanClasses(TusRateLimitFilter.class)
+                .build();
+    }
+
+    @BuildStep
+    AdditionalBeanBuildItem tusMethodOverrideFilter(TusBuildTimeConfig config) {
+        if (!config.methodOverrideEnabled()) {
+            return new AdditionalBeanBuildItem.Builder().build();
+        }
+        return AdditionalBeanBuildItem.builder()
+                .setUnremovable()
+                .addBeanClasses(TusMethodOverrideFilter.class)
                 .build();
     }
 

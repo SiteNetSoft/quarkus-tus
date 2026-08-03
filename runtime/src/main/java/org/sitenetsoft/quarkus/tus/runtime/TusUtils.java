@@ -25,6 +25,20 @@ public final class TusUtils {
         return UUID_PATTERN.matcher(id).matches();
     }
 
+    /**
+     * Whether a request path falls under the TUS endpoints. Deliberately compares against
+     * where the resources are actually mounted rather than {@code quarkus.tus.path}: filters
+     * that gate on configuration stop matching if the two ever diverge.
+     */
+    public static boolean isTusPath(String requestPath) {
+        if (requestPath == null) {
+            return false;
+        }
+        String normalized = requestPath.startsWith("/") ? requestPath : "/" + requestPath;
+        return normalized.equals(TusUploadResource.TUS_PATH)
+                || normalized.startsWith(TusUploadResource.TUS_PATH + "/");
+    }
+
     public static Optional<UploadInfo.ChecksumInfo> parseChecksumHeader(String headerValue) {
         if (headerValue == null) return Optional.empty();
         String[] pair = headerValue.split(" ");
