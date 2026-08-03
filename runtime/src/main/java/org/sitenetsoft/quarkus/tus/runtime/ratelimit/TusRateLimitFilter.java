@@ -8,6 +8,7 @@ import jakarta.ws.rs.container.ContainerRequestFilter;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.sitenetsoft.quarkus.tus.runtime.TusUploadResource;
 
 @Provider
 @Priority(Priorities.USER + 1)
@@ -15,9 +16,6 @@ public class TusRateLimitFilter implements ContainerRequestFilter {
 
     @ConfigProperty(name = "quarkus.tus.rate-limit-enabled", defaultValue = "false")
     boolean rateLimitEnabled;
-
-    @ConfigProperty(name = "quarkus.tus.path", defaultValue = "/tus")
-    String tusPath;
 
     @Inject
     TusRateLimitService rateLimitService;
@@ -28,8 +26,10 @@ public class TusRateLimitFilter implements ContainerRequestFilter {
             return;
         }
 
+        // Matched against where the endpoints are actually mounted, never against
+        // configuration: a mismatch would silently disable throttling.
         String requestPath = requestContext.getUriInfo().getPath();
-        if (!requestPath.startsWith(tusPath)) {
+        if (!isTusPath(requestPath)) {
             return;
         }
 
@@ -50,6 +50,12 @@ public class TusRateLimitFilter implements ContainerRequestFilter {
                             .build()
             );
         }
+    }
+
+    private static boolean isTusPath(String requestPath) {
+        String normalized = requestPath.startsWith("/") ? requestPath : "/" + requestPath;
+        return normalized.equals(TusUploadResource.TUS_PATH)
+                || normalized.startsWith(TusUploadResource.TUS_PATH + "/");
     }
 
     private String resolveClientId(ContainerRequestContext requestContext) {

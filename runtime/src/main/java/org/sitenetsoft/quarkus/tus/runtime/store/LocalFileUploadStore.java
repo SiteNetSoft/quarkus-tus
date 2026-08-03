@@ -395,6 +395,9 @@ public class LocalFileUploadStore implements UploadStore {
             finalInfo.setEntityLength(totalLength);
             finalInfo.setOffset(totalLength);
             finalInfo.setPartial(false);
+            finalInfo.setUploaderId(requiredOwnerId);
+            finalInfo.setLastActivity(Instant.now());
+            finalInfo.setExpiresAt(Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS));
             uploadMetadata.ifPresent(finalInfo::setMetadata);
 
             StringBuilder concatValue = new StringBuilder("final;");
@@ -428,7 +431,8 @@ public class LocalFileUploadStore implements UploadStore {
     }
 
     @Override
-    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata) {
+    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata,
+                                                          String requiredOwnerId) {
         if (ids == null || ids.length == 0) {
             return Optional.empty();
         }
@@ -442,6 +446,14 @@ public class LocalFileUploadStore implements UploadStore {
             }
             if (partialInfo.getEntityLength() < 0) {
                 return Optional.empty();
+            }
+            if (requiredOwnerId != null) {
+                String ownerId = partialInfo.getUploaderId();
+                if (ownerId != null && !ownerId.equals(requiredOwnerId)) {
+                    LOG.warnf("Ownership validation failed for partial %s: required=%s, actual=%s",
+                            partialId, requiredOwnerId, ownerId);
+                    return Optional.empty();
+                }
             }
             totalLength += partialInfo.getEntityLength();
             partialIdList.add(partialId);
@@ -459,6 +471,8 @@ public class LocalFileUploadStore implements UploadStore {
         finalInfo.setPartial(false);
         finalInfo.setFinalConcat(true);
         finalInfo.setPartialIds(partialIdList);
+        finalInfo.setUploaderId(requiredOwnerId);
+        finalInfo.setLastActivity(Instant.now());
         uploadMetadata.ifPresent(finalInfo::setMetadata);
 
         Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
@@ -726,11 +740,19 @@ public class LocalFileUploadStore implements UploadStore {
             return -1;
         }
 
+        // Never store more than the declared length: clamping only the recorded offset
+        // would leave trailing bytes on disk and report the upload as complete.
+        if (info.getEntityLength() >= 0 && data.length > info.getEntityLength()) {
+            LOG.warnf("Initial data for upload %s exceeds declared length (%d > %d)",
+                    id, data.length, info.getEntityLength());
+            return -1;
+        }
+
         Path file = safePath(id);
 
         try (OutputStream out = Files.newOutputStream(file, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
             out.write(data);
-            long newOffset = Math.min(data.length, info.getEntityLength());
+            long newOffset = data.length;
             info.setOffset(newOffset);
             info.setLastActivity(Instant.now());
             persistMetadata(id, info);

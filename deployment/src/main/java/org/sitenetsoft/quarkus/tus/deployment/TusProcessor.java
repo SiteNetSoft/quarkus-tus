@@ -1,11 +1,14 @@
 package org.sitenetsoft.quarkus.tus.deployment;
 
 import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
+import io.quarkus.deployment.annotations.BuildProducer;
 import io.quarkus.deployment.annotations.BuildStep;
+import io.quarkus.deployment.builditem.AdditionalIndexedClassesBuildItem;
 import io.quarkus.deployment.builditem.FeatureBuildItem;
 import io.quarkus.deployment.builditem.nativeimage.ReflectiveClassBuildItem;
 import io.quarkus.deployment.Capabilities;
 import io.quarkus.deployment.Capability;
+import io.quarkus.runtime.configuration.ConfigurationException;
 import org.sitenetsoft.quarkus.tus.runtime.TusUploadResource;
 import org.sitenetsoft.quarkus.tus.runtime.UploadExpirationScheduler;
 import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
@@ -24,6 +27,9 @@ import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadProgress;
 import org.sitenetsoft.quarkus.tus.runtime.store.LocalFileUploadStore;
 
+import java.util.ArrayList;
+import java.util.List;
+
 class TusProcessor {
 
     private static final String FEATURE = "tus";
@@ -31,6 +37,22 @@ class TusProcessor {
     @BuildStep
     FeatureBuildItem feature() {
         return new FeatureBuildItem(FEATURE);
+    }
+
+    /**
+     * JAX-RS needs a constant {@code @Path}, so the endpoints cannot be relocated by
+     * configuration. Failing the build beats the previous behaviour, where a changed path
+     * left the endpoints in place but stopped the auth and rate-limit filters from matching
+     * them — silently serving TUS unauthenticated.
+     */
+    private static void validateTusPath(TusBuildTimeConfig config) {
+        if (!TusUploadResource.TUS_PATH.equals(config.path())) {
+            throw new ConfigurationException(
+                    "quarkus.tus.path is set to '" + config.path() + "' but the TUS endpoints are "
+                            + "mounted at '" + TusUploadResource.TUS_PATH + "' and cannot be moved. "
+                            + "Remove the property, or place the application behind a reverse proxy "
+                            + "that rewrites the prefix.");
+        }
     }
 
     @BuildStep
@@ -47,6 +69,38 @@ class TusProcessor {
         ).methods().fields().build();
     }
 
+    /**
+     * The runtime module deliberately ships no {@code META-INF/beans.xml}, so its classes are
+     * not part of the application index. JAX-RS resources and providers must therefore be
+     * indexed explicitly, and only when the corresponding feature is enabled — that is what
+     * keeps the conditional registration below meaningful.
+     */
+    @BuildStep
+    void indexedJaxRsClasses(TusBuildTimeConfig config,
+                             Capabilities capabilities,
+                             BuildProducer<AdditionalIndexedClassesBuildItem> producer) {
+        validateTusPath(config);
+
+        List<String> classNames = new ArrayList<>();
+        classNames.add(TusUploadResource.class.getName());
+
+        if (config.sseEnabled()) {
+            classNames.add(TusSseResource.class.getName());
+            classNames.add(TusProgressResource.class.getName());
+        }
+        if (config.authEnabled()) {
+            classNames.add(TusAuthFilter.class.getName());
+        }
+        if (config.rateLimitEnabled()) {
+            classNames.add(TusRateLimitFilter.class.getName());
+        }
+        if (capabilities.isPresent(Capability.SMALLRYE_HEALTH)) {
+            classNames.add(TusHealthCheck.class.getName());
+        }
+
+        producer.produce(new AdditionalIndexedClassesBuildItem(classNames.toArray(new String[0])));
+    }
+
     @BuildStep
     AdditionalBeanBuildItem tusCoreBeans() {
         return AdditionalBeanBuildItem.builder()
@@ -56,10 +110,25 @@ class TusProcessor {
                         LocalFileUploadStore.class,
                         UploadProgressService.class,
                         UploadExpirationScheduler.class,
-                        TusMetricsService.class,
                         TusDevUIJsonRpcService.class,
                         TusRateLimitService.class
                 )
+                .build();
+    }
+
+    /**
+     * TusMetricsService references Micrometer types directly and Micrometer is only a
+     * compileOnly dependency, so it must not be registered in applications that do not
+     * have the Micrometer extension — its event observers would fail to load.
+     */
+    @BuildStep
+    AdditionalBeanBuildItem tusMetrics(Capabilities capabilities) {
+        if (!capabilities.isPresent(Capability.METRICS)) {
+            return new AdditionalBeanBuildItem.Builder().build();
+        }
+        return AdditionalBeanBuildItem.builder()
+                .setUnremovable()
+                .addBeanClasses(TusMetricsService.class)
                 .build();
     }
 

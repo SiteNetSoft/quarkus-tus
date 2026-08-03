@@ -24,9 +24,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Tech Stack & Versions
 
-- **Quarkus 3.36.2** (via quarkus-bom)
+- **Quarkus 3.38.0** (via quarkus-bom)
 - **Java 25** (source and target compatibility)
-- **Gradle 9.5.1** (wrapper)
+- **Gradle 9.6.1** (wrapper)
 - **quarkus-arc**, **quarkus-rest**, **quarkus-scheduler**, **quarkus-vertx** (runtime deps)
 - **rest-assured** + **quarkus-junit5** (testing)
 
@@ -71,10 +71,10 @@ integration-tests/ — @QuarkusTest integration tests (io.quarkus plugin)
 |---|---|---|
 | `quarkus.tus.sse-enabled` | Build time | `true` |
 | `quarkus.tus.auth-enabled` | Build time | `false` |
-| `quarkus.tus.path` | Build time | `/tus` |
+| `quarkus.tus.path` | Build time | `/tus` (endpoints are fixed at `/tus`; any other value fails the build) |
 | `quarkus.tus.version` | Runtime | `1.0.0` |
 | `quarkus.tus.max-size` | Runtime | `107374182400` |
-| `quarkus.tus.extensions` | Runtime | `creation,termination,checksum,expiration,concatenation,creation-with-upload,creation-defer-length` |
+| `quarkus.tus.extensions` | Runtime | `creation,termination,checksum,expiration,concatenation,concatenation-unfinished,creation-with-upload,creation-defer-length` (no `checksum-trailer` — trailers are not read) |
 | `quarkus.tus.expiration-hours` | Runtime | `24` |
 | `quarkus.tus.checksum-algorithms` | Runtime | `sha1,md5,sha256` |
 | `quarkus.tus.store.local.upload-dir` | Runtime | `${java.io.tmpdir}/quarkus-tus-uploads` |
@@ -83,5 +83,7 @@ integration-tests/ — @QuarkusTest integration tests (io.quarkus plugin)
 ## Key Gotchas
 
 - `@ApplicationScoped` beans use CDI client proxies — direct field access bypasses the proxy. Use `@Singleton` or getter methods when test code needs to read bean state directly.
-- `@Provider` classes (like `TusAuthFilter`) are auto-discovered by Jandex regardless of `AdditionalBeanBuildItem` conditional registration. The filter must check config at runtime to short-circuit when disabled.
+- The runtime module deliberately ships **no** `META-INF/beans.xml`. Shipping one makes Quarkus index the whole runtime jar as a bean archive, which silently defeats every conditional `AdditionalBeanBuildItem` in `TusProcessor`. Because of this, JAX-RS resources and `@Provider` classes are not discovered automatically — `TusProcessor.indexedJaxRsClasses()` registers them explicitly via `AdditionalIndexedClassesBuildItem`, gated on the same config as their bean registration. Any new resource or provider must be added there or it will 404.
+- The filters still re-check their config flag at runtime. That is defense in depth, not a workaround.
+- Beans that reference an optional dependency's types (e.g. `TusMetricsService` → Micrometer, which is `compileOnly`) must be registered behind a `Capabilities.isPresent(...)` check, or consumer apps without that extension fail to load the class.
 - RESTEasy Reactive consumes the `Content-Type` header for `@Consumes` matching — `@HeaderParam("Content-Type")` returns null. Don't duplicate content-type validation that `@Consumes` already handles.
