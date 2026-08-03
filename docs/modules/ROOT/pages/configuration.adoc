@@ -22,6 +22,11 @@ Build time properties are fixed at application build and cannot be changed at ru
 | `false`
 | Whether the authentication filter is registered. When enabled, all TUS endpoints (except OPTIONS) require an authenticated user principal.
 
+| `quarkus.tus.rate-limit-enabled`
+| `boolean`
+| `false`
+| Whether the per-client token-bucket throttle is registered. Applies to POST and PATCH only. See <<Rate Limiting Behind a Proxy>> before enabling it behind a reverse proxy.
+
 | `quarkus.tus.method-override-enabled`
 | `boolean`
 | `true`
@@ -77,7 +82,35 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `long`
 | `10485760` (10 MB)
 | Maximum chunk size per PATCH request in bytes. Enforced on both PATCH uploads and creation-with-upload POST requests. Requests exceeding this limit receive a 413 response.
+
+| `quarkus.tus.rate-limit-requests-per-minute`
+| `int`
+| `60`
+| Sustained request rate allowed per client, for POST and PATCH only.
+
+| `quarkus.tus.rate-limit-burst-size`
+| `int`
+| `10`
+| Number of requests a client may make back-to-back before the sustained rate applies.
 |===
+
+== Rate Limiting Behind a Proxy
+
+Rate limiting is off by default; enable it with `quarkus.tus.rate-limit-enabled=true` (build time). Clients are identified by the authenticated principal when there is one, and otherwise by the peer address of the connection.
+
+Forwarding headers such as `X-Forwarded-For` are **not** trusted by default, because anyone can set them: a client that varied the value per request would get a fresh burst allowance every time and defeat the limiter entirely.
+
+If the application runs behind a reverse proxy, tell Quarkus to resolve the forwarded address, and restrict which peers may do so:
+
+[source,properties]
+----
+quarkus.http.proxy.proxy-address-forwarding=true
+quarkus.http.proxy.trusted-proxies=10.0.0.1
+----
+
+Quarkus verifies the immediate peer is a trusted proxy before rewriting the request's remote address, and the throttle then applies per forwarded client.
+
+WARNING: Without `proxy-address-forwarding`, every request arriving through a proxy carries the proxy's address, so all clients share a single bucket and throttle each other. Enable it whenever a proxy sits in front of the application.
 
 == Environment Variable Mapping
 

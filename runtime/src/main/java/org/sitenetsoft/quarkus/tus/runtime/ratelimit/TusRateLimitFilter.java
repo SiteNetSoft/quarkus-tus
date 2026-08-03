@@ -1,5 +1,8 @@
 package org.sitenetsoft.quarkus.tus.runtime.ratelimit;
 
+import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+import io.vertx.core.net.SocketAddress;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.annotation.Priority;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Priorities;
@@ -19,6 +22,9 @@ public class TusRateLimitFilter implements ContainerRequestFilter {
 
     @Inject
     TusRateLimitService rateLimitService;
+
+    @Inject
+    CurrentVertxRequest currentVertxRequest;
 
     @Override
     public void filter(ContainerRequestContext requestContext) {
@@ -51,18 +57,31 @@ public class TusRateLimitFilter implements ContainerRequestFilter {
         }
     }
 
+    /**
+     * Identifies the caller to throttle: the authenticated principal, otherwise the peer
+     * address of the connection.
+     * <p>
+     * Forwarding headers are deliberately not read here. They are attacker-controlled, so
+     * keying on them let a client buy a fresh burst per request simply by varying the value —
+     * and grew an unbounded map of buckets while doing it. Behind a real proxy, enable
+     * {@code quarkus.http.proxy.proxy-address-forwarding} (with
+     * {@code quarkus.http.proxy.trusted-proxies}); Quarkus then resolves the forwarded address
+     * into the peer address seen here, having first checked that the proxy is trusted.
+     */
     private String resolveClientId(ContainerRequestContext requestContext) {
         if (requestContext.getSecurityContext() != null
                 && requestContext.getSecurityContext().getUserPrincipal() != null) {
             return requestContext.getSecurityContext().getUserPrincipal().getName();
         }
 
-        // Fall back to remote IP from headers or direct connection
-        String forwarded = requestContext.getHeaderString("X-Forwarded-For");
-        if (forwarded != null && !forwarded.isBlank()) {
-            return forwarded.split(",")[0].trim();
+        RoutingContext routingContext = currentVertxRequest.getCurrent();
+        if (routingContext != null) {
+            SocketAddress remote = routingContext.request().remoteAddress();
+            if (remote != null && remote.hostAddress() != null) {
+                return remote.hostAddress();
+            }
         }
 
-        return "anonymous";
+        return "unknown";
     }
 }
