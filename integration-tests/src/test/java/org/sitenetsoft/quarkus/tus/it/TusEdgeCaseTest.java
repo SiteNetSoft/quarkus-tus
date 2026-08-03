@@ -171,6 +171,74 @@ class TusEdgeCaseTest {
                 .statusCode(204);
     }
 
+    // ---- Completion fires once per upload ----
+
+    /**
+     * A PATCH at the final offset with an empty body passes every check — the offset matches,
+     * nothing exceeds the declared length, and a zero-byte write succeeds — so it used to
+     * re-fire TusUploadCompletedEvent every time. Consumers typically move files, insert
+     * rows, call webhooks or bill for the upload, so this let any client replay those effects
+     * indefinitely.
+     */
+    @Test
+    void testCompletionEventFiresOnlyOnceWhenRePatchedAtFinalOffset() {
+        byte[] data = "all done".getBytes();
+        String location = createUpload(data.length);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(204);
+
+        assertEquals(1, observer.completedEvents.size(),
+                "Completing the upload should fire exactly one completion event");
+
+        for (int i = 0; i < 3; i++) {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", String.valueOf(data.length))
+                    .contentType("application/offset+octet-stream")
+                    .body(new byte[0])
+                    .when().patch(location);
+        }
+
+        assertEquals(1, observer.completedEvents.size(),
+                "Re-patching a complete upload must not fire further completion events");
+    }
+
+    /**
+     * The same guard must not stop a zero-length upload from completing: its only chance to
+     * fire is an empty PATCH, since offset already equals the declared length.
+     */
+    @Test
+    void testZeroLengthUploadStillFiresCompletionOnce() {
+        String location = given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", "0")
+                .when().post("/tus")
+                .then()
+                .statusCode(201)
+                .extract().header("Location");
+
+        for (int i = 0; i < 3; i++) {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(new byte[0])
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204);
+        }
+
+        assertEquals(1, observer.completedEvents.size(),
+                "A zero-length upload should complete exactly once");
+    }
+
     // ---- Discard must not run while a write holds the lock ----
 
     /**
