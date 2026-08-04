@@ -552,9 +552,8 @@ abstract class TusUploadTestBase {
 
         assertTrue(extensions.contains("concatenation-unfinished"),
                 "Extensions should include concatenation-unfinished");
-        // Trailer-based checksums are not read, so the extension must not be advertised.
-        assertFalse(extensions.contains("checksum-trailer"),
-                "Extensions must not include checksum-trailer while trailers are unsupported");
+        assertTrue(extensions.contains("checksum-trailer"),
+                "Extensions should include checksum-trailer");
     }
 
     @Test

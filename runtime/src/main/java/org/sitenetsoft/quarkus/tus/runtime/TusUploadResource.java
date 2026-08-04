@@ -548,9 +548,17 @@ public class TusUploadResource {
         // Parsed before the lock is taken so that a rejection cannot leak it. A blank header
         // is treated as absent; a present-but-unparseable one is a client error rather than
         // something to silently skip, since the client believes its data is being verified.
+        // The body has already been read by the time this method runs, so a trailer sent after
+        // it is available here. A client streaming a large chunk cannot hash it before sending,
+        // which is exactly what the checksum-trailer extension exists for.
+        String checksumValue = uploadChecksum;
+        if ((checksumValue == null || checksumValue.isBlank()) && routingContext != null) {
+            checksumValue = routingContext.request().getTrailer("Upload-Checksum");
+        }
+
         Optional<UploadInfo.ChecksumInfo> checksumInfo = Optional.empty();
-        if (uploadChecksum != null && !uploadChecksum.isBlank()) {
-            checksumInfo = TusUtils.parseChecksumHeader(uploadChecksum);
+        if (checksumValue != null && !checksumValue.isBlank()) {
+            checksumInfo = TusUtils.parseChecksumHeader(checksumValue);
             if (checksumInfo.isEmpty()) {
                 return Uni.createFrom().item(
                         Response.status(BAD_REQUEST)

@@ -60,7 +60,7 @@ Runtime properties can be overridden at startup via `application.properties`, en
 
 | `quarkus.tus.extensions`
 | `String`
-| `creation,termination,checksum,expiration,concatenation,creation-with-upload,creation-defer-length`
+| `creation,termination,checksum,checksum-trailer,expiration,concatenation,concatenation-unfinished,creation-with-upload,creation-defer-length`
 | Comma-separated list of active TUS protocol extensions. Reported in the `Tus-Extension` header.
 
 | `quarkus.tus.expiration-hours`
@@ -98,6 +98,17 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `10`
 | Number of requests a client may make back-to-back before the sustained rate applies.
 |===
+
+== Checksum Trailers
+
+The `checksum-trailer` extension lets a client send `Upload-Checksum` as an HTTP trailer, after the
+body, instead of as a header. This matters for clients that stream a large chunk and cannot compute
+its hash before sending it.
+
+WARNING: Reading HTTP request trailers requires a `vertx-core` that implements
+https://github.com/eclipse-vertx/vert.x/issues/5253[eclipse-vertx/vert.x#5253], which Vert.x does not
+yet ship. Against a stock Vert.x the trailer is never seen and the chunk would be accepted unverified,
+so remove `checksum-trailer` from `quarkus.tus.extensions` unless you are running a patched build.
 
 == Rate Limiting Behind a Proxy
 

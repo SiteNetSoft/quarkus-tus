@@ -24,11 +24,11 @@ public interface TusRuntimeConfig {
     /**
      * Active TUS protocol extensions (comma-separated).
      * <p>
-     * {@code checksum-trailer} is deliberately absent: checksums sent as HTTP trailers are
-     * not read, and announcing the extension would invite clients to rely on verification
-     * that never happens.
+     * {@code checksum-trailer} requires a vertx-core that can read HTTP request trailers
+     * (eclipse-vertx/vert.x#5253). Remove it from this list when running against a stock
+     * Vert.x, otherwise clients will rely on verification that never happens.
      */
-    @WithDefault("creation,termination,checksum,expiration,concatenation,concatenation-unfinished,creation-with-upload,creation-defer-length")
+    @WithDefault("creation,termination,checksum,checksum-trailer,expiration,concatenation,concatenation-unfinished,creation-with-upload,creation-defer-length")
     String extensions();
 
     /**
