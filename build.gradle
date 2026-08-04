@@ -12,14 +12,6 @@ subprojects {
     apply plugin: 'java'
     apply plugin: 'jacoco'
 
-    // Reading HTTP request trailers requires https://github.com/eclipse-vertx/vert.x/issues/5253,
-    // which Vert.x does not yet ship. Until it does, the checksum-trailer extension needs a
-    // vertx-core built from the request-trailers branch and installed to the local repository.
-    configurations.all {
-        resolutionStrategy {
-            force 'io.vertx:vertx-core:4.5.32-SNAPSHOT'
-        }
-    }
 
     java {
         sourceCompatibility = JavaVersion.VERSION_25
