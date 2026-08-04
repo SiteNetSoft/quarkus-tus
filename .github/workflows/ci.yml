@@ -75,10 +75,12 @@ jobs:
             **/build/reports/tests/
           retention-days: 7
 
+  # Runs on pull requests as well as master. Native image is sensitive to how beans and
+  # JAX-RS classes are registered, which is exactly the kind of change that is easy to get
+  # wrong and expensive to discover after merging.
   native:
     name: Native Image Test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
 
     steps:
       - uses: actions/checkout@v4
