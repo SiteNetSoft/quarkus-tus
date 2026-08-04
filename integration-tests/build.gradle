@@ -33,10 +33,11 @@ tasks.register('integrationTest', Test) {
     systemProperty 'java.util.logging.manager', 'org.jboss.logmanager.LogManager'
 }
 
-// Requires -Dquarkus.native.enabled=true on the Gradle invocation so that quarkusBuild
-// actually produces a native binary. Setting it only as a test system property configures
-// the test JVM but leaves quarkusBuild producing a JVM app, which is why this task used to
-// pass in seconds without building anything native.
+// Requires -Dquarkus.native.enabled=true -Dquarkus.package.jar.enabled=false on the Gradle
+// invocation so that quarkusBuild produces a native binary (Quarkus refuses to emit both a
+// native image and a JAR). Setting quarkus.native.enabled only as a test system property
+// configures the test JVM but leaves quarkusBuild producing a JVM app, which is why this
+// task used to pass in seconds without building anything native.
 tasks.register('nativeIntegrationTest', Test) {
     description = 'Runs @QuarkusIntegrationTest tests against the native binary'
     group = 'verification'
@@ -54,7 +55,8 @@ tasks.register('nativeIntegrationTest', Test) {
         if (runner == null) {
             throw new GradleException(
                     "No native runner found in ${buildDir}. Run this task with " +
-                    "-Dquarkus.native.enabled=true, otherwise quarkusBuild produces a JVM " +
+                    "-Dquarkus.native.enabled=true -Dquarkus.package.jar.enabled=false, " +
+                    "otherwise quarkusBuild produces a JVM " +
                     "application and this task reports success without exercising native image.")
         }
         logger.lifecycle("Testing against native binary: ${runner.name}")

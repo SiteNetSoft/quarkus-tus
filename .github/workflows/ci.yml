@@ -119,4 +119,4 @@ jobs:
             -DskipTests -Dmaven.javadoc.skip=true -Dmaven.source.skip=true
 
       - name: Build and test native image
-        run: ./gradlew :integration-tests:nativeIntegrationTest -Dquarkus.native.enabled=true
+        run: ./gradlew :integration-tests:nativeIntegrationTest -Dquarkus.native.enabled=true -Dquarkus.package.jar.enabled=false
