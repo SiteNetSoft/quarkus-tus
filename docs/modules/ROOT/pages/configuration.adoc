@@ -22,11 +22,23 @@ Build time properties are fixed at application build and cannot be changed at ru
 | `false`
 | Whether the authentication filter is registered. When enabled, all TUS endpoints (except OPTIONS) require an authenticated user principal.
 
+| `quarkus.tus.rate-limit-enabled`
+| `boolean`
+| `false`
+| Whether the per-client token-bucket throttle is registered. Applies to POST and PATCH only. See <<Rate Limiting Behind a Proxy>> before enabling it behind a reverse proxy.
+
+| `quarkus.tus.method-override-enabled`
+| `boolean`
+| `true`
+| Whether the `X-HTTP-Method-Override` filter is registered. Required by the TUS core protocol so that clients behind proxies which block `PATCH` and `DELETE` can still upload. Disable it only if something in front of the application enforces rules based on the HTTP method.
+
 | `quarkus.tus.path`
 | `String`
 | `/tus`
-| URL path prefix for all TUS endpoints.
+| Path prefix used when building `Location` and `Upload-Concat` header values. The endpoints themselves are fixed at `/tus`, so setting this to any other value fails the build. To serve TUS under a different prefix, put the application behind a reverse proxy that rewrites it.
 |===
+
+NOTE: Authorization is per upload. When `quarkus.tus.auth-enabled` is `true`, the principal that created an upload is recorded, and HEAD, PATCH, DELETE and concatenation requests from any other principal are answered with `404 Not Found`. Uploads created while auth was disabled have no recorded owner and stay accessible to everyone.
 
 == Runtime Properties
 
@@ -48,7 +60,7 @@ Runtime properties can be overridden at startup via `application.properties`, en
 
 | `quarkus.tus.extensions`
 | `String`
-| `creation,termination,checksum,expiration,concatenation,creation-with-upload,creation-defer-length`
+| `creation,termination,checksum,checksum-trailer,expiration,concatenation,concatenation-unfinished,creation-with-upload,creation-defer-length`
 | Comma-separated list of active TUS protocol extensions. Reported in the `Tus-Extension` header.
 
 | `quarkus.tus.expiration-hours`
@@ -70,7 +82,51 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `long`
 | `10485760` (10 MB)
 | Maximum chunk size per PATCH request in bytes. Enforced on both PATCH uploads and creation-with-upload POST requests. Requests exceeding this limit receive a 413 response.
+
+| `quarkus.tus.max-concat-parts`
+| `int`
+| `1000`
+| Maximum number of partial uploads a single `Upload-Concat: final` request may reference. Requests exceeding it are rejected with 400. Referencing the same partial more than once is always rejected, regardless of this limit.
+
+| `quarkus.tus.rate-limit-requests-per-minute`
+| `int`
+| `60`
+| Sustained request rate allowed per client, for POST and PATCH only.
+
+| `quarkus.tus.rate-limit-burst-size`
+| `int`
+| `10`
+| Number of requests a client may make back-to-back before the sustained rate applies.
 |===
+
+== Checksum Trailers
+
+The `checksum-trailer` extension lets a client send `Upload-Checksum` as an HTTP trailer, after the
+body, instead of as a header. This matters for clients that stream a large chunk and cannot compute
+its hash before sending it.
+
+WARNING: Reading HTTP request trailers requires a `vertx-core` that implements
+https://github.com/eclipse-vertx/vert.x/issues/5253[eclipse-vertx/vert.x#5253], which Vert.x does not
+yet ship. Against a stock Vert.x the trailer is never seen and the chunk would be accepted unverified,
+so remove `checksum-trailer` from `quarkus.tus.extensions` unless you are running a patched build.
+
+== Rate Limiting Behind a Proxy
+
+Rate limiting is off by default; enable it with `quarkus.tus.rate-limit-enabled=true` (build time). Clients are identified by the authenticated principal when there is one, and otherwise by the peer address of the connection.
+
+Forwarding headers such as `X-Forwarded-For` are **not** trusted by default, because anyone can set them: a client that varied the value per request would get a fresh burst allowance every time and defeat the limiter entirely.
+
+If the application runs behind a reverse proxy, tell Quarkus to resolve the forwarded address, and restrict which peers may do so:
+
+[source,properties]
+----
+quarkus.http.proxy.proxy-address-forwarding=true
+quarkus.http.proxy.trusted-proxies=10.0.0.1
+----
+
+Quarkus verifies the immediate peer is a trusted proxy before rewriting the request's remote address, and the throttle then applies per forwarded client.
+
+WARNING: Without `proxy-address-forwarding`, every request arriving through a proxy carries the proxy's address, so all clients share a single bucket and throttle each other. Enable it whenever a proxy sits in front of the application.
 
 == Environment Variable Mapping
 

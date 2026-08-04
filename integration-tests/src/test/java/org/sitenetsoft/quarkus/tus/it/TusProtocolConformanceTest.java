@@ -67,6 +67,59 @@ class TusProtocolConformanceTest {
     @Nested
     class CoreProtocol {
 
+        /**
+         * Tus-Resumable is required on every response except OPTIONS. The resource methods set
+         * it themselves, but responses the container produces — a media-type mismatch, an
+         * unsupported method, an unmatched path — bypass them entirely.
+         */
+        @Test
+        void wrongContentTypeOnPatchStillIncludesTusResumable() {
+            String location = createUpload(10);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("text/plain")
+                    .body("x")
+                    .when().patch(location)
+                    .then()
+                    .statusCode(415)
+                    .header("Tus-Resumable", "1.0.0");
+        }
+
+        @Test
+        void unsupportedMethodStillIncludesTusResumable() {
+            String location = createUpload(10);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().put(location)
+                    .then()
+                    .statusCode(405)
+                    .header("Tus-Resumable", "1.0.0");
+        }
+
+        @Test
+        void unsupportedMethodOnCollectionStillIncludesTusResumable() {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().put("/tus")
+                    .then()
+                    .statusCode(405)
+                    .header("Tus-Resumable", "1.0.0");
+        }
+
+        @Test
+        void versionMismatchStillIncludesTusVersion() {
+            given()
+                    .header("Tus-Resumable", "0.0.1")
+                    .header("Upload-Length", "10")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(412)
+                    .header("Tus-Version", "1.0.0");
+        }
+
         @Test
         void headIncludesCacheControlNoStore() {
             String location = createUpload(100);
@@ -320,6 +373,22 @@ class TusProtocolConformanceTest {
                     .header("Upload-Offset", String.valueOf(data.length));
         }
 
+        /**
+         * A body longer than Upload-Length used to be written to disk in full while the
+         * recorded offset was clamped, producing a "complete" upload with trailing garbage.
+         */
+        @Test
+        void bodyLongerThanUploadLengthIsRejected() {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", "5")
+                    .contentType("application/offset+octet-stream")
+                    .body("far more than five bytes".getBytes())
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(413);
+        }
+
         @Test
         void partialBodyThenResumeViaPatch() {
             byte[] fullData = "complete data!!".getBytes();
@@ -492,8 +561,9 @@ class TusProtocolConformanceTest {
                     .body(data)
                     .when().patch(location)
                     .then()
-                    // Empty/malformed checksum should be ignored (no separator found)
-                    .statusCode(204);
+                    // A client that sent a checksum expects verification; accepting the chunk
+                    // unverified would silently break that expectation.
+                    .statusCode(400);
         }
 
         @Test
@@ -535,8 +605,81 @@ class TusProtocolConformanceTest {
             }
         }
 
+        /**
+         * The checksum extension specifies 400 for an unsupported algorithm; 460 is reserved
+         * for a genuine mismatch and would mislead a client into retrying.
+         */
+        /**
+         * checksum-trailer: the client streams the chunk and only commits the checksum once it
+         * has finished, sending it as a trailer after the body. RestAssured cannot send
+         * trailers, so the request is written directly onto a socket.
+         */
         @Test
-        void invalidChecksumAlgorithmReturns460() {
+        void checksumSentAsTrailerIsVerified() throws Exception {
+            byte[] data = "trailer checksummed".getBytes();
+            String location = createUpload(data.length);
+            String sha1 = Base64.getEncoder().encodeToString(
+                    MessageDigest.getInstance("SHA-1").digest(data));
+
+            assertEquals(204, patchWithTrailer(location, data, "sha1 " + sha1),
+                    "A valid checksum trailer must be accepted");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", String.valueOf(data.length));
+        }
+
+        @Test
+        void badChecksumSentAsTrailerIsRejected() throws Exception {
+            byte[] data = "trailer checksummed".getBytes();
+            String location = createUpload(data.length);
+            String wrong = Base64.getEncoder().encodeToString(
+                    MessageDigest.getInstance("SHA-1").digest("something else".getBytes()));
+
+            assertEquals(460, patchWithTrailer(location, data, "sha1 " + wrong),
+                    "A mismatching checksum trailer must be rejected");
+
+            // The chunk must not have been stored.
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", "0");
+        }
+
+        /** Sends a chunked PATCH whose Upload-Checksum arrives as a trailer; returns the status. */
+        private int patchWithTrailer(String location, byte[] body, String checksum) throws Exception {
+            String request = "PATCH " + location + " HTTP/1.1\r\n"
+                    + "Host: localhost\r\n"
+                    + "Tus-Resumable: 1.0.0\r\n"
+                    + "Upload-Offset: 0\r\n"
+                    + "Content-Type: application/offset+octet-stream\r\n"
+                    + "Transfer-Encoding: chunked\r\n"
+                    + "Trailer: Upload-Checksum\r\n"
+                    + "\r\n"
+                    + Integer.toHexString(body.length) + "\r\n"
+                    + new String(body)
+                    + "\r\n0\r\n"
+                    + "Upload-Checksum: " + checksum + "\r\n"
+                    + "\r\n";
+
+            try (java.net.Socket socket = new java.net.Socket("localhost", io.restassured.RestAssured.port)) {
+                socket.setSoTimeout(10_000);
+                socket.getOutputStream().write(request.getBytes());
+                socket.getOutputStream().flush();
+                String statusLine = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(socket.getInputStream())).readLine();
+                assertNotNull(statusLine, "Server closed the connection without responding");
+                return Integer.parseInt(statusLine.split(" ")[1]);
+            }
+        }
+
+        @Test
+        void unsupportedChecksumAlgorithmReturns400() {
             byte[] data = "test".getBytes();
             String location = createUpload(data.length);
 
@@ -548,7 +691,15 @@ class TusProtocolConformanceTest {
                     .body(data)
                     .when().patch(location)
                     .then()
-                    .statusCode(460);
+                    .statusCode(400);
+
+            // The chunk must not have been stored.
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", "0");
         }
     }
 
@@ -642,6 +793,65 @@ class TusProtocolConformanceTest {
 
             assertNotNull(concat);
             assertTrue(concat.startsWith("final;"));
+        }
+
+        /**
+         * The spec requires HEAD on a final upload to return Upload-Concat "as received in
+         * the upload creation request", so a client that sent absolute URLs must get its own
+         * value back rather than one rebuilt from the parsed IDs.
+         */
+        @Test
+        void headOnFinalEchoesUploadConcatAsReceived() {
+            byte[] data1 = "aa".getBytes();
+            byte[] data2 = "bb".getBytes();
+
+            String loc1 = createPartialUpload(data1.length);
+            String loc2 = createPartialUpload(data2.length);
+            uploadData(loc1, data1, 0);
+            uploadData(loc2, data2, 0);
+
+            String sent = "final; https://example.com/tus/" + extractId(loc1)
+                    + " https://example.com/tus/" + extractId(loc2);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", sent)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(finalLocation)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Concat", equalTo(sent));
+        }
+
+        /**
+         * The same applies to a final whose partials are still incomplete, which takes the
+         * separate unfinished-merge path.
+         */
+        @Test
+        void headOnUnfinishedFinalEchoesUploadConcatAsReceived() {
+            String loc = createPartialUpload(10);
+            String sent = "final; https://example.com/tus/" + extractId(loc);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", sent)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(finalLocation)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Concat", equalTo(sent));
         }
 
         @Test
@@ -792,6 +1002,91 @@ class TusProtocolConformanceTest {
                     .header("Upload-Concat", "partial");
         }
 
+        /**
+         * The spec forbids PATCH against a final upload URL without distinguishing whether
+         * the concatenation has finished. An unfinished final used to accept writes, which
+         * finalizeConcatenation would then silently overwrite.
+         */
+        @Test
+        void patchOnUnfinishedFinalReturns403() {
+            String partial = createPartialUpload(10);
+
+            String finalLocation = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + partial)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body("injected".getBytes())
+                    .when().patch(finalLocation)
+                    .then()
+                    .statusCode(403);
+        }
+
+        /**
+         * Referencing the same partial repeatedly used to copy it once per occurrence, so a
+         * single small request could turn one uploaded partial into a file many times its
+         * size — amplification bounded only by the HTTP header limit.
+         */
+        @Test
+        void duplicatePartialReferenceIsRejected() {
+            byte[] data = "amplify".getBytes();
+            String loc = createPartialUpload(data.length);
+            uploadData(loc, data, 0);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc + " " + loc + " " + loc)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(400);
+
+            // The partial must not have been consumed by the rejected request.
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(loc)
+                    .then()
+                    .statusCode(200);
+        }
+
+        /**
+         * The deferred-merge path takes no locks, so unlike the complete-partial case above it
+         * had nothing incidentally stopping duplicates: the final's declared length was the
+         * sum of the repeated references, claiming more bytes than were ever uploaded.
+         */
+        @Test
+        void duplicateIncompletePartialReferenceIsRejected() {
+            String loc = createPartialUpload(10);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc + " " + loc + " " + loc)
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(400);
+        }
+
+        @Test
+        void concatWithInvalidPartialReferenceIsRejected() {
+            byte[] data = "abc".getBytes();
+            String loc = createPartialUpload(data.length);
+            uploadData(loc, data, 0);
+
+            // A non-UUID reference used to be filtered out silently, merging a subset.
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Concat", "final; " + loc + " /tus/not-a-uuid")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(400);
+        }
+
         @Test
         void concatenationWithSinglePartial() {
             byte[] data = "single".getBytes();
@@ -902,6 +1197,103 @@ class TusProtocolConformanceTest {
             // setDeferredLength returns false, results in 400
             assertTrue(status == 400 || status == 413,
                     "Deferred length exceeding max should be rejected: got " + status);
+        }
+    }
+
+    // ========== X-HTTP-Method-Override (core protocol) ==========
+
+    /**
+     * The core spec requires the server to interpret X-HTTP-Method-Override as the request
+     * method, so clients behind proxies that block PATCH and DELETE can still upload.
+     */
+    @Nested
+    class MethodOverride {
+
+        @Test
+        void overridePatchUploadsChunk() {
+            byte[] data = "override".getBytes();
+            String location = createUpload(data.length);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "PATCH")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().post(location)
+                    .then()
+                    .statusCode(204)
+                    .header("Upload-Offset", String.valueOf(data.length));
+        }
+
+        @Test
+        void overrideHeadReturnsUploadStatus() {
+            String location = createUpload(42);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "HEAD")
+                    .when().post(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", "0")
+                    .header("Upload-Length", "42");
+        }
+
+        @Test
+        void overrideDeleteTerminatesUpload() {
+            String location = createUpload(50);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "DELETE")
+                    .when().post(location)
+                    .then()
+                    .statusCode(204);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(404);
+        }
+
+        @Test
+        void overrideValueIsCaseInsensitive() {
+            byte[] data = "lower".getBytes();
+            String location = createUpload(data.length);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "patch")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(data)
+                    .when().post(location)
+                    .then()
+                    .statusCode(204);
+        }
+
+        @Test
+        void unsupportedOverrideValueReturns400() {
+            String location = createUpload(10);
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("X-HTTP-Method-Override", "TRACE")
+                    .when().post(location)
+                    .then()
+                    .statusCode(400);
+        }
+
+        @Test
+        void requestWithoutOverrideHeaderIsUnaffected() {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Length", "10")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201);
         }
     }
 }

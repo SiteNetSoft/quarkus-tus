@@ -14,6 +14,7 @@ import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.event.TusUploadCompletedEvent;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
+import org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 import java.io.IOException;
@@ -311,7 +312,8 @@ public class LocalFileUploadStore implements UploadStore {
     @Override
     public Optional<String> mergePartialUploadsWithOwnership(String[] ids,
                                                               Optional<String> uploadMetadata,
-                                                              String requiredOwnerId) {
+                                                              String requiredOwnerId,
+                                                              String uploadConcatHeader) {
         if (ids == null || ids.length == 0) {
             return Optional.empty();
         }
@@ -333,7 +335,7 @@ public class LocalFileUploadStore implements UploadStore {
         }
 
         try {
-            return doMergeWithOwnership(ids, uploadMetadata, requiredOwnerId);
+            return doMergeWithOwnership(ids, uploadMetadata, requiredOwnerId, uploadConcatHeader);
         } finally {
             lockedIds.forEach(this::releaseLock);
         }
@@ -341,7 +343,8 @@ public class LocalFileUploadStore implements UploadStore {
 
     private Optional<String> doMergeWithOwnership(String[] ids,
                                                     Optional<String> uploadMetadata,
-                                                    String requiredOwnerId) {
+                                                    String requiredOwnerId,
+                                                    String uploadConcatHeader) {
         long totalLength = 0;
         for (String partialId : ids) {
             UploadInfo partialInfo = uploads.get(partialId);
@@ -395,20 +398,19 @@ public class LocalFileUploadStore implements UploadStore {
             finalInfo.setEntityLength(totalLength);
             finalInfo.setOffset(totalLength);
             finalInfo.setPartial(false);
+            finalInfo.setUploaderId(requiredOwnerId);
+            finalInfo.setLastActivity(Instant.now());
+            finalInfo.setExpiresAt(Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS));
             uploadMetadata.ifPresent(finalInfo::setMetadata);
 
-            StringBuilder concatValue = new StringBuilder("final;");
-            for (int i = 0; i < ids.length; i++) {
-                if (i > 0) concatValue.append(" ");
-                concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
-            }
-            finalInfo.setUploadConcatMergedValue(concatValue.toString());
+            finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
 
             uploads.put(finalId, finalInfo);
             persistMetadata(finalId, finalInfo);
 
+            // The caller holds every partial's lock for the duration of the merge.
             for (String partialId : ids) {
-                discardUpload(partialId);
+                discardLockedUpload(partialId);
             }
 
             LOG.infof("Successfully merged %d partials into final upload %s (size=%d)",
@@ -428,7 +430,8 @@ public class LocalFileUploadStore implements UploadStore {
     }
 
     @Override
-    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata) {
+    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata,
+                                                          String requiredOwnerId, String uploadConcatHeader) {
         if (ids == null || ids.length == 0) {
             return Optional.empty();
         }
@@ -442,6 +445,14 @@ public class LocalFileUploadStore implements UploadStore {
             }
             if (partialInfo.getEntityLength() < 0) {
                 return Optional.empty();
+            }
+            if (requiredOwnerId != null) {
+                String ownerId = partialInfo.getUploaderId();
+                if (ownerId != null && !ownerId.equals(requiredOwnerId)) {
+                    LOG.warnf("Ownership validation failed for partial %s: required=%s, actual=%s",
+                            partialId, requiredOwnerId, ownerId);
+                    return Optional.empty();
+                }
             }
             totalLength += partialInfo.getEntityLength();
             partialIdList.add(partialId);
@@ -459,17 +470,14 @@ public class LocalFileUploadStore implements UploadStore {
         finalInfo.setPartial(false);
         finalInfo.setFinalConcat(true);
         finalInfo.setPartialIds(partialIdList);
+        finalInfo.setUploaderId(requiredOwnerId);
+        finalInfo.setLastActivity(Instant.now());
         uploadMetadata.ifPresent(finalInfo::setMetadata);
 
         Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
         finalInfo.setExpiresAt(expiresAt);
 
-        StringBuilder concatValue = new StringBuilder("final;");
-        for (int i = 0; i < ids.length; i++) {
-            if (i > 0) concatValue.append(" ");
-            concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
-        }
-        finalInfo.setUploadConcatMergedValue(concatValue.toString());
+        finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
 
         uploads.put(finalId, finalInfo);
 
@@ -486,6 +494,23 @@ public class LocalFileUploadStore implements UploadStore {
 
         persistMetadata(finalId, finalInfo);
         return Optional.of(tusBuildTimeConfig.path() + "/" + finalId);
+    }
+
+    /**
+     * The protocol requires HEAD on a final upload to return {@code Upload-Concat} exactly as
+     * the client sent it, so the raw header wins. Rebuilding from the parsed IDs is only a
+     * fallback for callers that reach the SPI without one.
+     */
+    private String concatValueFor(String[] ids, String uploadConcatHeader) {
+        if (uploadConcatHeader != null && !uploadConcatHeader.isBlank()) {
+            return uploadConcatHeader;
+        }
+        StringBuilder concatValue = new StringBuilder("final;");
+        for (int i = 0; i < ids.length; i++) {
+            if (i > 0) concatValue.append(" ");
+            concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
+        }
+        return concatValue.toString();
     }
 
     @Override
@@ -544,8 +569,9 @@ public class LocalFileUploadStore implements UploadStore {
                 info.setOffset(info.getEntityLength());
                 info.setFinalConcat(false);
 
+                // The caller holds every partial's lock for the duration of the finalization.
                 for (String partialId : partialIds) {
-                    discardUpload(partialId);
+                    discardLockedUpload(partialId);
                 }
                 info.setPartialIds(null);
                 persistMetadata(id, info);
@@ -568,11 +594,34 @@ public class LocalFileUploadStore implements UploadStore {
         return totalLength <= tusRuntimeConfig.maxSize();
     }
 
+    /**
+     * Deletes an upload, refusing while another thread holds its lock.
+     * <p>
+     * This used to delete the data file and drop the lock unconditionally, so a DELETE or a
+     * cleanup job landing mid-write unlinked the file underneath an in-flight write — which
+     * then reported success for bytes that were no longer stored anywhere. Callers that
+     * already hold the lock must use {@link #discardLockedUpload} instead; acquisition is not
+     * reentrant.
+     *
+     * @return true if an upload was removed; false if it did not exist or is locked
+     */
     @Override
     public boolean discardUpload(String id) {
+        if (!acquireLock(id)) {
+            LOG.warnf("Refusing to discard upload %s: currently being written", id);
+            return false;
+        }
+        try {
+            return discardLockedUpload(id);
+        } finally {
+            releaseLock(id);
+        }
+    }
+
+    /** Discards an upload whose lock the calling thread already holds. */
+    private boolean discardLockedUpload(String id) {
         UploadInfo removed = uploads.remove(id);
         uploadProgressService.finishUpload(id);
-        activeLocks.remove(id);
 
         Path file = safePath(id);
         try {
@@ -635,6 +684,16 @@ public class LocalFileUploadStore implements UploadStore {
             return Uni.createFrom().item(-1L);
         }
 
+        // The caller's offset is never trusted: writing at a stale one would overwrite bytes
+        // that were already stored and acknowledged. Callers holding the upload's lock have
+        // already validated this, so a mismatch here means the write raced past validation.
+        if (offset != info.getOffset()) {
+            return Uni.createFrom().failure(new OffsetMismatchException(
+                    "Write at offset " + offset + " but upload " + id
+                            + " is at offset " + info.getOffset(),
+                    info.getOffset()));
+        }
+
         Path file = safePath(id);
         byte[] data = (chunk != null) ? chunk : new byte[0];
 
@@ -668,16 +727,25 @@ public class LocalFileUploadStore implements UploadStore {
                         }).eventually(asyncFile::close)
                 )
                 .onItem().invoke(newOffset -> {
+                    // If the upload was discarded while this write was in flight, persisting
+                    // would recreate a .meta for an upload whose data file is gone.
+                    if (uploads.get(id) != info) {
+                        LOG.warnf("Upload %s was discarded during a write; discarding its result", id);
+                        return;
+                    }
                     info.setOffset(newOffset);
                     info.setLastActivity(Instant.now());
                     persistMetadata(id, info);
                 })
                 .emitOn(Infrastructure.getDefaultWorkerPool())
                 .onItem().invoke(newOffset -> {
-                    if (newOffset == info.getEntityLength()) {
+                    if (uploads.get(id) == info
+                            && newOffset == info.getEntityLength()
+                            && info.markCompletionFired()) {
                         uploadProgressService.finishUpload(id);
                         uploadCompletedEvent.fire(new TusUploadCompletedEvent(
                                 id, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));
+                        persistMetadata(id, info);
                     }
                 })
                 .onFailure().invoke(e -> {
@@ -726,11 +794,19 @@ public class LocalFileUploadStore implements UploadStore {
             return -1;
         }
 
+        // Never store more than the declared length: clamping only the recorded offset
+        // would leave trailing bytes on disk and report the upload as complete.
+        if (info.getEntityLength() >= 0 && data.length > info.getEntityLength()) {
+            LOG.warnf("Initial data for upload %s exceeds declared length (%d > %d)",
+                    id, data.length, info.getEntityLength());
+            return -1;
+        }
+
         Path file = safePath(id);
 
         try (OutputStream out = Files.newOutputStream(file, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
             out.write(data);
-            long newOffset = Math.min(data.length, info.getEntityLength());
+            long newOffset = data.length;
             info.setOffset(newOffset);
             info.setLastActivity(Instant.now());
             persistMetadata(id, info);
@@ -785,16 +861,22 @@ public class LocalFileUploadStore implements UploadStore {
             }
         }
 
+        // An upload being written is skipped rather than deleted underneath the write, and is
+        // retried on the next run. Only what was actually removed is reported as cleaned.
+        List<String> cleanedIds = new ArrayList<>();
         for (String id : expiredIds) {
-            LOG.infof("Cleaning up expired upload: %s", id);
-            discardUpload(id);
+            if (discardUpload(id)) {
+                cleanedIds.add(id);
+            } else {
+                LOG.infof("Skipped expired upload %s: in use, will retry next run", id);
+            }
         }
 
-        if (!expiredIds.isEmpty()) {
-            LOG.infof("Cleaned up %d expired uploads: %s", expiredIds.size(), String.join(", ", expiredIds));
+        if (!cleanedIds.isEmpty()) {
+            LOG.infof("Cleaned up %d expired uploads: %s", cleanedIds.size(), String.join(", ", cleanedIds));
         }
 
-        return expiredIds;
+        return cleanedIds;
     }
 
     /**
@@ -820,17 +902,22 @@ public class LocalFileUploadStore implements UploadStore {
             }
         }
 
+        List<String> cleanedIds = new ArrayList<>();
         for (String id : staleIds) {
             LOG.infof("Cleaning up stale upload %s (no activity since %s)", id,
                     uploads.get(id) != null ? uploads.get(id).getLastActivity() : "unknown");
-            discardUpload(id);
+            if (discardUpload(id)) {
+                cleanedIds.add(id);
+            } else {
+                LOG.infof("Skipped stale upload %s: in use, will retry next run", id);
+            }
         }
 
-        if (!staleIds.isEmpty()) {
-            LOG.infof("Cleaned up %d stale uploads", staleIds.size());
+        if (!cleanedIds.isEmpty()) {
+            LOG.infof("Cleaned up %d stale uploads", cleanedIds.size());
         }
 
-        return staleIds;
+        return cleanedIds;
     }
 
     /**

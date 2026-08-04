@@ -1,5 +1,8 @@
 package org.sitenetsoft.quarkus.tus.runtime.ratelimit;
 
+import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+import io.vertx.core.net.SocketAddress;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.annotation.Priority;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Priorities;
@@ -8,6 +11,7 @@ import jakarta.ws.rs.container.ContainerRequestFilter;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.sitenetsoft.quarkus.tus.runtime.TusUtils;
 
 @Provider
 @Priority(Priorities.USER + 1)
@@ -16,11 +20,11 @@ public class TusRateLimitFilter implements ContainerRequestFilter {
     @ConfigProperty(name = "quarkus.tus.rate-limit-enabled", defaultValue = "false")
     boolean rateLimitEnabled;
 
-    @ConfigProperty(name = "quarkus.tus.path", defaultValue = "/tus")
-    String tusPath;
-
     @Inject
     TusRateLimitService rateLimitService;
+
+    @Inject
+    CurrentVertxRequest currentVertxRequest;
 
     @Override
     public void filter(ContainerRequestContext requestContext) {
@@ -28,8 +32,9 @@ public class TusRateLimitFilter implements ContainerRequestFilter {
             return;
         }
 
-        String requestPath = requestContext.getUriInfo().getPath();
-        if (!requestPath.startsWith(tusPath)) {
+        // Matched against where the endpoints are actually mounted, never against
+        // configuration: a mismatch would silently disable throttling.
+        if (!TusUtils.isTusPath(requestContext.getUriInfo().getPath())) {
             return;
         }
 
@@ -52,18 +57,31 @@ public class TusRateLimitFilter implements ContainerRequestFilter {
         }
     }
 
+    /**
+     * Identifies the caller to throttle: the authenticated principal, otherwise the peer
+     * address of the connection.
+     * <p>
+     * Forwarding headers are deliberately not read here. They are attacker-controlled, so
+     * keying on them let a client buy a fresh burst per request simply by varying the value —
+     * and grew an unbounded map of buckets while doing it. Behind a real proxy, enable
+     * {@code quarkus.http.proxy.proxy-address-forwarding} (with
+     * {@code quarkus.http.proxy.trusted-proxies}); Quarkus then resolves the forwarded address
+     * into the peer address seen here, having first checked that the proxy is trusted.
+     */
     private String resolveClientId(ContainerRequestContext requestContext) {
         if (requestContext.getSecurityContext() != null
                 && requestContext.getSecurityContext().getUserPrincipal() != null) {
             return requestContext.getSecurityContext().getUserPrincipal().getName();
         }
 
-        // Fall back to remote IP from headers or direct connection
-        String forwarded = requestContext.getHeaderString("X-Forwarded-For");
-        if (forwarded != null && !forwarded.isBlank()) {
-            return forwarded.split(",")[0].trim();
+        RoutingContext routingContext = currentVertxRequest.getCurrent();
+        if (routingContext != null) {
+            SocketAddress remote = routingContext.request().remoteAddress();
+            if (remote != null && remote.hostAddress() != null) {
+                return remote.hostAddress();
+            }
         }
 
-        return "anonymous";
+        return "unknown";
     }
 }

@@ -15,6 +15,12 @@ quarkus.tus.sse-enabled=false
 
 When disabled, the SSE beans and endpoints are not registered at all (build-time decision).
 
+== Access Control
+
+Both streams require the upload to exist, and — when `quarkus.tus.auth-enabled` is `true` — to belong to the caller. An unknown, malformed or unowned upload ID is answered with `404`, indistinguishable from a missing upload so the endpoint cannot be used to probe for other users' upload IDs.
+
+Only one subscriber is tracked per upload ID. Opening a second stream for the same upload closes the first, so a client that reconnects replaces its own stream rather than leaking the previous connection.
+
 == SSE Endpoints
 
 === Event Stream

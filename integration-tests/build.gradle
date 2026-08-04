@@ -12,6 +12,7 @@ dependencies {
     testImplementation 'io.quarkus:quarkus-junit5'
     testImplementation 'io.rest-assured:rest-assured'
     testImplementation 'org.awaitility:awaitility:4.3.0'
+    implementation 'io.quarkus:quarkus-elytron-security-properties-file'
     implementation 'io.quarkus:quarkus-micrometer-registry-prometheus'
     implementation 'io.quarkus:quarkus-smallrye-health'
     implementation 'io.quarkus:quarkus-smallrye-openapi'
@@ -32,6 +33,11 @@ tasks.register('integrationTest', Test) {
     systemProperty 'java.util.logging.manager', 'org.jboss.logmanager.LogManager'
 }
 
+// Requires -Dquarkus.native.enabled=true -Dquarkus.package.jar.enabled=false on the Gradle
+// invocation so that quarkusBuild produces a native binary (Quarkus refuses to emit both a
+// native image and a JAR). Setting quarkus.native.enabled only as a test system property
+// configures the test JVM but leaves quarkusBuild producing a JVM app, which is why this
+// task used to pass in seconds without building anything native.
 tasks.register('nativeIntegrationTest', Test) {
     description = 'Runs @QuarkusIntegrationTest tests against the native binary'
     group = 'verification'
@@ -42,4 +48,17 @@ tasks.register('nativeIntegrationTest', Test) {
     include '**/*IT.class'
     systemProperty 'java.util.logging.manager', 'org.jboss.logmanager.LogManager'
     systemProperty 'quarkus.native.enabled', 'true'
+
+    doFirst {
+        def buildDir = layout.buildDirectory.get().asFile
+        def runner = buildDir.listFiles()?.find { it.name.endsWith('-runner') && it.canExecute() }
+        if (runner == null) {
+            throw new GradleException(
+                    "No native runner found in ${buildDir}. Run this task with " +
+                    "-Dquarkus.native.enabled=true -Dquarkus.package.jar.enabled=false, " +
+                    "otherwise quarkusBuild produces a JVM " +
+                    "application and this task reports success without exercising native image.")
+        }
+        logger.lifecycle("Testing against native binary: ${runner.name}")
+    }
 }

@@ -28,6 +28,14 @@ public interface TusBuildTimeConfig {
     boolean rateLimitEnabled();
 
     /**
+     * Whether the {@code X-HTTP-Method-Override} filter is registered. Required by the TUS
+     * core protocol, so enabled by default; disable it if a proxy in front of the application
+     * enforces rules based on the HTTP method.
+     */
+    @WithDefault("true")
+    boolean methodOverrideEnabled();
+
+    /**
      * URL path for TUS endpoints.
      */
     @WithDefault("/tus")

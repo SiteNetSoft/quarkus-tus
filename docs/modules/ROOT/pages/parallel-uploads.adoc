@@ -27,6 +27,8 @@ Client                                          Server
 2. **Upload data in parallel** -- each part can be uploaded concurrently via PATCH
 3. **Merge** -- a single POST with `Upload-Concat: final; /tus/{id1} /tus/{id2} /tus/{id3}` merges all parts
 
+Each partial may be referenced only once, and a single merge may reference at most `quarkus.tus.max-concat-parts` (default 1000) of them. Both violations are rejected with 400.
+
 == Step-by-Step with curl
 
 === 1. Create Partial Uploads

@@ -493,7 +493,7 @@ abstract class TusUploadTestBase {
     }
 
     @Test
-    void testUnsupportedChecksumAlgorithmReturns460() {
+    void testUnsupportedChecksumAlgorithmReturns400() {
         byte[] data = "checksum algo test".getBytes();
         String location = createUpload(data.length);
 
@@ -505,7 +505,7 @@ abstract class TusUploadTestBase {
                 .body(data)
                 .when().patch(location)
                 .then()
-                .statusCode(460);
+                .statusCode(400);
     }
 
     @Test
@@ -543,17 +543,17 @@ abstract class TusUploadTestBase {
     }
 
     @Test
-    void testOptionsIncludesChecksumTrailerExtension() {
+    void testOptionsAdvertisesOnlyImplementedExtensions() {
         String extensions = given()
                 .when().options("/tus")
                 .then()
                 .statusCode(204)
                 .extract().header("Tus-Extension");
 
-        assertTrue(extensions.contains("checksum-trailer"),
-                "Extensions should include checksum-trailer");
         assertTrue(extensions.contains("concatenation-unfinished"),
                 "Extensions should include concatenation-unfinished");
+        assertTrue(extensions.contains("checksum-trailer"),
+                "Extensions should include checksum-trailer");
     }
 
     @Test

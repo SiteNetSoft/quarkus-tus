@@ -133,8 +133,22 @@ public class InMemoryUploadStore implements UploadStore {
         return info != null && info.isDeferredLength() && info.getEntityLength() < 0;
     }
 
+    /** Stores the client's raw Upload-Concat header so HEAD can echo it back verbatim. */
+    private String concatValueFor(String[] ids, String uploadConcatHeader) {
+        if (uploadConcatHeader != null && !uploadConcatHeader.isBlank()) {
+            return uploadConcatHeader;
+        }
+        StringBuilder concatValue = new StringBuilder("final;");
+        for (int i = 0; i < ids.length; i++) {
+            if (i > 0) concatValue.append(" ");
+            concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
+        }
+        return concatValue.toString();
+    }
+
     @Override
-    public Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata, String requiredOwnerId) {
+    public Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata,
+                                                             String requiredOwnerId, String uploadConcatHeader) {
         if (ids == null || ids.length == 0) {
             return Optional.empty();
         }
@@ -182,12 +196,7 @@ public class InMemoryUploadStore implements UploadStore {
         finalInfo.setPartial(false);
         uploadMetadata.ifPresent(finalInfo::setMetadata);
 
-        StringBuilder concatValue = new StringBuilder("final;");
-        for (int i = 0; i < ids.length; i++) {
-            if (i > 0) concatValue.append(" ");
-            concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
-        }
-        finalInfo.setUploadConcatMergedValue(concatValue.toString());
+        finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
 
         uploads.put(finalId, finalInfo);
 
@@ -199,7 +208,8 @@ public class InMemoryUploadStore implements UploadStore {
     }
 
     @Override
-    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata) {
+    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata,
+                                                          String requiredOwnerId, String uploadConcatHeader) {
         if (ids == null || ids.length == 0) {
             return Optional.empty();
         }
@@ -213,6 +223,12 @@ public class InMemoryUploadStore implements UploadStore {
             }
             if (partialInfo.getEntityLength() < 0) {
                 return Optional.empty();
+            }
+            if (requiredOwnerId != null) {
+                String ownerId = partialInfo.getUploaderId();
+                if (ownerId != null && !ownerId.equals(requiredOwnerId)) {
+                    return Optional.empty();
+                }
             }
             totalLength += partialInfo.getEntityLength();
             partialIdList.add(partialId);
@@ -235,12 +251,7 @@ public class InMemoryUploadStore implements UploadStore {
         Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
         finalInfo.setExpiresAt(expiresAt);
 
-        StringBuilder concatValue = new StringBuilder("final;");
-        for (int i = 0; i < ids.length; i++) {
-            if (i > 0) concatValue.append(" ");
-            concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
-        }
-        finalInfo.setUploadConcatMergedValue(concatValue.toString());
+        finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
 
         uploads.put(finalId, finalInfo);
         dataStore.put(finalId, new byte[0]);
@@ -363,7 +374,8 @@ public class InMemoryUploadStore implements UploadStore {
         }
         info.setOffset(newOffset);
 
-        if (newOffset == info.getEntityLength()) {
+        // Latched so that re-patching a complete upload cannot replay the event.
+        if (newOffset == info.getEntityLength() && info.markCompletionFired()) {
             uploadProgressService.finishUpload(id);
             uploadCompletedEvent.fire(new TusUploadCompletedEvent(
                     id, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));

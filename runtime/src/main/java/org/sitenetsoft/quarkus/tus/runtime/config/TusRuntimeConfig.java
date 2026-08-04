@@ -23,6 +23,10 @@ public interface TusRuntimeConfig {
 
     /**
      * Active TUS protocol extensions (comma-separated).
+     * <p>
+     * {@code checksum-trailer} requires a vertx-core that can read HTTP request trailers
+     * (eclipse-vertx/vert.x#5253). Remove it from this list when running against a stock
+     * Vert.x, otherwise clients will rely on verification that never happens.
      */
     @WithDefault("creation,termination,checksum,checksum-trailer,expiration,concatenation,concatenation-unfinished,creation-with-upload,creation-defer-length")
     String extensions();
@@ -68,6 +72,14 @@ public interface TusRuntimeConfig {
      */
     @WithDefault("6")
     long staleUploadHours();
+
+    /**
+     * Maximum number of partial uploads a single {@code Upload-Concat: final} request may
+     * reference. Bounds how much copying one request can schedule; without it the only ceiling
+     * is the HTTP header size limit, which is not a deliberate bound.
+     */
+    @WithDefault("1000")
+    int maxConcatParts();
 
     interface StoreConfig {
         /**

@@ -79,21 +79,262 @@ class TusEdgeCaseTest {
                 .statusCode(400);
     }
 
-    // ---- Concurrent PATCH on same upload ----
+    // ---- Offset validation must happen under the lock (TOCTOU) ----
+
+    /**
+     * The offset used to be validated before the lock was taken, so two requests could both
+     * pass validation and then write in turn, the second one overwriting the first. Holding
+     * the lock must therefore be what a conflicting request notices first — a wrong offset
+     * cannot be judged until the state can be read consistently.
+     */
+    @Test
+    void testPatchWithWrongOffsetWhileLockedReturns423() {
+        String location = createUpload(100);
+        String uploadId = extractId(location);
+
+        assertTrue(uploadStore.acquireLock(uploadId), "Test needs to hold the lock");
+        try {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "50") // deliberately wrong; real offset is 0
+                    .contentType("application/offset+octet-stream")
+                    .body("xxxx".getBytes())
+                    .when().patch(location)
+                    .then()
+                    .statusCode(423);
+        } finally {
+            uploadStore.releaseLock(uploadId);
+        }
+    }
+
+    /**
+     * The store must not trust the caller-supplied offset either: a third-party caller (or a
+     * request that raced past the resource) writing at a stale offset would silently corrupt
+     * already-written bytes.
+     */
+    @Test
+    void testStoreRejectsWriteAtStaleOffset() throws Exception {
+        byte[] first = "AAAA".getBytes();
+        String location = createUpload(8);
+        String uploadId = extractId(location);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(first)
+                .when().patch(location)
+                .then()
+                .statusCode(204);
+
+        // Offset is now 4. Writing at 0 again must be refused, not silently applied.
+        assertThrows(Exception.class, () ->
+                        uploadStore.writeChunkAsync(uploadId, 0, "BB".getBytes(), java.util.Optional.empty())
+                                .await().atMost(java.time.Duration.ofSeconds(5)),
+                "Writing at a stale offset must fail");
+
+        assertEquals(4, uploadStore.findUploadInfo(uploadId).orElseThrow().getOffset(),
+                "Offset must be unchanged after the rejected write");
+
+        Path dataFile = Path.of(tusRuntimeConfig.store().local().uploadDir(), uploadId);
+        byte[] onDisk = Files.readAllBytes(dataFile);
+        assertArrayEquals(first, onDisk, "Already-written bytes must be intact");
+    }
+
+    /**
+     * Offset validation now happens while holding the lock, so every rejection path between
+     * acquiring it and handing off to the write must release it. A leak would make the upload
+     * unwritable (423) until the 30s lock timeout expired.
+     */
+    @Test
+    void testLockIsReleasedAfterOffsetMismatch() {
+        byte[] data = "hello".getBytes();
+        String location = createUpload(data.length);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "3") // wrong; upload is at 0
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(409);
+
+        // Must be writable immediately, not blocked behind a leaked lock.
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(204);
+    }
+
+    // ---- Completion fires once per upload ----
+
+    /**
+     * A PATCH at the final offset with an empty body passes every check — the offset matches,
+     * nothing exceeds the declared length, and a zero-byte write succeeds — so it used to
+     * re-fire TusUploadCompletedEvent every time. Consumers typically move files, insert
+     * rows, call webhooks or bill for the upload, so this let any client replay those effects
+     * indefinitely.
+     */
+    @Test
+    void testCompletionEventFiresOnlyOnceWhenRePatchedAtFinalOffset() {
+        byte[] data = "all done".getBytes();
+        String location = createUpload(data.length);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(204);
+
+        assertEquals(1, observer.completedEvents.size(),
+                "Completing the upload should fire exactly one completion event");
+
+        for (int i = 0; i < 3; i++) {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", String.valueOf(data.length))
+                    .contentType("application/offset+octet-stream")
+                    .body(new byte[0])
+                    .when().patch(location);
+        }
+
+        assertEquals(1, observer.completedEvents.size(),
+                "Re-patching a complete upload must not fire further completion events");
+    }
+
+    /**
+     * The same guard must not stop a zero-length upload from completing: its only chance to
+     * fire is an empty PATCH, since offset already equals the declared length.
+     */
+    @Test
+    void testZeroLengthUploadStillFiresCompletionOnce() {
+        String location = given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Length", "0")
+                .when().post("/tus")
+                .then()
+                .statusCode(201)
+                .extract().header("Location");
+
+        for (int i = 0; i < 3; i++) {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(new byte[0])
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204);
+        }
+
+        assertEquals(1, observer.completedEvents.size(),
+                "A zero-length upload should complete exactly once");
+    }
+
+    // ---- Discard must not run while a write holds the lock ----
+
+    /**
+     * discardUpload used to delete the data file and forcibly drop another thread's lock. A
+     * DELETE landing mid-write therefore unlinked the file underneath the in-flight write,
+     * which went on to report success for bytes that were never durably stored.
+     */
+    @Test
+    void testDeleteWhileLockedReturns423() {
+        String location = createUpload(100);
+        String uploadId = extractId(location);
+
+        assertTrue(uploadStore.acquireLock(uploadId), "Test needs to hold the lock");
+        try {
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().delete(location)
+                    .then()
+                    .statusCode(423);
+        } finally {
+            uploadStore.releaseLock(uploadId);
+        }
+
+        // The upload must have survived the attempt, and be deletable once unlocked.
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .when().head(location)
+                .then()
+                .statusCode(200);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .when().delete(location)
+                .then()
+                .statusCode(204);
+    }
 
     @Test
-    void testConcurrentPatchOnSameUpload() throws Exception {
-        byte[] data = "concurrent test data!!".getBytes();
+    void testDiscardUploadRefusesWhileLockedAndKeepsData() throws Exception {
+        byte[] data = "keep me".getBytes();
         String location = createUpload(data.length);
         String uploadId = extractId(location);
 
-        ExecutorService executor = Executors.newFixedThreadPool(5);
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", "0")
+                .contentType("application/offset+octet-stream")
+                .body(data)
+                .when().patch(location)
+                .then()
+                .statusCode(204);
+
+        Path dataFile = Path.of(tusRuntimeConfig.store().local().uploadDir(), uploadId);
+
+        assertTrue(uploadStore.acquireLock(uploadId), "Test needs to hold the lock");
+        try {
+            assertFalse(uploadStore.discardUpload(uploadId),
+                    "discardUpload must refuse while the upload is locked");
+            assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(),
+                    "Upload entry must survive a refused discard");
+            assertTrue(Files.exists(dataFile), "Data file must survive a refused discard");
+            assertArrayEquals(data, Files.readAllBytes(dataFile), "Data must be intact");
+        } finally {
+            uploadStore.releaseLock(uploadId);
+        }
+
+        assertTrue(uploadStore.discardUpload(uploadId), "Discard must succeed once unlocked");
+        assertFalse(Files.exists(dataFile), "Data file must be gone after a successful discard");
+    }
+
+    // ---- Concurrent PATCH on same upload ----
+
+    /**
+     * Competing writers each send a differently sized chunk at offset 0, so an interleaved
+     * write leaves a detectable mix of two chunks rather than one intact chunk.
+     * <p>
+     * Losers may be rejected with either 423 (the lock was still held) or 409 (the lock was
+     * acquired after the winner finished, so the offset had moved). Both are correct; which
+     * one a given request sees is a timing detail, so the test asserts the invariant — one
+     * winner, no corruption — rather than a particular split.
+     */
+    @Test
+    void testConcurrentPatchOnSameUpload() throws Exception {
+        int threads = 5;
+        int maxChunk = threads * 4;
+        String location = createUpload(maxChunk);
+        String uploadId = extractId(location);
+
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
         CountDownLatch latch = new CountDownLatch(1);
         List<Integer> statusCodes = Collections.synchronizedList(new ArrayList<>());
 
-        // Submit 5 concurrent PATCH requests
         List<Future<?>> futures = new ArrayList<>();
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < threads; i++) {
+            byte[] chunk = new byte[(i + 1) * 4];
+            java.util.Arrays.fill(chunk, (byte) ('A' + i));
             futures.add(executor.submit(() -> {
                 try {
                     latch.await();
@@ -101,7 +342,7 @@ class TusEdgeCaseTest {
                             .header("Tus-Resumable", "1.0.0")
                             .header("Upload-Offset", "0")
                             .contentType("application/offset+octet-stream")
-                            .body(data)
+                            .body(chunk)
                             .when().patch(location)
                             .then()
                             .extract().statusCode();
@@ -112,7 +353,6 @@ class TusEdgeCaseTest {
             }));
         }
 
-        // Release all threads at once
         latch.countDown();
 
         for (Future<?> f : futures) {
@@ -120,12 +360,24 @@ class TusEdgeCaseTest {
         }
         executor.shutdown();
 
-        // Exactly one should succeed (204), rest should be locked (423)
         long successCount = statusCodes.stream().filter(s -> s == 204).count();
-        long lockedCount = statusCodes.stream().filter(s -> s == 423).count();
+        assertEquals(1, successCount, "Exactly one PATCH should succeed, got: " + statusCodes);
+        assertTrue(statusCodes.stream().filter(s -> s != 204).allMatch(s -> s == 423 || s == 409),
+                "Losing PATCHes must be rejected with 423 or 409, got: " + statusCodes);
 
-        assertEquals(1, successCount, "Exactly one PATCH should succeed");
-        assertEquals(4, lockedCount, "Remaining PATCHes should get 423 Locked");
+        // The stored bytes must be exactly one writer's chunk, not a blend of two.
+        long offset = uploadStore.findUploadInfo(uploadId).orElseThrow().getOffset();
+        byte[] onDisk = Files.readAllBytes(Path.of(tusRuntimeConfig.store().local().uploadDir(), uploadId));
+        assertEquals(offset, onDisk.length, "File length must match the recorded offset");
+        assertTrue(offset > 0 && offset % 4 == 0, "Offset must match one writer's chunk size: " + offset);
+
+        byte first = onDisk[0];
+        for (byte b : onDisk) {
+            assertEquals(first, b,
+                    "Stored data is a mix of two writers' chunks: " + new String(onDisk));
+        }
+        assertEquals((first - 'A' + 1) * 4, onDisk.length,
+                "Stored chunk length must match the writer that produced its bytes");
     }
 
     // ---- Lock timeout reclamation ----

@@ -11,6 +11,12 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * Rate limiting as deployed behind a proxy: {@code proxy-address-forwarding} tells Quarkus to
+ * resolve X-Forwarded-For into the request's remote address, having first checked the proxy is
+ * trusted, so each forwarded client is throttled separately. Without that setting the header is
+ * ignored entirely — see {@link TusRateLimitSpoofingTest}.
+ */
 @QuarkusTest
 @TestProfile(TusRateLimitTest.RateLimitProfile.class)
 class TusRateLimitTest {
@@ -21,7 +27,8 @@ class TusRateLimitTest {
             return Map.of(
                     "quarkus.tus.rate-limit-enabled", "true",
                     "quarkus.tus.rate-limit-requests-per-minute", "6",
-                    "quarkus.tus.rate-limit-burst-size", "3"
+                    "quarkus.tus.rate-limit-burst-size", "3",
+                    "quarkus.http.proxy.proxy-address-forwarding", "true"
             );
         }
     }

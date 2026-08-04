@@ -23,6 +23,7 @@ public class UploadInfo {
     private List<String> partialIds;
     private String uploaderId;
     private Instant lastActivity;
+    private volatile boolean completionFired;
 
     public long getEntityLength() { return entityLength; }
     public void setEntityLength(long entityLength) { this.entityLength = entityLength; }
@@ -59,6 +60,25 @@ public class UploadInfo {
     public Instant getLastActivity() { return lastActivity; }
     public void setLastActivity(Instant lastActivity) { this.lastActivity = lastActivity; }
 
+    public boolean isCompletionFired() { return completionFired; }
+    public void setCompletionFired(boolean completionFired) { this.completionFired = completionFired; }
+
+    /**
+     * Claims the right to fire this upload's completion event, returning true only for the
+     * caller that makes the transition.
+     * <p>
+     * Reaching the final offset is not on its own a safe trigger: a PATCH at the final offset
+     * with an empty body satisfies every check and would otherwise fire the event again on
+     * every request, replaying whatever consumers do with a completed upload.
+     */
+    public synchronized boolean markCompletionFired() {
+        if (completionFired) {
+            return false;
+        }
+        completionFired = true;
+        return true;
+    }
+
     /**
      * Checks if all partial uploads for this final concat are complete.
      */
@@ -81,7 +101,8 @@ public class UploadInfo {
                 .add("offset", offset)
                 .add("isPartial", isPartial)
                 .add("deferredLength", deferredLength)
-                .add("isFinalConcat", isFinalConcat);
+                .add("isFinalConcat", isFinalConcat)
+                .add("completionFired", completionFired);
 
         if (metadata != null) {
             builder.add("metadata", metadata);
@@ -116,6 +137,9 @@ public class UploadInfo {
             info.setPartial(obj.getBoolean("isPartial", false));
             info.setDeferredLength(obj.getBoolean("deferredLength", false));
             info.setFinalConcat(obj.getBoolean("isFinalConcat", false));
+            // Absent in metadata written before this field existed; those uploads may fire
+            // one more completion event, which is preferable to suppressing a genuine one.
+            info.setCompletionFired(obj.getBoolean("completionFired", false));
 
             if (obj.containsKey("metadata") && !obj.isNull("metadata")) {
                 info.setMetadata(obj.getString("metadata"));

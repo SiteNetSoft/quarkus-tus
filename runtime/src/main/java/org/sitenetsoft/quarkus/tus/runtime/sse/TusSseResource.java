@@ -8,11 +8,14 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.SecurityContext;
 import jakarta.ws.rs.sse.Sse;
 import jakarta.ws.rs.sse.SseEventSink;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
+import org.sitenetsoft.quarkus.tus.runtime.TusUploadAuthorizer;
 import org.sitenetsoft.quarkus.tus.runtime.TusUtils;
+import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 @Path("/tus/events")
 public class TusSseResource {
@@ -26,6 +29,12 @@ public class TusSseResource {
     TusSseService sseService;
 
     @Inject
+    UploadStore uploadStore;
+
+    @Inject
+    TusUploadAuthorizer authorizer;
+
+    @Inject
     Sse sse;
 
     @GET
@@ -33,6 +42,7 @@ public class TusSseResource {
     @Produces(MediaType.SERVER_SENT_EVENTS)
     public void streamUploadEvents(
             @PathParam("uploadId") String uploadId,
+            @Context SecurityContext securityContext,
             @Context SseEventSink eventSink
     ) {
         if (!sseEnabled) {
@@ -49,6 +59,14 @@ public class TusSseResource {
                 LOG.debugf("Error sending error event: %s", e.getMessage());
             }
             return;
+        }
+
+        // Registering a sink displaces any existing subscriber, so an unknown or unowned ID
+        // must not get this far. 404 rather than 403 keeps a denial indistinguishable from a
+        // missing upload.
+        if (uploadStore.findUploadInfo(uploadId).isEmpty()
+                || authorizer.isDenied(uploadId, securityContext)) {
+            throw new NotFoundException();
         }
 
         LOG.infof("SSE connection opened for upload: %s", uploadId);

@@ -95,11 +95,19 @@ public class S3UploadStore implements UploadStore {
 
 === Key Implementation Notes
 
-writeChunkAsync:: Returns a `Uni<Long>` with the new offset after writing. Return `-1` if the upload was not found. Throw `LocalFileUploadStore.ChecksumMismatchException` if checksum validation fails (the extension handles the 460 response). *Important:* Your implementation must fire `TusUploadCompletedEvent` when the upload is complete (i.e., `newOffset == entityLength`). Inject `Event<TusUploadCompletedEvent>` and fire it after updating the offset. See `LocalFileUploadStore` for the reference implementation.
+writeChunkAsync:: Returns a `Uni<Long>` with the new offset after writing. Return `-1` if the upload was not found. Gate the completion event on `UploadInfo.markCompletionFired()`, which returns `true` only for the caller that makes the transition — reaching the final offset is not on its own a safe trigger, since a PATCH at the final offset with an empty body satisfies every check and would otherwise replay the event on every request. *Do not trust the supplied offset:* compare it to the upload's current offset and fail with `spi.OffsetMismatchException` if they differ (the extension maps that to 409). Writing at a stale offset would overwrite bytes that were already stored and acknowledged. Throw `LocalFileUploadStore.ChecksumMismatchException` if checksum validation fails (the extension handles the 460 response). *Important:* Your implementation must fire `TusUploadCompletedEvent` when the upload is complete (i.e., `newOffset == entityLength`). Inject `Event<TusUploadCompletedEvent>` and fire it after updating the offset. See `LocalFileUploadStore` for the reference implementation.
 
 createUpload / createUploadDeferred:: Must return the full location path (e.g., `/tus/{uploadId}`). The upload ID is extracted from the last path segment.
 
-acquireLock / releaseLock:: Must provide mutual exclusion for concurrent PATCH requests to the same upload. The default implementation uses `ConcurrentHashMap`-based locks.
+mergePartialUploadsWithOwnership / mergePartialUploadsUnfinished:: Both take a `requiredOwnerId`. When it is non-null, every referenced partial that has an uploader must match it, and the method must return `Optional.empty()` otherwise. Skipping this check in either method allows one user to concatenate — and thereby consume and delete — another user's partial uploads.
++
+Both also take `uploadConcatHeader`, the raw `Upload-Concat` request header. Store it verbatim on the final upload: the protocol requires `HEAD` on a final upload to return the value as the client sent it, so rebuilding it from the parsed IDs would return a different string to clients that sent absolute URLs or different spacing.
+
+acquireLock / releaseLock:: Must provide mutual exclusion for concurrent PATCH requests to the same upload. The default implementation uses `ConcurrentHashMap`-based locks. Acquisition is not reentrant.
+
+discardUpload:: Must respect the lock: return `false` without deleting anything if the upload is currently being written, rather than removing the data file underneath an in-flight write. The extension answers `423` when a `DELETE` is refused for this reason, and cleanup jobs retry on their next run.
+
+cleanupExpiredUploads:: Return only the uploads actually removed. Reporting one that was skipped because it was in use makes the scheduler log claim work it did not do.
 
 cleanupExpiredUploads:: Called hourly by the built-in `UploadExpirationScheduler`. Return the list of expired upload IDs that were cleaned up.
 
