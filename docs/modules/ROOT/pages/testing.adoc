@@ -234,3 +234,29 @@ JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 ./gradlew :integration-tests:native
 ----
 
 This builds a native binary and runs all `*IT` test classes against it.
+
+== Manual test console
+
+`integration-tests` serves a browser console for exercising the protocol by hand. It is part of the
+test module only — it is never packaged into `quarkus-tus` or `quarkus-tus-deployment`.
+
+[source,bash]
+----
+./gradlew :integration-tests:quarkusDev
+# then open http://localhost:8080/
+----
+
+Each extension has its own section: core upload with pause and resume, creation-with-upload,
+creation-defer-length, checksum (valid and deliberately corrupt), concatenation via parallel partial
+uploads, expiration, termination, and live SSE progress.
+
+The point of it is the protocol log on the right. Every request the page makes is logged with its
+method, URL, status and the TUS headers that matter, so you can watch an upload resume from its real
+offset, see a corrupt checksum rejected with 460 while the offset stays put, and see partials merge
+into a final upload. That is the part automated tests assert but never show you.
+
+The page speaks TUS directly with `fetch` rather than using a client library, so nothing about the
+wire format is hidden behind an abstraction.
+
+NOTE: `application.properties` sets a 1 KB `max-chunk-size` so the tests exercise the limit. Dev mode
+overrides it via `%dev.` keys, otherwise the console would hit 413 on any real file.

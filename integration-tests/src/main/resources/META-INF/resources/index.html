@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TUS console</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2b3038; --fg: #e6e8ec;
+    --muted: #99a1ad; --accent: #7aa2f7; --ok: #79c67d; --warn: #e0af68; --err: #f07178;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f5f6f8; --panel:#fff; --line:#dfe3e8; --fg:#1c2029; --muted:#5c6573;
+            --accent:#2f6feb; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-sans-serif,system-ui,sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .sub { color:var(--muted); font-size:13px; }
+  main { display:grid; grid-template-columns:minmax(340px,1fr) minmax(420px,1.2fr); gap:0; align-items:start; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+  #controls { padding:16px 20px; display:flex; flex-direction:column; gap:14px; }
+  #logPane { border-left:1px solid var(--line); height:calc(100vh - 56px); position:sticky; top:0; display:flex; flex-direction:column; }
+  @media (max-width:900px) { #logPane { border-left:none; border-top:1px solid var(--line); height:70vh; position:static; } }
+  .logHead { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; }
+  #log { overflow:auto; padding:8px 12px; flex:1; font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  section { border:1px solid var(--line); border-radius:8px; background:var(--panel); padding:12px 14px; }
+  section h2 { margin:0 0 4px; font-size:13px; letter-spacing:.02em; text-transform:uppercase; color:var(--muted); }
+  section p.hint { margin:0 0 10px; color:var(--muted); font-size:12.5px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:7px 12px; font-size:13px; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input[type=text], input[type=number], select { background:var(--bg); color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:6px 8px; font-size:13px; }
+  input[type=file] { font-size:12.5px; color:var(--muted); max-width:100%; }
+  progress { width:100%; height:8px; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .entry { border-bottom:1px solid var(--line); padding:6px 0; }
+  .entry .top { display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+  .m { font-weight:700; color:var(--accent); }
+  .u { color:var(--muted); word-break:break-all; }
+  .s-2 { color:var(--ok); font-weight:700; }
+  .s-4, .s-5 { color:var(--err); font-weight:700; }
+  .s-4.expected { color:var(--warn); }
+  .hdrs { margin:4px 0 0 12px; color:var(--muted); white-space:pre-wrap; }
+  .note { color:var(--warn); }
+  .status { font-size:12.5px; color:var(--muted); min-height:18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TUS console</h1>
+  <span class="sub">Manual harness for the quarkus-tus extension — not part of the published library.</span>
+</header>
+
+<main>
+  <div id="controls">
+    <section>
+      <h2>Server</h2>
+      <p class="hint">Capabilities the server advertises via <code>OPTIONS /tus</code>.</p>
+      <div class="row"><button onclick="discover()">Discover</button></div>
+      <div class="status" id="caps"></div>
+    </section>
+
+    <section>
+      <h2>Core upload — creation, chunking, resume</h2>
+      <p class="hint">Pause mid-upload, then resume: the client re-reads the offset with HEAD and continues.</p>
+      <div class="row">
+        <input type="file" id="file">
+        <label>chunk <input type="number" id="chunkSize" value="65536" min="1" style="width:100px"> bytes</label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="btnStart" onclick="startUpload()">Upload</button>
+        <button id="btnPause" class="secondary" onclick="paused=true" disabled>Pause</button>
+        <button id="btnResume" class="secondary" onclick="resumeUpload()" disabled>Resume</button>
+        <button class="secondary" onclick="headCurrent()">HEAD</button>
+        <button class="secondary" onclick="terminate()">DELETE</button>
+      </div>
+      <progress id="prog" value="0" max="1" style="margin-top:10px"></progress>
+      <div class="status" id="coreStatus"></div>
+    </section>
+
+    <section>
+      <h2>creation-with-upload</h2>
+      <p class="hint">Sends the first bytes in the creation POST itself, saving a round trip.</p>
+      <div class="row"><button onclick="creationWithUpload()">Create with body</button></div>
+      <div class="status" id="cwuStatus"></div>
+    </section>
+
+    <section>
+      <h2>creation-defer-length</h2>
+      <p class="hint">Creates without a known size, then sets <code>Upload-Length</code> on the first PATCH.</p>
+      <div class="row"><button onclick="deferLength()">Deferred upload</button></div>
+      <div class="status" id="deferStatus"></div>
+    </section>
+
+    <section>
+      <h2>checksum</h2>
+      <p class="hint">SHA-1 computed in the browser. The bad case should be rejected with 460 and leave the offset untouched.</p>
+      <div class="row">
+        <button onclick="checksumUpload(true)">Valid checksum</button>
+        <button class="secondary" onclick="checksumUpload(false)">Corrupt checksum</button>
+      </div>
+      <div class="status" id="ckStatus"></div>
+    </section>
+
+    <section>
+      <h2>concatenation — parallel upload</h2>
+      <p class="hint">Splits the chosen file into partials, uploads them concurrently, then merges with <code>Upload-Concat: final</code>.</p>
+      <div class="row">
+        <label>parts <input type="number" id="parts" value="3" min="2" max="8" style="width:70px"></label>
+        <button onclick="parallelUpload()">Upload in parallel</button>
+      </div>
+      <div class="status" id="concatStatus"></div>
+    </section>
+
+    <section>
+      <h2>expiration &amp; termination</h2>
+      <p class="hint"><code>Upload-Expires</code> is returned on creation; DELETE terminates. A second DELETE is idempotent.</p>
+      <div class="row">
+        <button onclick="showExpiry()">Show expiry</button>
+        <button class="secondary" onclick="terminate()">Terminate current</button>
+      </div>
+      <div class="status" id="expStatus"></div>
+    </section>
+
+    <section>
+      <h2>SSE progress</h2>
+      <p class="hint">Live <code>upload-progress</code> events for the current upload. Start this, then run an upload.</p>
+      <div class="row">
+        <button onclick="sseConnect()">Connect</button>
+        <button class="secondary" onclick="sseClose()">Disconnect</button>
+      </div>
+      <div class="status" id="sseStatus"></div>
+    </section>
+  </div>
+
+  <div id="logPane">
+    <div class="logHead">
+      <strong style="font-size:13px">Protocol log</strong>
+      <button class="secondary" onclick="document.getElementById('log').innerHTML=''">Clear</button>
+    </div>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>
+const TUS = '/tus';
+const VERSION = '1.0.0';
+// Headers worth seeing; anything else is noise for protocol watching.
+const SHOWN = ['tus-resumable','tus-version','tus-extension','tus-max-size','tus-checksum-algorithm',
+               'location','upload-offset','upload-length','upload-metadata','upload-expires',
+               'upload-concat','upload-defer-length','retry-after','cache-control'];
+
+let currentUrl = null;   // location of the upload being worked on
+let paused = false;
+let sse = null;
+
+const $ = id => document.getElementById(id);
+const setStatus = (id, msg) => $(id).textContent = msg;
+
+function logEntry(method, url, res, note) {
+  const div = document.createElement('div');
+  div.className = 'entry';
+  const cls = res ? 's-' + String(res.status)[0] + (note === 'expected' ? ' expected' : '') : '';
+  const shown = [];
+  if (res) {
+    res.headers.forEach((v, k) => { if (SHOWN.includes(k.toLowerCase())) shown.push(k + ': ' + v); });
+  }
+  div.innerHTML =
+    '<div class="top"><span class="m">' + method + '</span><span class="u">' + url + '</span>' +
+    (res ? '<span class="' + cls + '">' + res.status + '</span>' : '') +
+    (note && note !== 'expected' ? '<span class="note">' + note + '</span>' : '') + '</div>' +
+    (shown.length ? '<div class="hdrs">' + shown.join('\n') + '</div>' : '');
+  $('log').appendChild(div);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+// Every request goes through here so nothing reaches the server unlogged.
+async function tus(method, url, headers = {}, body = null, note) {
+  const h = Object.assign({'Tus-Resumable': VERSION}, headers);
+  const res = await fetch(url, {method, headers: h, body});
+  logEntry(method, url, res, note);
+  return res;
+}
+
+async function discover() {
+  const res = await tus('OPTIONS', TUS);
+  setStatus('caps', 'Extensions: ' + (res.headers.get('Tus-Extension') || '(none)'));
+}
+
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const sha1 = async bytes => b64(await crypto.subtle.digest('SHA-1', bytes));
+const meta = name => 'filename ' + btoa(unescape(encodeURIComponent(name)));
+
+function pickedFile() {
+  const f = $('file').files[0];
+  if (!f) { alert('Choose a file first.'); return null; }
+  return f;
+}
+
+async function createUpload(length, extraHeaders = {}) {
+  const res = await tus('POST', TUS, Object.assign({'Upload-Length': String(length)}, extraHeaders));
+  if (res.status !== 201) { setStatus('coreStatus', 'Creation failed: ' + res.status); return null; }
+  return res.headers.get('Location');
+}
+
+// ---- core upload, with pause/resume ----
+async function startUpload() {
+  const f = pickedFile(); if (!f) return;
+  currentUrl = await createUpload(f.size, {'Upload-Metadata': meta(f.name)});
+  if (!currentUrl) return;
+  paused = false;
+  $('btnPause').disabled = false; $('btnResume').disabled = true;
+  await sendFrom(0, f);
+}
+
+async function resumeUpload() {
+  const f = pickedFile(); if (!f || !currentUrl) return;
+  const res = await tus('HEAD', currentUrl);
+  const offset = Number(res.headers.get('Upload-Offset') || 0);
+  paused = false;
+  $('btnPause').disabled = false; $('btnResume').disabled = true;
+  await sendFrom(offset, f);
+}
+
+async function sendFrom(offset, f) {
+  const size = Math.max(1, Number($('chunkSize').value) || 65536);
+  while (offset < f.size) {
+    if (paused) {
+      setStatus('coreStatus', 'Paused at ' + offset + ' / ' + f.size + ' — press Resume');
+      $('btnPause').disabled = true; $('btnResume').disabled = false;
+      return;
+    }
+    const chunk = f.slice(offset, Math.min(offset + size, f.size));
+    const res = await tus('PATCH', currentUrl,
+      {'Upload-Offset': String(offset), 'Content-Type': 'application/offset+octet-stream'},
+      await chunk.arrayBuffer());
+    if (res.status !== 204) { setStatus('coreStatus', 'Stopped on ' + res.status); return; }
+    offset = Number(res.headers.get('Upload-Offset'));
+    $('prog').value = offset / f.size;
+    setStatus('coreStatus', offset + ' / ' + f.size + ' bytes');
+  }
+  $('btnPause').disabled = true; $('btnResume').disabled = true;
+  setStatus('coreStatus', 'Complete — ' + f.size + ' bytes');
+}
+
+async function headCurrent() {
+  if (!currentUrl) return setStatus('coreStatus', 'Nothing uploaded yet');
+  const res = await tus('HEAD', currentUrl);
+  setStatus('coreStatus', res.status === 200
+    ? 'Offset ' + res.headers.get('Upload-Offset') + ' of ' + res.headers.get('Upload-Length')
+    : 'HEAD returned ' + res.status);
+}
+
+async function terminate() {
+  if (!currentUrl) return setStatus('coreStatus', 'Nothing to terminate');
+  await tus('DELETE', currentUrl);
+  const after = await tus('HEAD', currentUrl, {}, null, 'expected');
+  setStatus('coreStatus', 'Terminated; HEAD now returns ' + after.status);
+  currentUrl = null;
+}
+
+// ---- creation-with-upload ----
+async function creationWithUpload() {
+  const body = new TextEncoder().encode('created together with the upload');
+  const res = await tus('POST', TUS,
+    {'Upload-Length': String(body.length), 'Content-Type': 'application/offset+octet-stream',
+     'Upload-Metadata': meta('inline.txt')}, body);
+  currentUrl = res.headers.get('Location');
+  setStatus('cwuStatus', res.status === 201
+    ? 'Created at offset ' + res.headers.get('Upload-Offset') + ' in one request'
+    : 'Failed: ' + res.status);
+}
+
+// ---- creation-defer-length ----
+async function deferLength() {
+  const body = new TextEncoder().encode('length was not known up front');
+  const res = await tus('POST', TUS, {'Upload-Defer-Length': '1', 'Upload-Metadata': meta('deferred.txt')});
+  if (res.status !== 201) return setStatus('deferStatus', 'Creation failed: ' + res.status);
+  currentUrl = res.headers.get('Location');
+  await tus('HEAD', currentUrl);
+  const patch = await tus('PATCH', currentUrl,
+    {'Upload-Offset': '0', 'Upload-Length': String(body.length),
+     'Content-Type': 'application/offset+octet-stream'}, body);
+  setStatus('deferStatus', patch.status === 204
+    ? 'Length supplied on first PATCH; offset ' + patch.headers.get('Upload-Offset')
+    : 'PATCH returned ' + patch.status);
+}
+
+// ---- checksum ----
+async function checksumUpload(valid) {
+  const body = new TextEncoder().encode('checksummed payload');
+  const url = await createUpload(body.length, {'Upload-Metadata': meta('checksum.txt')});
+  if (!url) return;
+  currentUrl = url;
+  const digest = valid ? await sha1(body) : await sha1(new TextEncoder().encode('different bytes'));
+  const res = await tus('PATCH', url,
+    {'Upload-Offset': '0', 'Upload-Checksum': 'sha1 ' + digest,
+     'Content-Type': 'application/offset+octet-stream'}, body, valid ? undefined : 'expected');
+  const head = await tus('HEAD', url);
+  setStatus('ckStatus', (valid ? 'Valid' : 'Corrupt') + ' checksum → ' + res.status +
+    '; offset is now ' + head.headers.get('Upload-Offset') +
+    (valid ? '' : ' (unchanged — the chunk was discarded)'));
+}
+
+// ---- concatenation ----
+async function parallelUpload() {
+  const f = pickedFile(); if (!f) return;
+  const n = Math.max(2, Number($('parts').value) || 3);
+  const per = Math.ceil(f.size / n);
+  setStatus('concatStatus', 'Creating ' + n + ' partial uploads…');
+
+  const partials = [];
+  for (let i = 0; i < n; i++) {
+    const slice = f.slice(i * per, Math.min((i + 1) * per, f.size));
+    const res = await tus('POST', TUS, {'Upload-Length': String(slice.size), 'Upload-Concat': 'partial'});
+    if (res.status !== 201) return setStatus('concatStatus', 'Partial creation failed: ' + res.status);
+    partials.push({url: res.headers.get('Location'), slice});
+  }
+
+  setStatus('concatStatus', 'Uploading ' + n + ' partials concurrently…');
+  await Promise.all(partials.map(async p => {
+    await tus('PATCH', p.url,
+      {'Upload-Offset': '0', 'Content-Type': 'application/offset+octet-stream'},
+      await p.slice.arrayBuffer());
+  }));
+
+  const res = await tus('POST', TUS,
+    {'Upload-Concat': 'final; ' + partials.map(p => p.url).join(' '), 'Upload-Metadata': meta(f.name)});
+  if (res.status !== 201) return setStatus('concatStatus', 'Merge failed: ' + res.status);
+  currentUrl = res.headers.get('Location');
+  const head = await tus('HEAD', currentUrl);
+  setStatus('concatStatus', 'Merged ' + n + ' parts → ' + head.headers.get('Upload-Length') +
+    ' bytes, offset ' + head.headers.get('Upload-Offset'));
+}
+
+// ---- expiration ----
+async function showExpiry() {
+  const res = await tus('POST', TUS, {'Upload-Length': '64', 'Upload-Metadata': meta('expiring.txt')});
+  currentUrl = res.headers.get('Location');
+  setStatus('expStatus', 'Upload-Expires: ' + (res.headers.get('Upload-Expires') || '(not returned)'));
+}
+
+// ---- SSE ----
+function sseConnect() {
+  if (!currentUrl) return setStatus('sseStatus', 'Create or start an upload first');
+  sseClose();
+  const id = currentUrl.substring(currentUrl.lastIndexOf('/') + 1);
+  sse = new EventSource(TUS + '/progress/' + id);
+  logEntry('GET', TUS + '/progress/' + id, null, 'SSE stream opened');
+  sse.addEventListener('upload-progress', e => setStatus('sseStatus', 'progress: ' + e.data));
+  sse.onerror = () => setStatus('sseStatus', 'stream closed or errored');
+  setStatus('sseStatus', 'listening on ' + id);
+}
+function sseClose() { if (sse) { sse.close(); sse = null; setStatus('sseStatus', 'disconnected'); } }
+
+discover();
+</script>
+</body>
+</html>
