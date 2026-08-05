@@ -1,0 +1,65 @@
+= Releasing
+
+include::./includes/attributes.adoc[]
+
+Two artifacts are published; `integration-tests` is not:
+
+[cols="2,3"]
+|===
+| Coordinates | Contents
+
+| `org.sitenetsoft:quarkus-tus`
+| Extension runtime. Consumers declare this one.
+
+| `org.sitenetsoft:quarkus-tus-deployment`
+| Build-time augmentation. Resolved by Quarkus from the runtime jar's `META-INF/quarkus-extension.properties`.
+|===
+
+IMPORTANT: The artifact ids must stay exactly as above. The extension descriptor generated into the
+runtime jar names `org.sitenetsoft:quarkus-tus-deployment`, and Quarkus resolves the deployment
+module from it at augmentation time. Renaming a module without updating the other breaks every
+consumer at build time, not at runtime.
+
+== Signing
+
+Releases must be signed. The key is read from `signingKey` / `signingPassword` Gradle properties, or
+the `SIGNING_KEY` / `SIGNING_PASSWORD` environment variables — never from a file in the repository.
+Signing is skipped for `-SNAPSHOT` versions so local builds need no key.
+
+[source,bash]
+----
+export SIGNING_KEY="$(gpg --armor --export-secret-keys KEY_ID)"
+export SIGNING_PASSWORD='...'
+----
+
+== Staging a release
+
+[source,bash]
+----
+# set a release version in build.gradle first (no -SNAPSHOT)
+./gradlew :runtime:publish :deployment:publish
+----
+
+This writes a complete Maven layout — jar, sources, javadoc, POM and signatures — to
+`build/staging-deploy`.
+
+== Uploading to Maven Central
+
+OSSRH reached end of life in June 2025 and Sonatype has no first-party Gradle plugin yet, so the
+upload is a separate step. Take the contents of `build/staging-deploy` and either:
+
+* upload it as a bundle through the https://central.sonatype.com[Central Portal] UI, or
+* point https://jreleaser.org[JReleaser] at the directory, which Sonatype currently recommends for
+  Gradle projects.
+
+Both need a Central Portal token; nothing in this build stores credentials.
+
+== Checking before you publish
+
+[source,bash]
+----
+./gradlew :runtime:publishToMavenLocal :deployment:publishToMavenLocal
+----
+
+Then build a sample application against the local repository to confirm the extension resolves and
+augments correctly.
