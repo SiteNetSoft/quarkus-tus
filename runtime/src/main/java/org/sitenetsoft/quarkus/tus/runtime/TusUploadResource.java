@@ -17,9 +17,9 @@ import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.event.*;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadProgress;
+import org.sitenetsoft.quarkus.tus.runtime.spi.ChecksumMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 import org.sitenetsoft.quarkus.tus.runtime.sse.TusSseService;
-import org.sitenetsoft.quarkus.tus.runtime.store.LocalFileUploadStore;
 
 import java.util.HashSet;
 import java.util.Optional;
@@ -713,7 +713,7 @@ public class TusUploadResource {
                             .entity("Upload offset mismatch")
                             .build();
                 })
-                .onFailure(LocalFileUploadStore.ChecksumMismatchException.class).recoverWithItem(e -> {
+                .onFailure(ChecksumMismatchException.class).recoverWithItem(e -> {
                     LOG.warnf("Checksum mismatch for upload %s: %s", uploadID, e.getMessage());
                     return Response.status(460)
                             .header("Tus-Resumable", tusRuntimeConfig.version())

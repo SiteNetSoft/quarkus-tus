@@ -14,6 +14,7 @@ import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.event.TusUploadCompletedEvent;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
+import org.sitenetsoft.quarkus.tus.runtime.spi.ChecksumMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
@@ -656,6 +657,7 @@ public class LocalFileUploadStore implements UploadStore {
         activeLocks.remove(id);
     }
 
+    @Override
     public void cleanupStaleLocks() {
         long now = System.currentTimeMillis();
         activeLocks.entrySet().removeIf(entry -> {
@@ -777,12 +779,6 @@ public class LocalFileUploadStore implements UploadStore {
         }
     }
 
-    public static class ChecksumMismatchException extends RuntimeException {
-        public ChecksumMismatchException(String message) {
-            super(message);
-        }
-    }
-
     @Override
     public long writeInitialData(String id, byte[] data) {
         if (data == null || data.length == 0) {
@@ -882,6 +878,7 @@ public class LocalFileUploadStore implements UploadStore {
     /**
      * Removes incomplete uploads that have had no activity for the given number of hours.
      */
+    @Override
     public List<String> cleanupStaleUploads(long staleHours) {
         if (staleHours <= 0) {
             return List.of();
@@ -924,6 +921,7 @@ public class LocalFileUploadStore implements UploadStore {
      * Scans the upload directory for data files with no matching in-memory entry
      * and no .meta sidecar file. These are orphans from crashes or incomplete cleanup.
      */
+    @Override
     public int cleanupOrphanFiles() {
         int cleaned = 0;
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(uploadBaseDir)) {

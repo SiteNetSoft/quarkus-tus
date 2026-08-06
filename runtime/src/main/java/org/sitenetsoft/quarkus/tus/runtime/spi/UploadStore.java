@@ -69,4 +69,32 @@ public interface UploadStore {
     Optional<Instant> getExpiresAt(String id);
 
     List<String> cleanupExpiredUploads();
+
+    /**
+     * Releases locks whose holder died. Called by the scheduler roughly once a minute.
+     * <p>
+     * This and the two hooks below default to doing nothing so that a store with no such concept
+     * need not implement them — but a store that does hold locks or write files must, or its
+     * maintenance simply never runs.
+     */
+    default void cleanupStaleLocks() {
+    }
+
+    /**
+     * Removes incomplete uploads with no activity for {@code staleHours}.
+     *
+     * @return the uploads actually removed, which is what the scheduler logs
+     */
+    default List<String> cleanupStaleUploads(long staleHours) {
+        return List.of();
+    }
+
+    /**
+     * Removes stored data with no corresponding upload, e.g. left by a crash.
+     *
+     * @return how many were removed
+     */
+    default int cleanupOrphanFiles() {
+        return 0;
+    }
 }

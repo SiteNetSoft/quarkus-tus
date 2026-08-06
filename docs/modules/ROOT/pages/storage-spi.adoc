@@ -95,7 +95,7 @@ public class S3UploadStore implements UploadStore {
 
 === Key Implementation Notes
 
-writeChunkAsync:: Returns a `Uni<Long>` with the new offset after writing. Return `-1` if the upload was not found. Gate the completion event on `UploadInfo.markCompletionFired()`, which returns `true` only for the caller that makes the transition — reaching the final offset is not on its own a safe trigger, since a PATCH at the final offset with an empty body satisfies every check and would otherwise replay the event on every request. *Do not trust the supplied offset:* compare it to the upload's current offset and fail with `spi.OffsetMismatchException` if they differ (the extension maps that to 409). Writing at a stale offset would overwrite bytes that were already stored and acknowledged. Throw `LocalFileUploadStore.ChecksumMismatchException` if checksum validation fails (the extension handles the 460 response). *Important:* Your implementation must fire `TusUploadCompletedEvent` when the upload is complete (i.e., `newOffset == entityLength`). Inject `Event<TusUploadCompletedEvent>` and fire it after updating the offset. See `LocalFileUploadStore` for the reference implementation.
+writeChunkAsync:: Returns a `Uni<Long>` with the new offset after writing. Return `-1` if the upload was not found. Gate the completion event on `UploadInfo.markCompletionFired()`, which returns `true` only for the caller that makes the transition — reaching the final offset is not on its own a safe trigger, since a PATCH at the final offset with an empty body satisfies every check and would otherwise replay the event on every request. *Do not trust the supplied offset:* compare it to the upload's current offset and fail with `spi.OffsetMismatchException` if they differ (the extension maps that to 409). Writing at a stale offset would overwrite bytes that were already stored and acknowledged. Throw `spi.ChecksumMismatchException` if checksum validation fails (the extension handles the 460 response). *Important:* Your implementation must fire `TusUploadCompletedEvent` when the upload is complete (i.e., `newOffset == entityLength`). Inject `Event<TusUploadCompletedEvent>` and fire it after updating the offset. See `LocalFileUploadStore` for the reference implementation.
 
 createUpload / createUploadDeferred:: Must return the full location path (e.g., `/tus/{uploadId}`). The upload ID is extracted from the last path segment.
 
@@ -110,6 +110,8 @@ discardUpload:: Must respect the lock: return `false` without deleting anything 
 cleanupExpiredUploads:: Return only the uploads actually removed. Reporting one that was skipped because it was in use makes the scheduler log claim work it did not do.
 
 cleanupExpiredUploads:: Called hourly by the built-in `UploadExpirationScheduler`. Return the list of expired upload IDs that were cleaned up.
+
+cleanupStaleLocks / cleanupStaleUploads / cleanupOrphanFiles:: Optional maintenance hooks, also driven by the scheduler. They default to doing nothing, so a store with no locks or files on disk can ignore them — but a store that has either must implement them, or that maintenance never runs.
 
 == Default Local File Store
 

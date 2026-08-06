@@ -10,8 +10,8 @@ import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.event.TusUploadCompletedEvent;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
+import org.sitenetsoft.quarkus.tus.runtime.spi.ChecksumMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
-import org.sitenetsoft.quarkus.tus.runtime.store.LocalFileUploadStore;
 
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -357,7 +357,7 @@ public class InMemoryUploadStore implements UploadStore {
             UploadInfo.ChecksumInfo checksumInfo = checksum.get();
             if (!validateChecksum(data, checksumInfo)) {
                 return Uni.createFrom().failure(
-                        new LocalFileUploadStore.ChecksumMismatchException("Checksum validation failed"));
+                        new ChecksumMismatchException("Checksum validation failed"));
             }
         }
 
@@ -393,7 +393,7 @@ public class InMemoryUploadStore implements UploadStore {
                 case "sha1" -> "SHA-1";
                 case "md5" -> "MD5";
                 case "sha256" -> "SHA-256";
-                default -> throw new LocalFileUploadStore.ChecksumMismatchException(
+                default -> throw new ChecksumMismatchException(
                         "Unsupported checksum algorithm: " + algorithm);
             };
 
@@ -404,7 +404,7 @@ public class InMemoryUploadStore implements UploadStore {
             return computedValue.equals(expectedValue);
 
         } catch (NoSuchAlgorithmException e) {
-            throw new LocalFileUploadStore.ChecksumMismatchException("Checksum algorithm unavailable: " + algorithm);
+            throw new ChecksumMismatchException("Checksum algorithm unavailable: " + algorithm);
         }
     }
 

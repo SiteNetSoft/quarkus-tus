@@ -6,7 +6,6 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.ratelimit.TusRateLimitService;
-import org.sitenetsoft.quarkus.tus.runtime.store.LocalFileUploadStore;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 import java.util.List;
@@ -39,9 +38,7 @@ public class UploadExpirationScheduler {
 
     @Scheduled(every = "1m")
     public void cleanupStaleLocks() {
-        if (uploadStore instanceof LocalFileUploadStore localStore) {
-            localStore.cleanupStaleLocks();
-        }
+        uploadStore.cleanupStaleLocks();
     }
 
     @Scheduled(every = "30m", delayed = "10m")
@@ -56,18 +53,20 @@ public class UploadExpirationScheduler {
 
     @Scheduled(every = "1h", delayed = "30m")
     public void cleanupStaleUploads() {
-        if (uploadStore instanceof LocalFileUploadStore localStore) {
-            long staleHours = tusRuntimeConfig.staleUploadHours();
-            if (staleHours > 0) {
-                localStore.cleanupStaleUploads(staleHours);
+        long staleHours = tusRuntimeConfig.staleUploadHours();
+        if (staleHours > 0) {
+            List<String> cleaned = uploadStore.cleanupStaleUploads(staleHours);
+            if (!cleaned.isEmpty()) {
+                LOG.infof("Scheduled cleanup removed %d stale uploads", cleaned.size());
             }
         }
     }
 
     @Scheduled(every = "1h", delayed = "45m")
     public void cleanupOrphanFiles() {
-        if (uploadStore instanceof LocalFileUploadStore localStore) {
-            localStore.cleanupOrphanFiles();
+        int cleaned = uploadStore.cleanupOrphanFiles();
+        if (cleaned > 0) {
+            LOG.infof("Scheduled cleanup removed %d orphaned files", cleaned);
         }
     }
 }
