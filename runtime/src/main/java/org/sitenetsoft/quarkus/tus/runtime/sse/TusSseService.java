@@ -86,6 +86,36 @@ public class TusSseService {
         }
     }
 
+    /**
+     * Sends a lifecycle event on the {@code /tus/events} stream for an upload.
+     * <p>
+     * Closed or broken sinks are dropped here, which is the only thing that keeps the map from
+     * growing: nothing iterates it otherwise.
+     *
+     * @param uploadId  the upload whose stream to write to
+     * @param eventName the SSE event name, e.g. {@code progress} or {@code complete}
+     * @param json      the payload
+     */
+    public void sendUploadEvent(String uploadId, String eventName, String json) {
+        if (uploadId == null || eventName == null) return;
+
+        var sink = uploadSinks.get(uploadId);
+        if (sink == null) return;
+
+        if (sink.isClosed()) {
+            uploadSinks.remove(uploadId);
+            return;
+        }
+
+        try {
+            sink.send(sse.newEventBuilder().name(eventName).data(json == null ? "{}" : json).build());
+        } catch (Exception e) {
+            LOG.debugf("Failed to send %s to upload stream %s: %s", eventName, uploadId, e.getMessage());
+            uploadSinks.remove(uploadId);
+            try { sink.close(); } catch (Exception ignored) {}
+        }
+    }
+
     public void registerForUpload(String uploadId, SseEventSink sink) {
         if (uploadId == null || sink == null) {
             return;

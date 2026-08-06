@@ -23,6 +23,7 @@ import org.sitenetsoft.quarkus.tus.runtime.devui.TusDevUIJsonRpcService;
 import org.sitenetsoft.quarkus.tus.runtime.health.TusHealthCheck;
 import org.sitenetsoft.quarkus.tus.runtime.metrics.TusMetricsService;
 import org.sitenetsoft.quarkus.tus.runtime.sse.TusProgressResource;
+import org.sitenetsoft.quarkus.tus.runtime.sse.TusSseEventBridge;
 import org.sitenetsoft.quarkus.tus.runtime.sse.TusSseResource;
 import org.sitenetsoft.quarkus.tus.runtime.sse.TusSseService;
 import org.sitenetsoft.quarkus.tus.runtime.event.*;
@@ -150,6 +151,7 @@ class TusProcessor {
                 .setUnremovable()
                 .addBeanClasses(
                         TusSseService.class,
+                        TusSseEventBridge.class,
                         TusSseResource.class,
                         TusProgressResource.class
                 )

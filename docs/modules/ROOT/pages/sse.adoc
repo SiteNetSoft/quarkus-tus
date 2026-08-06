@@ -27,7 +27,15 @@ Only one subscriber is tracked per upload ID. Opening a second stream for the sa
 
 `GET /tus/events/{uploadId}`
 
-Opens a persistent SSE connection for the given upload. The server sends a `connected` event immediately upon connection, followed by progress events as chunks are received. The connection stays open until the upload completes or the client disconnects.
+Opens a persistent SSE connection for the given upload, carrying its lifecycle:
+
+* `connected` — sent immediately on subscribe
+* `progress` — one per chunk written, with `bytesUploaded`, `totalBytes` and `chunkSize`
+* `complete` — the upload finished; a final `progress` at 100% precedes it
+* `terminated` — the upload was deleted
+
+The server closes the stream after `complete` or `terminated`, which also releases the subscription.
+For a progress bar alone, prefer the progress stream below.
 
 .Client-side JavaScript
 [source,javascript]
@@ -50,8 +58,8 @@ eventSource.addEventListener("complete", (e) => {
     eventSource.close();
 });
 
-eventSource.addEventListener("error", (e) => {
-    console.log("Upload failed");
+eventSource.addEventListener("terminated", (e) => {
+    console.log("Upload was deleted");
     eventSource.close();
 });
 ----

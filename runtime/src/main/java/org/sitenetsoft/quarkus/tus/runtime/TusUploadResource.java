@@ -687,6 +687,14 @@ public class TusUploadResource {
                     // Send SSE progress if available
                     if (sseServiceInstance.isResolvable()) {
                         UploadProgress progress = uploadProgressService.getProgress(uploadID);
+                        if (progress == null && newOffset == finalInfo.getEntityLength()) {
+                            // The store clears the progress entry as soon as the upload completes,
+                            // and that runs earlier in this pipeline than we do. Without this, the
+                            // chunk that finishes an upload emits nothing and a client watching the
+                            // stream stalls on the previous chunk, never seeing 100%.
+                            progress = new UploadProgress(finalInfo.getEntityLength());
+                            progress.uploadedBytes = finalInfo.getEntityLength();
+                        }
                         if (progress != null) {
                             sseServiceInstance.get().sendProgress(uploadID, progress);
                         }
