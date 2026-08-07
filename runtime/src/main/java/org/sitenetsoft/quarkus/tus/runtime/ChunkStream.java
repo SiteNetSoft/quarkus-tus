@@ -8,6 +8,7 @@ import io.vertx.mutiny.core.http.HttpServerRequest;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -28,22 +29,24 @@ import java.util.concurrent.atomic.AtomicReference;
 final class ChunkStream {
 
     private final Multi<Buffer> multi;
-    private final MessageDigest digest;
+    private final Map<String, MessageDigest> digests;
     private final AtomicLong count = new AtomicLong();
     private final AtomicBoolean subscribed = new AtomicBoolean();
     private final AtomicReference<ChunkLimitExceededException> limitExceeded = new AtomicReference<>();
 
     /**
-     * @param digest        the digest to feed, or null when no checksum was requested
+     * @param digests       the digests to feed, keyed by TUS algorithm name; empty when no
+     *                      checksum was requested. More than one when the algorithm is only
+     *                      known at the end (an announced {@code Upload-Checksum} trailer).
      * @param maxChunkSize  fail past this many bytes with {@code Kind.CHUNK_SIZE}
      * @param maxRemaining  fail past this many bytes with {@code remainingKind}
      * @param remainingKind the kind to raise for {@code maxRemaining} -- {@code ENTITY_LENGTH}
      *                      while the upload's declared length bounds it, {@code MAX_SIZE} while
      *                      the length is still deferred and the server-wide cap bounds it instead
      */
-    ChunkStream(RoutingContext routingContext, MessageDigest digest, long maxChunkSize, long maxRemaining,
+    ChunkStream(RoutingContext routingContext, Map<String, MessageDigest> digests, long maxChunkSize, long maxRemaining,
                 ChunkLimitExceededException.Kind remainingKind) {
-        this.digest = digest;
+        this.digests = digests;
         io.vertx.core.http.HttpServerRequest request = routingContext.request();
         this.multi = HttpServerRequest.newInstance(request).toMulti()
                 .onSubscription().invoke(() -> {
@@ -62,7 +65,7 @@ final class ChunkStream {
                     if (total > maxRemaining) {
                         throw limit(new ChunkLimitExceededException(remainingKind, maxRemaining));
                     }
-                    if (digest != null) {
+                    for (MessageDigest digest : digests.values()) {
                         digest.update(buffer.getByteBuf().nioBuffer());
                     }
                 });
@@ -96,10 +99,18 @@ final class ChunkStream {
         return count.get();
     }
 
-    /** True if no digest was requested, or the computed digest equals the client's Base64 value. */
+    /**
+     * True if nothing was expected, or the digest computed for the expected algorithm equals the
+     * client's Base64 value. False if the algorithm was not being digested — the caller decides
+     * up front which algorithms it will accept.
+     */
     boolean checksumMatches(ChecksumInfo expected) {
-        if (digest == null || expected == null) {
+        if (expected == null) {
             return true;
+        }
+        MessageDigest digest = digests.get(expected.algorithm().trim().toLowerCase());
+        if (digest == null) {
+            return false;
         }
         String computed = Base64.getEncoder().encodeToString(digest.digest());
         return computed.equals(expected.value());

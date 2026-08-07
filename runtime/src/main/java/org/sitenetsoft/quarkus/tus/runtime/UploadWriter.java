@@ -11,8 +11,11 @@ import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
 import org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadNotFoundException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
+import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 
 import java.security.MessageDigest;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -43,11 +46,18 @@ public class UploadWriter {
      * Streams the request body into the store at {@code offset}: stage, then commit if the
      * checksum matched or abort if it did not, then progress bookkeeping and events. Resolves to
      * the new offset. The caller holds the upload's lock and releases it afterwards; nothing here
-     * does. Fails with {@link ChecksumMismatch}, {@link ChunkLimitExceededException},
-     * {@link OffsetMismatchException}, {@link UploadNotFoundException} or the store's failure.
+     * does. Fails with {@link ChecksumMismatch}, {@link BadChecksumHeader},
+     * {@link ChunkLimitExceededException}, {@link OffsetMismatchException},
+     * {@link UploadNotFoundException} or the store's failure.
+     * <p>
+     * {@code digests} holds every algorithm being computed as the bytes pass. It has one entry for
+     * an {@code Upload-Checksum} header, and one per configured algorithm when the client announced
+     * the checksum as a <em>trailer</em> ({@code trailerAnnounced}) — a trailer names its algorithm
+     * only after the body, by which time it is too late to start hashing.
      */
     public Uni<Long> write(String uploadID, UploadInfo info, long offset, RoutingContext routingContext,
-                           ChecksumInfo checksumInfo, MessageDigest digest, Long contentLength,
+                           ChecksumInfo checksumInfo, Map<String, MessageDigest> digests,
+                           boolean trailerAnnounced, Long contentLength,
                            AtomicReference<ChunkStream> streamRef) {
         final long entityLength = info.getEntityLength();
         // While the length is deferred there is no Upload-Length to bound the stream against, but
@@ -61,7 +71,7 @@ public class UploadWriter {
         ChunkLimitExceededException.Kind remainingKind = entityLength >= 0
                 ? ChunkLimitExceededException.Kind.ENTITY_LENGTH
                 : ChunkLimitExceededException.Kind.MAX_SIZE;
-        ChunkStream stream = new ChunkStream(routingContext, digest, tusRuntimeConfig.maxChunkSize(), remaining,
+        ChunkStream stream = new ChunkStream(routingContext, digests, tusRuntimeConfig.maxChunkSize(), remaining,
                 remainingKind);
         streamRef.set(stream);
         // Completion is a transition, decided once: only the commit that reaches the declared
@@ -79,7 +89,26 @@ public class UploadWriter {
                     if (stream.limitExceeded() != null) {
                         return Uni.createFrom().<Long>failure(stream.limitExceeded());
                     }
-                    if (!stream.checksumMatches(checksumInfo)) {
+                    ChecksumInfo expected = checksumInfo;
+                    if (expected == null && trailerAnnounced) {
+                        // The body is in; the trailer, if the client really sent one, is now readable.
+                        String trailer = routingContext.request().getTrailer("Upload-Checksum");
+                        if (trailer != null && !trailer.isBlank()) {
+                            Optional<ChecksumInfo> parsed = TusUtils.parseChecksumHeader(trailer);
+                            if (parsed.isEmpty()) {
+                                return uploadStore.abortChunk(uploadID, offset).onItem().transformToUni(v ->
+                                        Uni.createFrom().<Long>failure(
+                                                new BadChecksumHeader("Malformed Upload-Checksum trailer")));
+                            }
+                            if (!isSupportedChecksumAlgorithm(parsed.get().algorithm())) {
+                                return uploadStore.abortChunk(uploadID, offset).onItem().transformToUni(v ->
+                                        Uni.createFrom().<Long>failure(
+                                                new BadChecksumHeader("Unsupported checksum algorithm")));
+                            }
+                            expected = parsed.get();
+                        }
+                    }
+                    if (!stream.checksumMatches(expected)) {
                         return uploadStore.abortChunk(uploadID, offset)
                                 .onItem().transformToUni(v -> Uni.createFrom().<Long>failure(new ChecksumMismatch()));
                     }
@@ -115,6 +144,18 @@ public class UploadWriter {
                                 .invoke(current -> events.uploadCompleted(uploadID, current.orElse(info)))
                                 .replaceWithVoid()
                         : Uni.createFrom().voidItem());
+    }
+
+    private boolean isSupportedChecksumAlgorithm(String algorithm) {
+        if (algorithm == null || algorithm.isBlank()) {
+            return false;
+        }
+        for (String supported : tusRuntimeConfig.checksumAlgorithms().split(",")) {
+            if (supported.trim().equalsIgnoreCase(algorithm.trim())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

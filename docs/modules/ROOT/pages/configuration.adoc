@@ -61,7 +61,7 @@ Runtime properties can be overridden at startup via `application.properties`, en
 
 | `quarkus.tus.extensions`
 | `String`
-| `creation,termination,checksum,expiration,concatenation,concatenation-unfinished,creation-with-upload,creation-defer-length`
+| `creation,termination,checksum,checksum-trailer,expiration,concatenation,concatenation-unfinished,creation-with-upload,creation-defer-length`
 | Comma-separated list of active TUS protocol extensions. Reported in the `Tus-Extension` header.
 
 | `quarkus.tus.expiration-hours`
@@ -140,16 +140,13 @@ Runtime properties can be overridden at startup via `application.properties`, en
 == Checksum Trailers
 
 The `checksum-trailer` extension lets a client send `Upload-Checksum` as an HTTP trailer, after the
-body, instead of as a header — useful for clients that stream a large chunk and cannot compute its
-hash before sending it.
+body, instead of as a header. This matters for clients that stream a large chunk and cannot compute
+its hash before sending it.
 
-It is **not supported** and deliberately not advertised, because reading HTTP request trailers
-requires https://github.com/eclipse-vertx/vert.x/issues/5253[eclipse-vertx/vert.x#5253], which Vert.x
-does not yet ship. Clients should send `Upload-Checksum` as a request header, which is fully
-supported.
-
-The implementation exists on the `checksum-trailer` branch, which builds against a patched
-`vertx-core`; it will be merged once the upstream change is released.
+WARNING: Reading HTTP request trailers requires a `vertx-core` that implements
+https://github.com/eclipse-vertx/vert.x/issues/5253[eclipse-vertx/vert.x#5253], which Vert.x does not
+yet ship. Against a stock Vert.x the trailer is never seen and the chunk would be accepted unverified,
+so remove `checksum-trailer` from `quarkus.tus.extensions` unless you are running a patched build.
 
 == Rate Limiting Behind a Proxy
 

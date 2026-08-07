@@ -44,6 +44,33 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      # TEMPORARY: the checksum-trailer extension needs a vertx-core that can read HTTP request
+      # trailers (eclipse-vertx/vert.x#5253). Until that ships, the build forces a patched
+      # 4.5.32-SNAPSHOT resolved from the local Maven repository, so CI has to produce it.
+      # Remove this block, the force in build.gradle, and the note in configuration.adoc once
+      # upstream releases it.
+      - name: Resolve patched Vert.x revision
+        id: vertx
+        run: |
+          sha=$(git ls-remote https://github.com/SiteNetSoft/vert.x.git refs/heads/request-trailers-4.x | cut -f1)
+          if [ -z "$sha" ]; then echo "Could not resolve request-trailers-4.x" >&2; exit 1; fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Cache patched Vert.x
+        id: vertx-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository/io/vertx
+          key: vertx-request-trailers-4.x-${{ steps.vertx.outputs.sha }}
+
+      - name: Build and install patched Vert.x
+        if: steps.vertx-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch request-trailers-4.x \
+            https://github.com/SiteNetSoft/vert.x.git "${RUNNER_TEMP}/vertx"
+          cd "${RUNNER_TEMP}/vertx"
+          mvn -B --no-transfer-progress install \
+            -DskipTests -Dmaven.javadoc.skip=true -Dmaven.source.skip=true
 
       - name: Build
         run: ./gradlew build
@@ -111,6 +138,29 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      # TEMPORARY: see the identical block in the build job.
+      - name: Resolve patched Vert.x revision
+        id: vertx
+        run: |
+          sha=$(git ls-remote https://github.com/SiteNetSoft/vert.x.git refs/heads/request-trailers-4.x | cut -f1)
+          if [ -z "$sha" ]; then echo "Could not resolve request-trailers-4.x" >&2; exit 1; fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Cache patched Vert.x
+        id: vertx-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository/io/vertx
+          key: vertx-request-trailers-4.x-${{ steps.vertx.outputs.sha }}
+
+      - name: Build and install patched Vert.x
+        if: steps.vertx-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch request-trailers-4.x \
+            https://github.com/SiteNetSoft/vert.x.git "${RUNNER_TEMP}/vertx"
+          cd "${RUNNER_TEMP}/vertx"
+          mvn -B --no-transfer-progress install \
+            -DskipTests -Dmaven.javadoc.skip=true -Dmaven.source.skip=true
 
       - name: Build and test native image
         run: ./gradlew :integration-tests:nativeIntegrationTest -Dquarkus.native.enabled=true -Dquarkus.package.jar.enabled=false

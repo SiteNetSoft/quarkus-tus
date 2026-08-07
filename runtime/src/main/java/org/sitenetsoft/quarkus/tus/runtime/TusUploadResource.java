@@ -31,7 +31,9 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
@@ -320,7 +322,7 @@ public class TusUploadResource {
             if (!locked) {
                 return Uni.createFrom().item(tus(423).entity("Upload is currently being processed").build());
             }
-            return detached(writer.write(uploadId, info, 0, routingContext, null, null, contentLength, stream)
+            return detached(writer.write(uploadId, info, 0, routingContext, null, Map.of(), false, contentLength, stream)
                     .onItem().transform(newOffset -> createdResponse(location, expires, false, newOffset))
                     .onFailure(ChunkLimitExceededException.class).recoverWithItem(e ->
                             tus(REQUEST_ENTITY_TOO_LARGE).entity(e.getMessage()).build())
@@ -523,11 +525,14 @@ public class TusUploadResource {
             // Parsed before the lock is taken so that a rejection cannot leak it. A blank header
             // is treated as absent; a present-but-unparseable one is a client error rather than
             // something to silently skip, since the client believes its data is being verified.
-            // checksum-trailer would read Upload-Checksum from the request trailers here, but
-            // HttpServerRequest cannot expose them until eclipse-vertx/vert.x#5253 ships. See the
-            // checksum-trailer branch, which builds against a patched vertx-core.
+            //
+            // checksum-trailer: a client streaming a large chunk cannot hash it before sending, so
+            // it may announce "Trailer: Upload-Checksum" and send the header after the body. The
+            // algorithm is then only known once the body has been staged, so every configured
+            // algorithm is digested on the way through and the trailer is checked before commit.
             ChecksumInfo checksumInfo = null;
-            MessageDigest digest = null;
+            Map<String, MessageDigest> digests = new LinkedHashMap<>();
+            boolean announcedTrailer = false;
             if (uploadChecksum != null && !uploadChecksum.isBlank()) {
                 Optional<ChecksumInfo> parsed = TusUtils.parseChecksumHeader(uploadChecksum);
                 if (parsed.isEmpty()) {
@@ -539,11 +544,18 @@ public class TusUploadResource {
                 if (digestOpt.isEmpty()) {
                     return Uni.createFrom().item(tus(BAD_REQUEST).entity("Unsupported checksum algorithm").build());
                 }
-                digest = digestOpt.get();
+                digests.put(checksumInfo.algorithm().trim().toLowerCase(), digestOpt.get());
+            } else if (announcesChecksumTrailer(routingContext)) {
+                announcedTrailer = true;
+                for (String algorithm : tusRuntimeConfig.checksumAlgorithms().split(",")) {
+                    String name = algorithm.trim().toLowerCase();
+                    ChunkStream.digestFor(name).ifPresent(d -> digests.put(name, d));
+                }
             }
 
             final ChecksumInfo expectedChecksum = checksumInfo;
-            final MessageDigest bodyDigest = digest;
+            final Map<String, MessageDigest> bodyDigests = digests;
+            final boolean trailerAnnounced = announcedTrailer;
             return uploadStore.acquireLock(uploadID).chain(locked -> {
                 if (!locked) {
                     return Uni.createFrom().item(tus(423).entity("Upload is currently being processed").build());
@@ -556,7 +568,7 @@ public class TusUploadResource {
                 // the lock allowed two requests to both pass validation and then write in turn,
                 // the second silently overwriting the first.
                 return detached(patchUnderLockValidated(uploadID, offset, contentLength, uploadLength,
-                        expectedChecksum, bodyDigest, routingContext, stream)
+                        expectedChecksum, bodyDigests, trailerAnnounced, routingContext, stream)
                         .eventually(() -> uploadStore.releaseLock(uploadID)));
             });
         });
@@ -569,7 +581,8 @@ public class TusUploadResource {
      */
     private Uni<Response> patchUnderLockValidated(String uploadID, long uploadOffset, Long contentLength,
                                                   Long uploadLength, ChecksumInfo checksumInfo,
-                                                  MessageDigest digest, RoutingContext routingContext,
+                                                  Map<String, MessageDigest> digests, boolean trailerAnnounced,
+                                                  RoutingContext routingContext,
                                                   AtomicReference<ChunkStream> stream) {
         return uploadStore.findUploadInfo(uploadID).chain(lockedInfoOpt -> {
             if (lockedInfoOpt.isEmpty()) {
@@ -647,7 +660,7 @@ public class TusUploadResource {
                 }
 
                 return patchUnderLock(uploadID, info, uploadOffset, routingContext,
-                        checksumInfo, digest, contentLength, stream);
+                        checksumInfo, digests, trailerAnnounced, contentLength, stream);
             });
         });
     }
@@ -658,16 +671,16 @@ public class TusUploadResource {
      */
     private Uni<Response> patchUnderLock(String uploadID, UploadInfo info, long uploadOffset,
                                          RoutingContext routingContext, ChecksumInfo checksumInfo,
-                                         MessageDigest digest, Long contentLength,
-                                         AtomicReference<ChunkStream> stream) {
+                                         Map<String, MessageDigest> digests, boolean trailerAnnounced,
+                                         Long contentLength, AtomicReference<ChunkStream> stream) {
         final String expires = expiresHeader(info);
         final long entityLength = info.getEntityLength();
 
         // Some clients poll with an empty PATCH; the store never sees a chunk it could not write.
         Uni<Long> write = contentLength != null && contentLength == 0
                 ? writer.writeNothing(uploadID, uploadOffset, entityLength)
-                : writer.write(uploadID, info, uploadOffset, routingContext, checksumInfo, digest,
-                        contentLength, stream);
+                : writer.write(uploadID, info, uploadOffset, routingContext, checksumInfo, digests,
+                        trailerAnnounced, contentLength, stream);
 
         return write
                 .onItem().transform(newOffset -> {
@@ -707,6 +720,7 @@ public class TusUploadResource {
                     LOG.warnf("Checksum mismatch for upload %s", uploadID);
                     return tus(460).entity("Checksum mismatch").build();
                 })
+                .onFailure(BadChecksumHeader.class).recoverWithItem(e -> tus(BAD_REQUEST).entity(e.getMessage()).build())
                 .onFailure(ChunkLimitExceededException.class).recoverWithItem(e -> {
                     ChunkLimitExceededException limit = (ChunkLimitExceededException) e;
                     return switch (limit.kind()) {
@@ -723,6 +737,20 @@ public class TusUploadResource {
                     LOG.error("Error while writing to upload " + uploadID, e);
                     return tus(INTERNAL_SERVER_ERROR).entity("Internal server error").build();
                 });
+    }
+
+    /** Whether the request announces an {@code Upload-Checksum} trailer via the HTTP {@code Trailer} header. */
+    private static boolean announcesChecksumTrailer(RoutingContext routingContext) {
+        String announced = routingContext.request().getHeader("Trailer");
+        if (announced == null) {
+            return false;
+        }
+        for (String name : announced.split(",")) {
+            if ("Upload-Checksum".equalsIgnoreCase(name.trim())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean fitsWithin(long contentLength, long offset, long entityLength) {
