@@ -23,7 +23,7 @@ Add the extension to your Quarkus application:
 #### Gradle
 
 ```kotlin
-implementation("org.sitenetsoft:quarkus-tus:1.0.0-SNAPSHOT")
+implementation("org.sitenetsoft:quarkus-tus:0.1.0")
 ```
 
 #### Maven
@@ -32,7 +32,7 @@ implementation("org.sitenetsoft:quarkus-tus:1.0.0-SNAPSHOT")
 <dependency>
     <groupId>org.sitenetsoft</groupId>
     <artifactId>quarkus-tus</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>0.1.0</version>
 </dependency>
 ```
 
@@ -114,7 +114,17 @@ Read the [full documentation](docs/modules/ROOT/pages/index.adoc) for detailed g
 
 | Extension Version | Quarkus Version | Java Version |
 |---|---|---|
-| 1.0.0-SNAPSHOT | 3.31.4 | 25 |
+| 0.1.0 | 3.38.0 | 25 |
+
+### Stability
+
+The TUS endpoints and configuration are stable: they implement a published protocol and are covered
+by a conformance suite.
+
+The `UploadStore` SPI is not yet stable. Writing a storage backend against it is supported and
+encouraged, but `writeChunkAsync` currently takes a `byte[]`, which rules out streaming uploads to
+object stores, and changing it will break implementors. That is why this release is `0.x`. The SPI
+settles at `1.0.0`.
 
 ## License
 
