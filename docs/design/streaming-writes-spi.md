@@ -19,6 +19,28 @@ a *transition* — the commit that reaches `Upload-Length` — instead of a pers
 `UploadInfo.completionFired` is gone and a zero-length upload completes on creation. The TCK lives in
 the `tck` module (`org.sitenetsoft:quarkus-tus-tck`).
 
+**What the review then found (2026-08-16).** Streaming moved *when* things happen, and machinery
+written for the buffered world assumed the old timing:
+
+- The lock now spans the client's transfer, not a local disk write, so the local store's 30 s
+  stale-lock reclamation fired on any chunk that took longer than that. The lock is refreshed per
+  buffer while staging, the timeout is `quarkus.tus.lock-timeout-seconds`, and the SPI states that a
+  lock must be treated as live while bytes flow.
+- Staged bytes reach the data file before they are verified, so a crash mid-chunk left the file
+  longer than the persisted offset — and restart "trusted the file size", adopting unverified bytes.
+  Restart now truncates the file to the persisted offset (only committed offsets are ever persisted).
+- Quarkus REST *cancels* the response pipeline when the client disconnects, and cancellation skips
+  every failure handler: the store's promised `abortChunk`, the events after a commit, completion.
+  The write pipeline is detached from the response (`TusUploadResource.detached`), so a disconnect
+  surfaces as the body stream's own failure and takes the ordinary abort → release path.
+- After a stale-offset failure nothing was staged, so the framework no longer calls
+  `abortChunk(callerOffset)` — that would tell the store to roll back below the real offset.
+- A store that throws from `stageChunk` instead of failing the `Uni` (the docs' own S3 sketch did)
+  no longer leaks the creation-with-upload lock: the call is `deferred`, the same failure mapping
+  serves POST and PATCH, and a failed creation-with-upload discards its upload. The TCK now rejects
+  synchronous throws and has a failing-stream case; `BufferingUploadStore` runs `appendBytes` on a
+  worker. `TusFaultyStoreTest` is the misbehaving-store harness for all of this.
+
 ## The problem is not really `byte[]`
 
 The roadmap records this item as "`writeChunkAsync` takes `byte[]`, not a stream". That is true and it

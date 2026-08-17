@@ -46,7 +46,8 @@ import java.util.Optional;
  * SPI revision.
  * <p>
  * A reusable contract test, {@code AbstractUploadStoreContractTest} in the
- * {@code quarkus-tus} test-fixtures artifact, checks an implementation against every rule below.
+ * {@code org.sitenetsoft:quarkus-tus-tck} artifact, checks an implementation against every rule
+ * below.
  */
 public interface UploadStore {
 
@@ -92,6 +93,12 @@ public interface UploadStore {
      * {@code offset} must be re-checked against the record: a stale offset means a request raced
      * past the framework's own validation, and writing there would overwrite bytes that were
      * already acknowledged.
+     *
+     * Failures come down {@code data} too — the client hung up, or the framework cut the body
+     * off at a limit. Let them fail the returned {@code Uni} as they are, unwrapped: the
+     * framework decides the response from the failure's type. Every failure, including a
+     * missing upload or a stale offset, must be a failure of the returned {@code Uni}, never a
+     * synchronous throw.
      *
      * @param data           the chunk, as a backpressured stream of buffers; subscribe exactly once
      * @param expectedLength the declared chunk length in bytes, for backends that must know it up
@@ -148,6 +155,12 @@ public interface UploadStore {
      * Takes the upload's exclusive lock, which the framework holds across a chunk write and a
      * concatenation. Not reentrant. A store that runs on more than one node needs a shared
      * lock here; the bundled store's lock is per process.
+     * <p>
+     * The lock is held for the whole of {@link #stageChunk} — that is, for as long as the
+     * client takes to send the chunk. A store that expires abandoned locks must therefore treat
+     * a lock as live while bytes are flowing (the bundled store refreshes it on every buffer;
+     * a lease-based lock would extend the lease), and its timeout must exceed the longest pause
+     * a healthy client may make mid-chunk.
      *
      * @return false if the lock is held by someone else
      */

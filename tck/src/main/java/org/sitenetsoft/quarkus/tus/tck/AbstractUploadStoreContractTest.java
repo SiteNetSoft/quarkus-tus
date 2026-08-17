@@ -78,6 +78,21 @@ public abstract class AbstractUploadStoreContractTest {
         return uni.await().atMost(TIMEOUT);
     }
 
+    /**
+     * Calls {@code stageChunk} and awaits it, failing the test if the store threw synchronously
+     * instead of returning a failed {@code Uni}. The framework tolerates a synchronous throw, but
+     * it is not the contract: a failure must be a failure of the returned {@code Uni}.
+     */
+    protected long stage(String id, long offset, Multi<Buffer> data, long expectedLength) {
+        Uni<Long> staged;
+        try {
+            staged = store().stageChunk(id, offset, data, expectedLength);
+        } catch (RuntimeException e) {
+            throw new AssertionError("stageChunk must return a failed Uni, not throw synchronously: " + e, e);
+        }
+        return await(staged);
+    }
+
     protected String create(long entityLength) {
         return store().createUpload(record(entityLength));
     }
@@ -90,7 +105,7 @@ public abstract class AbstractUploadStoreContractTest {
     protected long write(String id, long offset, String content) {
         assertTrue(store().acquireLock(id), "lock must be free");
         try {
-            long staged = await(store().stageChunk(id, offset, bytes(content), content.length()));
+            long staged = stage(id, offset, bytes(content), content.length());
             await(store().commitChunk(id, offset, staged));
             return offset + staged;
         } finally {
@@ -238,19 +253,44 @@ public abstract class AbstractUploadStoreContractTest {
         write(id, 0, "abc");
 
         OffsetMismatchException e = assertThrows(OffsetMismatchException.class,
-                () -> await(store().stageChunk(id, 0, bytes("ZZ"), 2)));
+                () -> stage(id, 0, bytes("ZZ"), 2));
         assertEquals(3, e.getExpectedOffset(), "the exception must carry the real offset");
         assertEquals(3, info(id).getOffset());
         assertContent(id, "abc");
 
         assertThrows(OffsetMismatchException.class,
-                () -> await(store().stageChunk(id, 7, bytes("ZZ"), 2)), "an offset past the end is stale too");
+                () -> stage(id, 7, bytes("ZZ"), 2), "an offset past the end is stale too");
+    }
+
+    /**
+     * The body stream can fail part-way — the client hung up, or the framework cut it off at a
+     * limit. The store must surface that failure as-is (the framework decides the response from
+     * its type) and, once aborted, leave the upload exactly as it was.
+     */
+    @Test
+    public void failedStreamLeavesNothingVisibleAfterAbort() {
+        String id = create(10);
+        write(id, 0, "abc");
+        IllegalStateException boom = new IllegalStateException("stream cut");
+        Multi<Buffer> failing = Multi.createBy().concatenating().streams(bytes("de"), Multi.createFrom().failure(boom));
+
+        assertTrue(store().acquireLock(id));
+        try {
+            Throwable seen = assertThrows(Throwable.class, () -> stage(id, 3, failing, -1));
+            assertSame(boom, seen, "the stream's failure must be propagated unwrapped");
+            await(store().abortChunk(id, 3));
+        } finally {
+            store().releaseLock(id);
+        }
+        assertEquals(3, info(id).getOffset());
+        assertContent(id, "abc");
+        assertEquals(6, write(id, 3, "fgh"), "the upload must still accept the next chunk");
     }
 
     @Test
     public void stageOnUnknownUploadFails() {
         assertThrows(UploadNotFoundException.class,
-                () -> await(store().stageChunk(UUID.randomUUID().toString(), 0, bytes("x"), 1)));
+                () -> stage(UUID.randomUUID().toString(), 0, bytes("x"), 1));
     }
 
     @Test
