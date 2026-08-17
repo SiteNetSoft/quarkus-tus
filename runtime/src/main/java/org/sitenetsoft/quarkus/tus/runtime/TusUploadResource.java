@@ -312,15 +312,20 @@ public class TusUploadResource {
             return Uni.createFrom().item(tus(423).entity("Upload is currently being processed").build());
         }
 
-        return writeBody(uploadId, info, 0, routingContext, null, null, contentLength, stream)
+        return detached(writeBody(uploadId, info, 0, routingContext, null, null, contentLength, stream)
                 .onItem().transform(newOffset -> createdResponse(location, expires, false, newOffset))
                 .onFailure(ChunkLimitExceededException.class).recoverWithItem(e ->
                         tus(REQUEST_ENTITY_TOO_LARGE).entity(e.getMessage()).build())
-                .onFailure().recoverWithItem(e -> {
-                    LOG.error("Failed to write initial data for upload " + uploadId, e);
-                    return tus(INTERNAL_SERVER_ERROR).entity("Failed to write initial upload data").build();
-                })
-                .eventually(() -> uploadStore.releaseLock(uploadId));
+                .plug(u -> recoverWriteFailures(u, uploadId))
+                .eventually(() -> uploadStore.releaseLock(uploadId))
+                .onItem().invoke(response -> {
+                    // The client gets an error and no Location, so it will create again rather
+                    // than resume: leaving the upload behind only makes work for the cleanup jobs.
+                    if (response.getStatus() != CREATED.getStatusCode()) {
+                        uploadStore.discardUpload(uploadId);
+                        uploadProgressService.finishUpload(uploadId);
+                    }
+                }));
     }
 
     private Response createdResponse(String location, String expires, boolean deferred, long offset) {
@@ -665,7 +670,7 @@ public class TusUploadResource {
             write = writeBody(uploadID, info, uploadOffset, routingContext, checksumInfo, digest, contentLength, stream);
         }
 
-        return write
+        return detached(write
                 .onItem().transform(newOffset -> {
                     Response.ResponseBuilder builder = tus(NO_CONTENT)
                             .header("Upload-Offset", String.valueOf(newOffset));
@@ -674,6 +679,25 @@ public class TusUploadResource {
                     }
                     return builder.build();
                 })
+                .plug(u -> recoverWriteFailures(u, uploadID))
+                .eventually(() -> uploadStore.releaseLock(uploadID)));
+    }
+
+    /**
+     * Runs {@code pipeline} to its natural end even if Quarkus REST cancels the response — which
+     * it does the moment the client goes away. Cancellation would skip every failure handler in
+     * the write pipeline: the abort the store was promised, the events after a commit that
+     * already happened, the completion. Detached, a disconnect instead surfaces as the body
+     * stream's own failure and takes the ordinary abort → release path; the response simply
+     * has nobody left to read it.
+     */
+    private static <T> Uni<T> detached(Uni<T> pipeline) {
+        return Uni.createFrom().emitter(emitter -> pipeline.subscribe().with(emitter::complete, emitter::fail));
+    }
+
+    /** Maps the failures {@link #writeBody} can produce to their TUS responses. */
+    private Uni<Response> recoverWriteFailures(Uni<Response> write, String uploadID) {
+        return write
                 .onFailure(OffsetMismatchException.class).recoverWithItem(e -> {
                     long expected = ((OffsetMismatchException) e).getExpectedOffset();
                     LOG.warnf("Rejected write to upload %s at stale offset: %s", uploadID, e.getMessage());
@@ -693,10 +717,9 @@ public class TusUploadResource {
                 })
                 .onFailure(UploadNotFoundException.class).recoverWithItem(e -> tus(NOT_FOUND).build())
                 .onFailure().recoverWithItem(e -> {
-                    LOG.error("Error while patching upload " + uploadID, e);
+                    LOG.error("Error while writing to upload " + uploadID, e);
                     return tus(INTERNAL_SERVER_ERROR).entity("Internal server error").build();
-                })
-                .eventually(() -> uploadStore.releaseLock(uploadID));
+                });
     }
 
     /**
@@ -715,7 +738,9 @@ public class TusUploadResource {
         streamRef.set(stream);
         long expectedLength = contentLength != null ? contentLength : -1;
 
-        return uploadStore.stageChunk(uploadID, offset, stream.multi(), expectedLength)
+        // deferred(): a store that throws from stageChunk instead of returning a failed Uni
+        // still lands in the failure path below, where the lock is released and the error mapped.
+        return Uni.createFrom().deferred(() -> uploadStore.stageChunk(uploadID, offset, stream.multi(), expectedLength))
                 .onItem().transformToUni(staged -> {
                     if (!stream.checksumMatches(checksumInfo)) {
                         return uploadStore.abortChunk(uploadID, offset)
@@ -723,10 +748,12 @@ public class TusUploadResource {
                     }
                     return uploadStore.commitChunk(uploadID, offset, staged).replaceWith(offset + staged);
                 })
-                .onFailure(e -> !(e instanceof ChecksumMismatch)).call(e -> {
+                .onFailure(e -> !(e instanceof ChecksumMismatch) && !(e instanceof OffsetMismatchException)).call(e -> {
                     // A store that fails mid-stage may already have discarded its bytes; abort
                     // anyway so the offset is guaranteed to be where the client left it. An
-                    // abort failure must not mask the original error.
+                    // abort failure must not mask the original error. Not after a stale offset,
+                    // though: nothing was staged, and abortChunk(offset) would tell the store to
+                    // roll the upload back below where it really is.
                     return uploadStore.abortChunk(uploadID, offset)
                             .onFailure().recoverWithItem(abortErr -> {
                                 LOG.warnf(abortErr, "Failed to abort staged chunk for upload %s", uploadID);

@@ -2,6 +2,7 @@ package org.sitenetsoft.quarkus.tus.runtime.spi;
 
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
+import io.smallrye.mutiny.infrastructure.Infrastructure;
 import io.vertx.core.buffer.Buffer;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
 
@@ -64,15 +65,21 @@ public abstract class BufferingUploadStore implements UploadStore {
             }
             bytes = new byte[0];
         }
-        UploadInfo info = findUploadInfo(id).orElse(null);
-        if (info == null) {
-            return Uni.createFrom().failure(new UploadNotFoundException(id));
-        }
-        appendBytes(id, offset, bytes);
-        info.setOffset(offset + bytes.length);
-        info.setLastActivity(Instant.now());
-        updateUploadInfo(id, info);
-        return Uni.createFrom().voidItem();
+        final byte[] data = bytes;
+        // appendBytes and updateUploadInfo are synchronous by design — this class exists for
+        // stores whose client blocks — so they must not run on the event loop the body arrived on.
+        return Uni.createFrom().<Void>item(() -> {
+                    UploadInfo info = findUploadInfo(id).orElse(null);
+                    if (info == null) {
+                        throw new UploadNotFoundException(id);
+                    }
+                    appendBytes(id, offset, data);
+                    info.setOffset(offset + data.length);
+                    info.setLastActivity(Instant.now());
+                    updateUploadInfo(id, info);
+                    return null;
+                })
+                .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
     @Override
