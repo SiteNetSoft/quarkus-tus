@@ -76,7 +76,9 @@ The framework holds the upload's lock around the whole sequence, computes the di
 * `abortChunk` is idempotent and safe to call when nothing was staged or when staging itself failed.
 * `concatenate(finalId, sourceIds)` fills a final upload the framework already created with `isFinalConcat=true` and `partialIds`; on success set its offset to its length, clear `isFinalConcat` and `partialIds`, persist. Leave the sources alone -- the framework discards them.
 * `discardUpload` must refuse (return `false`) while another caller holds the lock, rather than delete underneath an in-flight write.
-* The `Uni`/`Multi` methods are subscribed to on a Vert.x event loop: do not block in them.
+* A failure of `stageChunk` -- unknown id, stale offset, or a failure that came down the body stream (client gone, limit crossed) -- is a failure of the returned `Uni`, propagated as-is; never a synchronous throw, never wrapped. The framework decides the response from the failure's type. After the framework's `abortChunk`, the upload is exactly as it was.
+* The lock is held for the whole of `stageChunk`, i.e. for as long as the client takes to send the chunk. A store that expires abandoned locks must treat a lock as live while bytes are flowing (the bundled store refreshes it on every buffer) and give it a timeout longer than any pause a healthy client may make mid-chunk -- see `quarkus.tus.lock-timeout-seconds`.
+* The `Uni`/`Multi` methods are subscribed to on a Vert.x event loop: do not block in them. (`BufferingUploadStore` runs your `appendBytes` on a worker thread for exactly this reason.)
 * `createUpload` returns an **id**. It is the last segment of the `Location` the extension builds; it must not contain `/`.
 
 Every one of these rules is an assertion in the contract test below.
@@ -128,9 +130,12 @@ public class S3UploadStore implements UploadStore {
 
     @Override
     public Uni<Long> stageChunk(String id, long offset, Multi<Buffer> data, long expectedLength) {
-        UploadInfo info = findUploadInfo(id).orElseThrow(() -> new UploadNotFoundException(id));
+        UploadInfo info = findUploadInfo(id).orElse(null);
+        if (info == null) {   // failures are failures of the Uni, never synchronous throws
+            return Uni.createFrom().failure(new UploadNotFoundException(id));
+        }
         if (offset != info.getOffset()) {
-            throw new OffsetMismatchException("stale offset", info.getOffset());
+            return Uni.createFrom().failure(new OffsetMismatchException("stale offset", info.getOffset()));
         }
         // S3 needs a content length per part; expectedLength is -1 for chunked bodies, in
         // which case a real store would fall back to buffering that one chunk.
