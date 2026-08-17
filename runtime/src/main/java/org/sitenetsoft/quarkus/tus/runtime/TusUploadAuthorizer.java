@@ -4,6 +4,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.SecurityContext;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
+import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 /**
@@ -37,7 +38,7 @@ public class TusUploadAuthorizer {
         if (!tusBuildTimeConfig.authEnabled()) {
             return false;
         }
-        String ownerId = uploadStore.getUploaderId(uploadId);
+        String ownerId = uploadStore.findUploadInfo(uploadId).map(UploadInfo::getUploaderId).orElse(null);
         return ownerId != null && !ownerId.equals(currentUserId);
     }
 

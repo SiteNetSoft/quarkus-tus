@@ -39,11 +39,11 @@ public final class TusUtils {
                 || normalized.startsWith(TusUploadResource.TUS_PATH + "/");
     }
 
-    public static Optional<UploadInfo.ChecksumInfo> parseChecksumHeader(String headerValue) {
+    public static Optional<ChecksumInfo> parseChecksumHeader(String headerValue) {
         if (headerValue == null) return Optional.empty();
         String[] pair = headerValue.split(" ");
         if (pair.length == 2) {
-            return Optional.of(new UploadInfo.ChecksumInfo(pair[0], pair[1]));
+            return Optional.of(new ChecksumInfo(pair[0], pair[1]));
         }
         return Optional.empty();
     }

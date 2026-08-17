@@ -2,43 +2,34 @@ package org.sitenetsoft.quarkus.tus.it;
 
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.event.Event;
 import jakarta.enterprise.inject.Alternative;
-import jakarta.inject.Inject;
-import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
-import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
-import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
-import org.sitenetsoft.quarkus.tus.runtime.event.TusUploadCompletedEvent;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
-import org.sitenetsoft.quarkus.tus.runtime.spi.ChecksumMismatchException;
+import org.sitenetsoft.quarkus.tus.runtime.spi.BufferingUploadStore;
+import org.sitenetsoft.quarkus.tus.runtime.spi.UploadNotFoundException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.io.ByteArrayOutputStream;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * The simplest possible {@link UploadStore}: records and bytes in maps. It exists to prove that
+ * a store needs to know nothing about the protocol — no events, no progress bookkeeping, no
+ * checksums, no configuration — and to exercise {@link BufferingUploadStore}.
+ */
 @ApplicationScoped
 @Alternative
-public class InMemoryUploadStore implements UploadStore {
+public class InMemoryUploadStore extends BufferingUploadStore {
 
     private final Map<String, UploadInfo> uploads = new ConcurrentHashMap<>();
     private final Map<String, byte[]> dataStore = new ConcurrentHashMap<>();
     private final Set<String> activeLocks = ConcurrentHashMap.newKeySet();
-
-    @Inject
-    UploadProgressService uploadProgressService;
-
-    @Inject
-    TusRuntimeConfig tusRuntimeConfig;
-
-    @Inject
-    TusBuildTimeConfig tusBuildTimeConfig;
-
-    @Inject
-    Event<TusUploadCompletedEvent> uploadCompletedEvent;
 
     public boolean hasData(String id) {
         return dataStore.containsKey(id);
@@ -54,275 +45,63 @@ public class InMemoryUploadStore implements UploadStore {
     }
 
     @Override
-    public Optional<String> createUpload(Long totalLength, Optional<String> uploadMetadata, boolean isPartial) {
-        if (totalLength == null || totalLength < 0) {
-            return Optional.empty();
-        }
-
+    public String createUpload(UploadInfo info) {
         String id = UUID.randomUUID().toString();
-
-        UploadInfo info = new UploadInfo();
-        info.setEntityLength(totalLength);
-        info.setOffset(0L);
-        info.setPartial(isPartial);
-        uploadMetadata.ifPresent(info::setMetadata);
-
-        Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
-        info.setExpiresAt(expiresAt);
-
         uploads.put(id, info);
         dataStore.put(id, new byte[0]);
-        uploadProgressService.startUpload(id, totalLength);
-
-        return Optional.of(tusBuildTimeConfig.path() + "/" + id);
+        return id;
     }
 
     @Override
-    public void setUploaderId(String id, String uploaderId) {
-        UploadInfo info = uploads.get(id);
-        if (info != null) {
-            info.setUploaderId(uploaderId);
+    public void updateUploadInfo(String id, UploadInfo info) {
+        if (uploads.containsKey(id)) {
+            uploads.put(id, info);
         }
     }
 
     @Override
-    public String getUploaderId(String id) {
-        UploadInfo info = uploads.get(id);
-        return info != null ? info.getUploaderId() : null;
+    protected void appendBytes(String id, long offset, byte[] data) {
+        byte[] existing = dataStore.getOrDefault(id, new byte[0]);
+        byte[] combined = new byte[existing.length + data.length];
+        System.arraycopy(existing, 0, combined, 0, existing.length);
+        System.arraycopy(data, 0, combined, existing.length, data.length);
+        dataStore.put(id, combined);
     }
 
     @Override
-    public Optional<String> createUploadDeferred(Optional<String> uploadMetadata, boolean isPartial) {
-        String id = UUID.randomUUID().toString();
-
-        UploadInfo info = new UploadInfo();
-        info.setEntityLength(-1);
-        info.setOffset(0L);
-        info.setPartial(isPartial);
-        info.setDeferredLength(true);
-        uploadMetadata.ifPresent(info::setMetadata);
-
-        Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
-        info.setExpiresAt(expiresAt);
-
-        uploads.put(id, info);
-        dataStore.put(id, new byte[0]);
-
-        return Optional.of(tusBuildTimeConfig.path() + "/" + id);
-    }
-
-    @Override
-    public boolean setDeferredLength(String id, long length) {
-        UploadInfo info = uploads.get(id);
-        if (info == null || !info.isDeferredLength() || info.getEntityLength() >= 0) {
-            return false;
+    public Uni<Void> concatenate(String finalId, List<String> sourceIds) {
+        UploadInfo finalInfo = uploads.get(finalId);
+        if (finalInfo == null) {
+            return Uni.createFrom().failure(new UploadNotFoundException(finalId));
         }
-        if (!checkServerSizeConstraint(length)) {
-            return false;
-        }
-
-        info.setEntityLength(length);
-        info.setDeferredLength(false);
-        uploadProgressService.startUpload(id, length);
-        return true;
-    }
-
-    @Override
-    public boolean hasDeferredLength(String id) {
-        UploadInfo info = uploads.get(id);
-        return info != null && info.isDeferredLength() && info.getEntityLength() < 0;
-    }
-
-    /** Stores the client's raw Upload-Concat header so HEAD can echo it back verbatim. */
-    private String concatValueFor(String[] ids, String uploadConcatHeader) {
-        if (uploadConcatHeader != null && !uploadConcatHeader.isBlank()) {
-            return uploadConcatHeader;
-        }
-        StringBuilder concatValue = new StringBuilder("final;");
-        for (int i = 0; i < ids.length; i++) {
-            if (i > 0) concatValue.append(" ");
-            concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
-        }
-        return concatValue.toString();
-    }
-
-    @Override
-    public Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata,
-                                                             String requiredOwnerId, String uploadConcatHeader) {
-        if (ids == null || ids.length == 0) {
-            return Optional.empty();
-        }
-
-        long totalLength = 0;
-        for (String partialId : ids) {
-            UploadInfo partialInfo = uploads.get(partialId);
-            if (partialInfo == null || !partialInfo.isPartial()) {
-                return Optional.empty();
+        ByteArrayOutputStream merged = new ByteArrayOutputStream();
+        for (String sourceId : sourceIds) {
+            byte[] bytes = dataStore.get(sourceId);
+            if (bytes == null) {
+                return Uni.createFrom().failure(new UploadNotFoundException(sourceId));
             }
-            if (partialInfo.getOffset() != partialInfo.getEntityLength()) {
-                return Optional.empty();
-            }
-            if (requiredOwnerId != null) {
-                String ownerId = partialInfo.getUploaderId();
-                if (ownerId != null && !ownerId.equals(requiredOwnerId)) {
-                    return Optional.empty();
-                }
-            }
-            totalLength += partialInfo.getEntityLength();
+            merged.writeBytes(bytes);
         }
-
-        if (!checkServerSizeConstraint(totalLength)) {
-            return Optional.empty();
-        }
-
-        String finalId = UUID.randomUUID().toString();
-
-        // Merge data
-        byte[] mergedData = new byte[(int) totalLength];
-        int pos = 0;
-        for (String partialId : ids) {
-            byte[] partialData = dataStore.get(partialId);
-            if (partialData == null) {
-                return Optional.empty();
-            }
-            System.arraycopy(partialData, 0, mergedData, pos, partialData.length);
-            pos += partialData.length;
-        }
-        dataStore.put(finalId, mergedData);
-
-        UploadInfo finalInfo = new UploadInfo();
-        finalInfo.setEntityLength(totalLength);
-        finalInfo.setOffset(totalLength);
-        finalInfo.setPartial(false);
-        uploadMetadata.ifPresent(finalInfo::setMetadata);
-
-        finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
-
-        uploads.put(finalId, finalInfo);
-
-        for (String partialId : ids) {
-            discardUpload(partialId);
-        }
-
-        return Optional.of(tusBuildTimeConfig.path() + "/" + finalId);
-    }
-
-    @Override
-    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata,
-                                                          String requiredOwnerId, String uploadConcatHeader) {
-        if (ids == null || ids.length == 0) {
-            return Optional.empty();
-        }
-
-        long totalLength = 0;
-        List<String> partialIdList = new ArrayList<>();
-        for (String partialId : ids) {
-            UploadInfo partialInfo = uploads.get(partialId);
-            if (partialInfo == null || !partialInfo.isPartial()) {
-                return Optional.empty();
-            }
-            if (partialInfo.getEntityLength() < 0) {
-                return Optional.empty();
-            }
-            if (requiredOwnerId != null) {
-                String ownerId = partialInfo.getUploaderId();
-                if (ownerId != null && !ownerId.equals(requiredOwnerId)) {
-                    return Optional.empty();
-                }
-            }
-            totalLength += partialInfo.getEntityLength();
-            partialIdList.add(partialId);
-        }
-
-        if (!checkServerSizeConstraint(totalLength)) {
-            return Optional.empty();
-        }
-
-        String finalId = UUID.randomUUID().toString();
-
-        UploadInfo finalInfo = new UploadInfo();
-        finalInfo.setEntityLength(totalLength);
-        finalInfo.setOffset(0);
-        finalInfo.setPartial(false);
-        finalInfo.setFinalConcat(true);
-        finalInfo.setPartialIds(partialIdList);
-        uploadMetadata.ifPresent(finalInfo::setMetadata);
-
-        Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
-        finalInfo.setExpiresAt(expiresAt);
-
-        finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
-
-        uploads.put(finalId, finalInfo);
-        dataStore.put(finalId, new byte[0]);
-
-        return Optional.of(tusBuildTimeConfig.path() + "/" + finalId);
-    }
-
-    @Override
-    public boolean isConcatReady(String id) {
-        UploadInfo info = uploads.get(id);
-        if (info == null || !info.isFinalConcat()) {
-            return false;
-        }
-        return info.areAllPartialsComplete(uploads::get);
-    }
-
-    @Override
-    public boolean finalizeConcatenation(String id) {
-        UploadInfo info = uploads.get(id);
-        if (info == null || !info.isFinalConcat()) {
-            return false;
-        }
-        if (!info.areAllPartialsComplete(uploads::get)) {
-            return false;
-        }
-
-        List<String> partialIds = info.getPartialIds();
-        if (partialIds == null || partialIds.isEmpty()) {
-            return false;
-        }
-
-        // Merge data in memory
-        int totalLen = 0;
-        for (String partialId : partialIds) {
-            byte[] d = dataStore.get(partialId);
-            if (d == null) return false;
-            totalLen += d.length;
-        }
-        byte[] mergedData = new byte[totalLen];
-        int pos = 0;
-        for (String partialId : partialIds) {
-            byte[] d = dataStore.get(partialId);
-            System.arraycopy(d, 0, mergedData, pos, d.length);
-            pos += d.length;
-        }
-        dataStore.put(id, mergedData);
-
-        info.setOffset(info.getEntityLength());
-        info.setFinalConcat(false);
-
-        for (String partialId : partialIds) {
-            discardUpload(partialId);
-        }
-        info.setPartialIds(null);
-
-        return true;
-    }
-
-    @Override
-    public boolean checkServerSizeConstraint(Long totalLength) {
-        if (totalLength == null) return false;
-        return totalLength <= tusRuntimeConfig.maxSize();
+        dataStore.put(finalId, merged.toByteArray());
+        finalInfo.setOffset(finalInfo.getEntityLength());
+        finalInfo.setFinalConcat(false);
+        finalInfo.setPartialIds(null);
+        finalInfo.setLastActivity(Instant.now());
+        return Uni.createFrom().voidItem();
     }
 
     @Override
     public boolean discardUpload(String id) {
-        UploadInfo removed = uploads.remove(id);
-        dataStore.remove(id);
-        uploadProgressService.finishUpload(id);
-        activeLocks.remove(id);
-        return removed != null;
+        if (!activeLocks.add(id)) {
+            return false;
+        }
+        try {
+            UploadInfo removed = uploads.remove(id);
+            dataStore.remove(id);
+            return removed != null;
+        } finally {
+            activeLocks.remove(id);
+        }
     }
 
     @Override
@@ -336,139 +115,15 @@ public class InMemoryUploadStore implements UploadStore {
     }
 
     @Override
-    public boolean validateOffset(String id, long clientOffset) {
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return false;
-        }
-        return info.getOffset() == clientOffset;
-    }
-
-    @Override
-    public Uni<Long> writeChunkAsync(String id, long offset, byte[] chunk, Optional<UploadInfo.ChecksumInfo> checksum) {
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return Uni.createFrom().item(-1L);
-        }
-
-        byte[] data = (chunk != null) ? chunk : new byte[0];
-
-        if (checksum.isPresent() && data.length > 0) {
-            UploadInfo.ChecksumInfo checksumInfo = checksum.get();
-            if (!validateChecksum(data, checksumInfo)) {
-                return Uni.createFrom().failure(
-                        new ChecksumMismatchException("Checksum validation failed"));
-            }
-        }
-
-        // Append data in memory
-        byte[] existing = dataStore.getOrDefault(id, new byte[0]);
-        byte[] combined = new byte[existing.length + data.length];
-        System.arraycopy(existing, 0, combined, 0, existing.length);
-        System.arraycopy(data, 0, combined, existing.length, data.length);
-        dataStore.put(id, combined);
-
-        long newOffset = offset + data.length;
-        if (newOffset > info.getEntityLength()) {
-            newOffset = info.getEntityLength();
-        }
-        info.setOffset(newOffset);
-
-        // Latched so that re-patching a complete upload cannot replay the event.
-        if (newOffset == info.getEntityLength() && info.markCompletionFired()) {
-            uploadProgressService.finishUpload(id);
-            uploadCompletedEvent.fire(new TusUploadCompletedEvent(
-                    id, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));
-        }
-
-        return Uni.createFrom().item(newOffset);
-    }
-
-    private boolean validateChecksum(byte[] data, UploadInfo.ChecksumInfo checksumInfo) {
-        String algorithm = checksumInfo.getAlgorithm().toLowerCase();
-        String expectedValue = checksumInfo.getValue();
-
-        try {
-            String digestAlgorithm = switch (algorithm) {
-                case "sha1" -> "SHA-1";
-                case "md5" -> "MD5";
-                case "sha256" -> "SHA-256";
-                default -> throw new ChecksumMismatchException(
-                        "Unsupported checksum algorithm: " + algorithm);
-            };
-
-            MessageDigest digest = MessageDigest.getInstance(digestAlgorithm);
-            byte[] hash = digest.digest(data);
-            String computedValue = Base64.getEncoder().encodeToString(hash);
-
-            return computedValue.equals(expectedValue);
-
-        } catch (NoSuchAlgorithmException e) {
-            throw new ChecksumMismatchException("Checksum algorithm unavailable: " + algorithm);
-        }
-    }
-
-    @Override
-    public long writeInitialData(String id, byte[] data) {
-        if (data == null || data.length == 0) {
-            return 0;
-        }
-
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return -1;
-        }
-
-        byte[] existing = dataStore.getOrDefault(id, new byte[0]);
-        byte[] combined = new byte[existing.length + data.length];
-        System.arraycopy(existing, 0, combined, 0, existing.length);
-        System.arraycopy(data, 0, combined, existing.length, data.length);
-        dataStore.put(id, combined);
-
-        long newOffset = Math.min(data.length, info.getEntityLength());
-        info.setOffset(newOffset);
-        return newOffset;
-    }
-
-    @Override
-    public boolean isExpired(String id) {
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return true;
-        }
-        Instant expiresAt = info.getExpiresAt();
-        if (expiresAt == null) {
-            return false;
-        }
-        return Instant.now().isAfter(expiresAt);
-    }
-
-    @Override
-    public Optional<Instant> getExpiresAt(String id) {
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return Optional.empty();
-        }
-        return Optional.ofNullable(info.getExpiresAt());
-    }
-
-    @Override
     public List<String> cleanupExpiredUploads() {
-        List<String> expiredIds = new ArrayList<>();
         Instant now = Instant.now();
-
+        List<String> cleaned = new ArrayList<>();
         for (Map.Entry<String, UploadInfo> entry : uploads.entrySet()) {
-            UploadInfo info = entry.getValue();
-            Instant expiresAt = info.getExpiresAt();
-            if (expiresAt != null && now.isAfter(expiresAt)) {
-                expiredIds.add(entry.getKey());
+            Instant expiresAt = entry.getValue().getExpiresAt();
+            if (expiresAt != null && now.isAfter(expiresAt) && discardUpload(entry.getKey())) {
+                cleaned.add(entry.getKey());
             }
         }
-
-        for (String id : expiredIds) {
-            discardUpload(id);
-        }
-
-        return expiredIds;
+        return cleaned;
     }
 }

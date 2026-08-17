@@ -1,11 +1,14 @@
 package org.sitenetsoft.quarkus.tus.it;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.smallrye.mutiny.Multi;
+import io.vertx.core.buffer.Buffer;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
+import org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 import org.sitenetsoft.quarkus.tus.runtime.store.LocalFileUploadStore;
 
@@ -128,10 +131,11 @@ class TusEdgeCaseTest {
                 .statusCode(204);
 
         // Offset is now 4. Writing at 0 again must be refused, not silently applied.
-        assertThrows(Exception.class, () ->
-                        uploadStore.writeChunkAsync(uploadId, 0, "BB".getBytes(), java.util.Optional.empty())
+        assertThrows(OffsetMismatchException.class, () ->
+                        uploadStore.stageChunk(uploadId, 0,
+                                        Multi.createFrom().item(Buffer.buffer("BB")), 2)
                                 .await().atMost(java.time.Duration.ofSeconds(5)),
-                "Writing at a stale offset must fail");
+                "Staging at a stale offset must fail");
 
         assertEquals(4, uploadStore.findUploadInfo(uploadId).orElseThrow().getOffset(),
                 "Offset must be unchanged after the rejected write");
@@ -720,8 +724,12 @@ class TusEdgeCaseTest {
             String location = createUpload(data.length);
             String uploadId = extractId(location);
 
-            long offset = uploadStore.writeInitialData(uploadId, data);
-            assertEquals(data.length, offset, "Initial data should be written");
+            long staged = uploadStore.stageChunk(uploadId, 0,
+                            Multi.createFrom().item(Buffer.buffer(data)), data.length)
+                    .await().atMost(java.time.Duration.ofSeconds(5));
+            uploadStore.commitChunk(uploadId, 0, staged).await().atMost(java.time.Duration.ofSeconds(5));
+            assertEquals(data.length, staged, "Initial data should be written");
+            assertEquals(data.length, uploadStore.findUploadInfo(uploadId).orElseThrow().getOffset());
 
             // Verify file size matches offset
             Path uploadDir = Path.of(tusRuntimeConfig.store().local().uploadDir());

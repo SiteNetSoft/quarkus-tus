@@ -26,22 +26,14 @@ public class TusSseEventBridge {
     TusSseService sseService;
 
     void onChunk(@Observes TusChunkReceivedEvent event) {
-        // The completing chunk is handled by onCompleted instead. TusUploadCompletedEvent is fired
-        // by the store, earlier in the write pipeline than the resource fires this one, so emitting
-        // here as well would put progress after complete — and after the stream had been closed.
-        if (event.totalSize() >= 0 && event.newOffset() >= event.totalSize()) {
-            return;
-        }
         sseService.sendUploadEvent(event.uploadId(), "progress", String.format(
                 "{\"bytesUploaded\": %d, \"totalBytes\": %d, \"chunkSize\": %d}",
                 event.newOffset(), event.totalSize(), event.chunkSize()));
     }
 
+    // The resource fires the chunk event before the completion event, so by the time this runs
+    // the stream has already reached 100%; a zero-length upload completes with no chunk at all.
     void onCompleted(@Observes TusUploadCompletedEvent event) {
-        // Emit the final progress here so the stream always reaches 100% before it closes.
-        sseService.sendUploadEvent(event.uploadId(), "progress", String.format(
-                "{\"bytesUploaded\": %d, \"totalBytes\": %d, \"chunkSize\": %d}",
-                event.totalSize(), event.totalSize(), 0));
         sseService.sendUploadEvent(event.uploadId(), "complete", String.format(
                 "{\"bytesUploaded\": %d, \"totalBytes\": %d}",
                 event.totalSize(), event.totalSize()));
