@@ -10,6 +10,7 @@ dependencies {
     implementation 'io.quarkus:quarkus-vertx'
 
     testImplementation 'io.quarkus:quarkus-junit5'
+    testImplementation project(':tck')
     testImplementation 'io.rest-assured:rest-assured'
     testImplementation 'org.awaitility:awaitility:4.3.0'
     implementation 'io.quarkus:quarkus-elytron-security-properties-file'

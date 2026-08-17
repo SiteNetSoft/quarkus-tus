@@ -1,0 +1,16 @@
+plugins {
+    id 'java-library'
+}
+
+// The UploadStore contract test, published as org.sitenetsoft:quarkus-tus-tck so that third-party
+// stores can extend it from their own test module. Deliberately not a Quarkus extension module and
+// not a test-fixtures variant of runtime: Quarkus's test class loader only sees regular
+// dependencies, and a fixtures jar of the runtime project ends up on the parent loader, where its
+// view of UploadStore is a different class from the application's.
+dependencies {
+    implementation enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
+    api project(':runtime')
+    api 'org.junit.jupiter:junit-jupiter-api'
+    api 'io.smallrye.reactive:mutiny'
+    api 'io.vertx:vertx-core'
+}
