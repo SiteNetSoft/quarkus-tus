@@ -23,7 +23,7 @@ Add the extension to your Quarkus application:
 #### Gradle
 
 ```kotlin
-implementation("org.sitenetsoft:quarkus-tus:0.1.0")
+implementation("org.sitenetsoft:quarkus-tus:1.0.0")
 ```
 
 #### Maven
@@ -32,7 +32,7 @@ implementation("org.sitenetsoft:quarkus-tus:0.1.0")
 <dependency>
     <groupId>org.sitenetsoft</groupId>
     <artifactId>quarkus-tus</artifactId>
-    <version>0.1.0</version>
+    <version>1.0.0</version>
 </dependency>
 ```
 
@@ -114,6 +114,7 @@ Read the [full documentation](docs/modules/ROOT/pages/index.adoc) for detailed g
 
 | Extension Version | Quarkus Version | Java Version |
 |---|---|---|
+| 1.0.0 | 3.38.0 | 25 |
 | 0.1.0 | 3.38.0 | 25 |
 
 ### Stability
