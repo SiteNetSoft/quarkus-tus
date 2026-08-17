@@ -74,6 +74,15 @@ public interface TusRuntimeConfig {
     long staleUploadHours();
 
     /**
+     * Seconds after which an upload lock that has seen no activity is considered abandoned and
+     * may be reclaimed. A lock is refreshed as long as bytes are flowing, so this only bounds a
+     * holder that died or stalled — set it above the longest pause a healthy client may make
+     * mid-chunk. Applies to the bundled local file store.
+     */
+    @WithDefault("30")
+    long lockTimeoutSeconds();
+
+    /**
      * Maximum number of partial uploads a single {@code Upload-Concat: final} request may
      * reference. Bounds how much copying one request can schedule; without it the only ceiling
      * is the HTTP header size limit, which is not a deliberate bound.

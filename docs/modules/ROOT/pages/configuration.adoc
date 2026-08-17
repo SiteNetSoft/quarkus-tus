@@ -83,6 +83,11 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `10485760` (10 MB)
 | Maximum chunk size per PATCH request in bytes. Enforced on both PATCH uploads and creation-with-upload POST requests. Requests exceeding this limit receive a 413 response.
 
+| `quarkus.tus.lock-timeout-seconds`
+| `long`
+| `30`
+| Seconds of inactivity after which an upload's lock is considered abandoned and may be reclaimed. The lock is held for the whole of a chunk transfer and refreshed as bytes arrive, so this only bounds a holder that died or stalled; set it above the longest pause a healthy client may make mid-chunk. Applies to the bundled local file store.
+
 | `quarkus.tus.max-concat-parts`
 | `int`
 | `1000`
