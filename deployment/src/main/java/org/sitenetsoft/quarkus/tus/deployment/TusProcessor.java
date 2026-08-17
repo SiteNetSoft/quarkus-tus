@@ -63,7 +63,6 @@ class TusProcessor {
     ReflectiveClassBuildItem reflectiveClasses() {
         return ReflectiveClassBuildItem.builder(
                 UploadInfo.class,
-                UploadInfo.ChecksumInfo.class,
                 UploadProgress.class,
                 TusUploadCreatedEvent.class,
                 TusChunkReceivedEvent.class,

@@ -31,6 +31,7 @@ public class UploadExpirationScheduler {
     public void cleanupExpiredUploads() {
         LOG.debug("Running scheduled cleanup of expired uploads");
         List<String> cleaned = uploadStore.cleanupExpiredUploads();
+        cleaned.forEach(uploadProgressService::finishUpload);
         if (!cleaned.isEmpty()) {
             LOG.infof("Scheduled cleanup removed %d expired uploads", cleaned.size());
         }
@@ -56,6 +57,7 @@ public class UploadExpirationScheduler {
         long staleHours = tusRuntimeConfig.staleUploadHours();
         if (staleHours > 0) {
             List<String> cleaned = uploadStore.cleanupStaleUploads(staleHours);
+            cleaned.forEach(uploadProgressService::finishUpload);
             if (!cleaned.isEmpty()) {
                 LOG.infof("Scheduled cleanup removed %d stale uploads", cleaned.size());
             }

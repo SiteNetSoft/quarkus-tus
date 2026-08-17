@@ -1,38 +1,34 @@
 package org.sitenetsoft.quarkus.tus.runtime.store;
 
+import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.file.OpenOptions;
 import io.vertx.mutiny.core.Vertx;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.event.Event;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
-import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
-import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
-import org.sitenetsoft.quarkus.tus.runtime.event.TusUploadCompletedEvent;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
-import org.sitenetsoft.quarkus.tus.runtime.spi.ChecksumMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException;
+import org.sitenetsoft.quarkus.tus.runtime.spi.UploadNotFoundException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
+import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStoreException;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.channels.FileChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class LocalFileUploadStore implements UploadStore {
@@ -53,16 +49,7 @@ public class LocalFileUploadStore implements UploadStore {
     Vertx vertx;
 
     @Inject
-    UploadProgressService uploadProgressService;
-
-    @Inject
     TusRuntimeConfig tusRuntimeConfig;
-
-    @Inject
-    TusBuildTimeConfig tusBuildTimeConfig;
-
-    @Inject
-    Event<TusUploadCompletedEvent> uploadCompletedEvent;
 
     @PostConstruct
     void init() {
@@ -196,403 +183,140 @@ public class LocalFileUploadStore implements UploadStore {
     }
 
     @Override
-    public Optional<String> createUpload(Long totalLength, Optional<String> uploadMetadata, boolean isPartial) {
-        if (totalLength == null || totalLength < 0) {
-            return Optional.empty();
-        }
-
+    public String createUpload(UploadInfo info) {
         String id = UUID.randomUUID().toString();
-
-        UploadInfo info = new UploadInfo();
-        info.setEntityLength(totalLength);
-        info.setOffset(0L);
-        info.setPartial(isPartial);
-        info.setLastActivity(Instant.now());
-        uploadMetadata.ifPresent(info::setMetadata);
-
-        Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
-        info.setExpiresAt(expiresAt);
-
-        uploads.put(id, info);
-        uploadProgressService.startUpload(id, totalLength);
-
         Path file = safePath(id);
         try {
             if (!Files.exists(file)) {
                 Files.createFile(file);
             }
         } catch (IOException e) {
-            LOG.errorf(e, "Failed to create upload file for %s", id);
-            uploads.remove(id);
-            uploadProgressService.finishUpload(id);
-            return Optional.empty();
+            throw new UploadStoreException("Failed to create upload file for " + id, e);
         }
-
+        uploads.put(id, info);
         persistMetadata(id, info);
-        return Optional.of(tusBuildTimeConfig.path() + "/" + id);
+        return id;
     }
 
     @Override
-    public void setUploaderId(String id, String uploaderId) {
-        UploadInfo info = uploads.get(id);
-        if (info != null) {
-            info.setUploaderId(uploaderId);
+    public void updateUploadInfo(String id, UploadInfo info) {
+        if (uploads.containsKey(id)) {
+            uploads.put(id, info);
             persistMetadata(id, info);
         }
     }
 
     @Override
-    public String getUploaderId(String id) {
-        UploadInfo info = uploads.get(id);
-        return info != null ? info.getUploaderId() : null;
-    }
-
-    @Override
-    public Optional<String> createUploadDeferred(Optional<String> uploadMetadata, boolean isPartial) {
-        String id = UUID.randomUUID().toString();
-
-        UploadInfo info = new UploadInfo();
-        info.setEntityLength(-1);
-        info.setOffset(0L);
-        info.setPartial(isPartial);
-        info.setDeferredLength(true);
-        info.setLastActivity(Instant.now());
-        uploadMetadata.ifPresent(info::setMetadata);
-
-        Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
-        info.setExpiresAt(expiresAt);
-
-        uploads.put(id, info);
-
-        Path file = safePath(id);
-        try {
-            if (!Files.exists(file)) {
-                Files.createFile(file);
-            }
-        } catch (IOException e) {
-            LOG.errorf(e, "Failed to create upload file for deferred upload %s", id);
-            uploads.remove(id);
-            return Optional.empty();
-        }
-
-        persistMetadata(id, info);
-        LOG.infof("Created deferred-length upload %s", id);
-        return Optional.of(tusBuildTimeConfig.path() + "/" + id);
-    }
-
-    @Override
-    public boolean setDeferredLength(String id, long length) {
+    public Uni<Long> stageChunk(String id, long offset, Multi<Buffer> data, long expectedLength) {
         UploadInfo info = uploads.get(id);
         if (info == null) {
-            return false;
-        }
-        if (!info.isDeferredLength()) {
-            return false;
-        }
-        if (info.getEntityLength() >= 0) {
-            return false;
-        }
-        if (!checkServerSizeConstraint(length)) {
-            return false;
+            return Uni.createFrom().failure(new UploadNotFoundException(id));
         }
 
-        info.setEntityLength(length);
-        info.setDeferredLength(false);
-        uploadProgressService.startUpload(id, length);
-        persistMetadata(id, info);
-        LOG.infof("Set deferred length for upload %s to %d", id, length);
-        return true;
+        // The caller's offset is never trusted: writing at a stale one would overwrite bytes
+        // that were already stored and acknowledged. Callers holding the upload's lock have
+        // already validated this, so a mismatch here means the write raced past validation.
+        if (offset != info.getOffset()) {
+            return Uni.createFrom().failure(new OffsetMismatchException(
+                    "Write at offset " + offset + " but upload " + id
+                            + " is at offset " + info.getOffset(),
+                    info.getOffset()));
+        }
+
+        Path file = safePath(id);
+        OpenOptions openOptions = new OpenOptions().setWrite(true).setCreate(false);
+
+        return vertx.fileSystem()
+                .open(file.toString(), openOptions)
+                .flatMap(asyncFile -> {
+                    asyncFile.setWritePos(offset);
+                    return data
+                            .onItem().transformToUniAndConcatenate(buf ->
+                                    asyncFile.write(io.vertx.mutiny.core.buffer.Buffer.newInstance(buf))
+                                            .replaceWith((long) buf.length()))
+                            .collect().with(Collectors.summingLong(Long::longValue))
+                            .eventually(asyncFile::close);
+                })
+                .onFailure().invoke(e -> {
+                    LOG.errorf(e, "Error staging chunk for upload %s at %d — truncating to safe offset", id, offset);
+                    truncateToOffset(file, offset);
+                });
     }
 
     @Override
-    public boolean hasDeferredLength(String id) {
+    public Uni<Void> commitChunk(String id, long offset, long bytesStaged) {
         UploadInfo info = uploads.get(id);
-        return info != null && info.isDeferredLength() && info.getEntityLength() < 0;
+        if (info == null) {
+            return Uni.createFrom().failure(new UploadNotFoundException(id));
+        }
+        // Metadata persistence is blocking file I/O; keep it off the event loop.
+        return vertx.executeBlocking(Uni.createFrom().item(() -> {
+            // If the upload was discarded while this write was in flight, persisting
+            // would recreate a .meta for an upload whose data file is gone.
+            if (uploads.get(id) != info) {
+                LOG.warnf("Upload %s was discarded during a write; discarding its result", id);
+                return null;
+            }
+            info.setOffset(offset + bytesStaged);
+            info.setLastActivity(Instant.now());
+            persistMetadata(id, info);
+            return null;
+        }), false).replaceWithVoid();
     }
 
     @Override
-    public Optional<String> mergePartialUploadsWithOwnership(String[] ids,
-                                                              Optional<String> uploadMetadata,
-                                                              String requiredOwnerId,
-                                                              String uploadConcatHeader) {
-        if (ids == null || ids.length == 0) {
-            return Optional.empty();
-        }
-
-        LOG.infof("Merging %d partial uploads: %s (requiredOwner=%s)",
-                ids.length, String.join(", ", ids), requiredOwnerId);
-
-        // Acquire locks on all partials to prevent concurrent modification
-        List<String> lockedIds = new ArrayList<>();
-        for (String partialId : ids) {
-            if (acquireLock(partialId)) {
-                lockedIds.add(partialId);
-            } else {
-                // Release already-acquired locks
-                lockedIds.forEach(this::releaseLock);
-                LOG.warnf("Could not acquire lock on partial %s for merge", partialId);
-                return Optional.empty();
+    public Uni<Void> abortChunk(String id, long offset) {
+        return vertx.executeBlocking(Uni.createFrom().item(() -> {
+            Path file = safePath(id);
+            if (Files.exists(file)) {
+                truncateToOffset(file, offset);
             }
-        }
-
-        try {
-            return doMergeWithOwnership(ids, uploadMetadata, requiredOwnerId, uploadConcatHeader);
-        } finally {
-            lockedIds.forEach(this::releaseLock);
-        }
+            return null;
+        }), false).replaceWithVoid();
     }
 
-    private Optional<String> doMergeWithOwnership(String[] ids,
-                                                    Optional<String> uploadMetadata,
-                                                    String requiredOwnerId,
-                                                    String uploadConcatHeader) {
-        long totalLength = 0;
-        for (String partialId : ids) {
-            UploadInfo partialInfo = uploads.get(partialId);
-            if (partialInfo == null) {
-                LOG.warnf("Partial upload %s not found", partialId);
-                return Optional.empty();
-            }
-            if (!partialInfo.isPartial()) {
-                LOG.warnf("Upload %s is not marked as partial", partialId);
-                return Optional.empty();
-            }
-            if (partialInfo.getOffset() != partialInfo.getEntityLength()) {
-                LOG.warnf("Partial upload %s is not complete (offset=%d, length=%d)",
-                        partialId, partialInfo.getOffset(), partialInfo.getEntityLength());
-                return Optional.empty();
-            }
-            if (requiredOwnerId != null) {
-                String ownerId = partialInfo.getUploaderId();
-                if (ownerId != null && !ownerId.equals(requiredOwnerId)) {
-                    LOG.warnf("Ownership validation failed for partial %s: required=%s, actual=%s",
-                            partialId, requiredOwnerId, ownerId);
-                    return Optional.empty();
-                }
-            }
-            totalLength += partialInfo.getEntityLength();
+    @Override
+    public Uni<Void> concatenate(String finalId, List<String> sourceIds) {
+        UploadInfo finalInfo = uploads.get(finalId);
+        if (finalInfo == null) {
+            return Uni.createFrom().failure(new UploadNotFoundException(finalId));
         }
-
-        if (!checkServerSizeConstraint(totalLength)) {
-            return Optional.empty();
-        }
-
-        String finalId = UUID.randomUUID().toString();
         Path finalFile = safePath(finalId);
-
-        try {
-            try (var outputStream = Files.newOutputStream(finalFile,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.TRUNCATE_EXISTING)) {
-                for (String partialId : ids) {
-                    Path partialFile = safePath(partialId);
-                    if (Files.exists(partialFile)) {
-                        Files.copy(partialFile, outputStream);
-                    } else {
-                        Files.deleteIfExists(finalFile);
-                        return Optional.empty();
-                    }
-                }
+        List<Path> sources = new ArrayList<>();
+        for (String sourceId : sourceIds) {
+            Path source = safePath(sourceId);
+            if (!uploads.containsKey(sourceId) || !Files.exists(source)) {
+                return Uni.createFrom().failure(new UploadNotFoundException(sourceId));
             }
-
-            UploadInfo finalInfo = new UploadInfo();
-            finalInfo.setEntityLength(totalLength);
-            finalInfo.setOffset(totalLength);
-            finalInfo.setPartial(false);
-            finalInfo.setUploaderId(requiredOwnerId);
-            finalInfo.setLastActivity(Instant.now());
-            finalInfo.setExpiresAt(Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS));
-            uploadMetadata.ifPresent(finalInfo::setMetadata);
-
-            finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
-
-            uploads.put(finalId, finalInfo);
-            persistMetadata(finalId, finalInfo);
-
-            // The caller holds every partial's lock for the duration of the merge.
-            for (String partialId : ids) {
-                discardLockedUpload(partialId);
-            }
-
-            LOG.infof("Successfully merged %d partials into final upload %s (size=%d)",
-                    ids.length, finalId, totalLength);
-
-            return Optional.of(tusBuildTimeConfig.path() + "/" + finalId);
-
-        } catch (IOException e) {
-            LOG.errorf(e, "Failed to merge partial uploads into %s", finalId);
-            try {
-                Files.deleteIfExists(finalFile);
-            } catch (IOException cleanupEx) {
-                LOG.warnf(cleanupEx, "Failed to clean up partial merge file: %s", finalFile);
-            }
-            return Optional.empty();
-        }
-    }
-
-    @Override
-    public Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata,
-                                                          String requiredOwnerId, String uploadConcatHeader) {
-        if (ids == null || ids.length == 0) {
-            return Optional.empty();
+            sources.add(source);
         }
 
-        long totalLength = 0;
-        List<String> partialIdList = new ArrayList<>();
-        for (String partialId : ids) {
-            UploadInfo partialInfo = uploads.get(partialId);
-            if (partialInfo == null || !partialInfo.isPartial()) {
-                return Optional.empty();
-            }
-            if (partialInfo.getEntityLength() < 0) {
-                return Optional.empty();
-            }
-            if (requiredOwnerId != null) {
-                String ownerId = partialInfo.getUploaderId();
-                if (ownerId != null && !ownerId.equals(requiredOwnerId)) {
-                    LOG.warnf("Ownership validation failed for partial %s: required=%s, actual=%s",
-                            partialId, requiredOwnerId, ownerId);
-                    return Optional.empty();
-                }
-            }
-            totalLength += partialInfo.getEntityLength();
-            partialIdList.add(partialId);
-        }
+        OpenOptions writeOptions = new OpenOptions().setWrite(true).setCreate(true).setTruncateExisting(true);
+        OpenOptions readOptions = new OpenOptions().setRead(true).setWrite(false).setCreate(false);
 
-        if (!checkServerSizeConstraint(totalLength)) {
-            return Optional.empty();
-        }
-
-        String finalId = UUID.randomUUID().toString();
-
-        UploadInfo finalInfo = new UploadInfo();
-        finalInfo.setEntityLength(totalLength);
-        finalInfo.setOffset(0);
-        finalInfo.setPartial(false);
-        finalInfo.setFinalConcat(true);
-        finalInfo.setPartialIds(partialIdList);
-        finalInfo.setUploaderId(requiredOwnerId);
-        finalInfo.setLastActivity(Instant.now());
-        uploadMetadata.ifPresent(finalInfo::setMetadata);
-
-        Instant expiresAt = Instant.now().plus(tusRuntimeConfig.expirationHours(), ChronoUnit.HOURS);
-        finalInfo.setExpiresAt(expiresAt);
-
-        finalInfo.setUploadConcatMergedValue(concatValueFor(ids, uploadConcatHeader));
-
-        uploads.put(finalId, finalInfo);
-
-        Path finalFile = safePath(finalId);
-        try {
-            if (!Files.exists(finalFile)) {
-                Files.createFile(finalFile);
-            }
-        } catch (IOException e) {
-            LOG.errorf(e, "Failed to create placeholder file for unfinished concat %s", finalId);
-            uploads.remove(finalId);
-            return Optional.empty();
-        }
-
-        persistMetadata(finalId, finalInfo);
-        return Optional.of(tusBuildTimeConfig.path() + "/" + finalId);
-    }
-
-    /**
-     * The protocol requires HEAD on a final upload to return {@code Upload-Concat} exactly as
-     * the client sent it, so the raw header wins. Rebuilding from the parsed IDs is only a
-     * fallback for callers that reach the SPI without one.
-     */
-    private String concatValueFor(String[] ids, String uploadConcatHeader) {
-        if (uploadConcatHeader != null && !uploadConcatHeader.isBlank()) {
-            return uploadConcatHeader;
-        }
-        StringBuilder concatValue = new StringBuilder("final;");
-        for (int i = 0; i < ids.length; i++) {
-            if (i > 0) concatValue.append(" ");
-            concatValue.append(tusBuildTimeConfig.path()).append("/").append(ids[i]);
-        }
-        return concatValue.toString();
-    }
-
-    @Override
-    public boolean isConcatReady(String id) {
-        UploadInfo info = uploads.get(id);
-        if (info == null || !info.isFinalConcat()) {
-            return false;
-        }
-        return info.areAllPartialsComplete(uploads::get);
-    }
-
-    @Override
-    public boolean finalizeConcatenation(String id) {
-        UploadInfo info = uploads.get(id);
-        if (info == null || !info.isFinalConcat()) {
-            return false;
-        }
-        if (!info.areAllPartialsComplete(uploads::get)) {
-            return false;
-        }
-
-        List<String> partialIds = info.getPartialIds();
-        if (partialIds == null || partialIds.isEmpty()) {
-            return false;
-        }
-
-        // Acquire locks on all partials to prevent concurrent modification
-        List<String> lockedIds = new ArrayList<>();
-        for (String partialId : partialIds) {
-            if (acquireLock(partialId)) {
-                lockedIds.add(partialId);
-            } else {
-                lockedIds.forEach(this::releaseLock);
-                LOG.warnf("Could not acquire lock on partial %s for finalization", partialId);
-                return false;
-            }
-        }
-
-        try {
-            Path finalFile = safePath(id);
-
-            try {
-                try (var outputStream = Files.newOutputStream(finalFile,
-                        StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING)) {
-                    for (String partialId : partialIds) {
-                        Path partialFile = safePath(partialId);
-                        if (Files.exists(partialFile)) {
-                            Files.copy(partialFile, outputStream);
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-
-                info.setOffset(info.getEntityLength());
-                info.setFinalConcat(false);
-
-                // The caller holds every partial's lock for the duration of the finalization.
-                for (String partialId : partialIds) {
-                    discardLockedUpload(partialId);
-                }
-                info.setPartialIds(null);
-                persistMetadata(id, info);
-
-                return true;
-
-            } catch (IOException e) {
-                LOG.errorf(e, "Failed to finalize concatenation %s — truncating partial merge", id);
-                truncateToOffset(finalFile, 0);
-                return false;
-            }
-        } finally {
-            lockedIds.forEach(this::releaseLock);
-        }
-    }
-
-    @Override
-    public boolean checkServerSizeConstraint(Long totalLength) {
-        if (totalLength == null) return false;
-        return totalLength <= tusRuntimeConfig.maxSize();
+        return vertx.fileSystem().open(finalFile.toString(), writeOptions)
+                .flatMap(out -> Multi.createFrom().iterable(sources)
+                        .onItem().transformToUniAndConcatenate(source ->
+                                vertx.fileSystem().open(source.toString(), readOptions)
+                                        .flatMap(in -> in.pipe().endOnComplete(false).endOnFailure(false).to(out)
+                                                .eventually(in::close)))
+                        .collect().last()
+                        .eventually(out::close))
+                .flatMap(v -> vertx.executeBlocking(Uni.createFrom().item(() -> {
+                    finalInfo.setOffset(finalInfo.getEntityLength());
+                    finalInfo.setFinalConcat(false);
+                    finalInfo.setPartialIds(null);
+                    finalInfo.setLastActivity(Instant.now());
+                    persistMetadata(finalId, finalInfo);
+                    return null;
+                }), false))
+                .replaceWithVoid()
+                .onFailure().transform(e -> {
+                    LOG.errorf(e, "Failed to concatenate into %s — truncating partial merge", finalId);
+                    truncateToOffset(finalFile, 0);
+                    return e instanceof UploadStoreException ? e
+                            : new UploadStoreException("Failed to concatenate into " + finalId, e);
+                });
     }
 
     /**
@@ -600,9 +324,8 @@ public class LocalFileUploadStore implements UploadStore {
      * <p>
      * This used to delete the data file and drop the lock unconditionally, so a DELETE or a
      * cleanup job landing mid-write unlinked the file underneath an in-flight write — which
-     * then reported success for bytes that were no longer stored anywhere. Callers that
-     * already hold the lock must use {@link #discardLockedUpload} instead; acquisition is not
-     * reentrant.
+     * then reported success for bytes that were no longer stored anywhere. Acquisition is not
+     * reentrant, so a caller that already holds the lock cannot discard through this method.
      *
      * @return true if an upload was removed; false if it did not exist or is locked
      */
@@ -619,10 +342,8 @@ public class LocalFileUploadStore implements UploadStore {
         }
     }
 
-    /** Discards an upload whose lock the calling thread already holds. */
     private boolean discardLockedUpload(String id) {
         UploadInfo removed = uploads.remove(id);
-        uploadProgressService.finishUpload(id);
 
         Path file = safePath(id);
         try {
@@ -669,172 +390,6 @@ public class LocalFileUploadStore implements UploadStore {
         });
     }
 
-    @Override
-    public boolean validateOffset(String id, long clientOffset) {
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return false;
-        }
-        return info.getOffset() == clientOffset;
-    }
-
-    @Override
-    public Uni<Long> writeChunkAsync(String id, long offset, byte[] chunk,
-                                      Optional<UploadInfo.ChecksumInfo> checksum) {
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return Uni.createFrom().item(-1L);
-        }
-
-        // The caller's offset is never trusted: writing at a stale one would overwrite bytes
-        // that were already stored and acknowledged. Callers holding the upload's lock have
-        // already validated this, so a mismatch here means the write raced past validation.
-        if (offset != info.getOffset()) {
-            return Uni.createFrom().failure(new OffsetMismatchException(
-                    "Write at offset " + offset + " but upload " + id
-                            + " is at offset " + info.getOffset(),
-                    info.getOffset()));
-        }
-
-        Path file = safePath(id);
-        byte[] data = (chunk != null) ? chunk : new byte[0];
-
-        if (checksum.isPresent() && data.length > 0) {
-            UploadInfo.ChecksumInfo checksumInfo = checksum.get();
-            try {
-                if (!validateChecksum(data, checksumInfo)) {
-                    return Uni.createFrom().failure(new ChecksumMismatchException("Checksum validation failed"));
-                }
-            } catch (ChecksumMismatchException e) {
-                return Uni.createFrom().failure(e);
-            }
-        }
-
-        OpenOptions openOptions = new OpenOptions()
-                .setWrite(true)
-                .setCreate(false);
-
-        return vertx.fileSystem()
-                .open(file.toString(), openOptions)
-                .flatMap(asyncFile ->
-                        asyncFile.write(
-                                io.vertx.mutiny.core.buffer.Buffer.buffer(data),
-                                offset
-                        ).onItem().transform(v -> {
-                            long newOffset = offset + data.length;
-                            if (newOffset > info.getEntityLength()) {
-                                newOffset = info.getEntityLength();
-                            }
-                            return newOffset;
-                        }).eventually(asyncFile::close)
-                )
-                .onItem().invoke(newOffset -> {
-                    // If the upload was discarded while this write was in flight, persisting
-                    // would recreate a .meta for an upload whose data file is gone.
-                    if (uploads.get(id) != info) {
-                        LOG.warnf("Upload %s was discarded during a write; discarding its result", id);
-                        return;
-                    }
-                    info.setOffset(newOffset);
-                    info.setLastActivity(Instant.now());
-                    persistMetadata(id, info);
-                })
-                .emitOn(Infrastructure.getDefaultWorkerPool())
-                .onItem().invoke(newOffset -> {
-                    if (uploads.get(id) == info
-                            && newOffset == info.getEntityLength()
-                            && info.markCompletionFired()) {
-                        uploadProgressService.finishUpload(id);
-                        uploadCompletedEvent.fire(new TusUploadCompletedEvent(
-                                id, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));
-                        persistMetadata(id, info);
-                    }
-                })
-                .onFailure().invoke(e -> {
-                    LOG.errorf(e, "Error writing upload %s to %s — truncating to safe offset %d", id, file, offset);
-                    truncateToOffset(file, offset);
-                });
-    }
-
-    private boolean validateChecksum(byte[] data, UploadInfo.ChecksumInfo checksumInfo) {
-        String algorithm = checksumInfo.getAlgorithm().toLowerCase();
-        String expectedValue = checksumInfo.getValue();
-
-        try {
-            String digestAlgorithm = switch (algorithm) {
-                case "sha1" -> "SHA-1";
-                case "md5" -> "MD5";
-                case "sha256" -> "SHA-256";
-                default -> throw new ChecksumMismatchException("Unsupported checksum algorithm: " + algorithm);
-            };
-
-            MessageDigest digest = MessageDigest.getInstance(digestAlgorithm);
-            byte[] hash = digest.digest(data);
-            String computedValue = Base64.getEncoder().encodeToString(hash);
-
-            return computedValue.equals(expectedValue);
-
-        } catch (NoSuchAlgorithmException e) {
-            throw new ChecksumMismatchException("Checksum algorithm unavailable: " + algorithm);
-        }
-    }
-
-    @Override
-    public long writeInitialData(String id, byte[] data) {
-        if (data == null || data.length == 0) {
-            return 0;
-        }
-
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return -1;
-        }
-
-        // Never store more than the declared length: clamping only the recorded offset
-        // would leave trailing bytes on disk and report the upload as complete.
-        if (info.getEntityLength() >= 0 && data.length > info.getEntityLength()) {
-            LOG.warnf("Initial data for upload %s exceeds declared length (%d > %d)",
-                    id, data.length, info.getEntityLength());
-            return -1;
-        }
-
-        Path file = safePath(id);
-
-        try (OutputStream out = Files.newOutputStream(file, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
-            out.write(data);
-            long newOffset = data.length;
-            info.setOffset(newOffset);
-            info.setLastActivity(Instant.now());
-            persistMetadata(id, info);
-            return newOffset;
-        } catch (IOException e) {
-            LOG.errorf(e, "Failed to write initial data for upload %s — truncating to 0", id);
-            truncateToOffset(file, 0);
-            return -1;
-        }
-    }
-
-    @Override
-    public boolean isExpired(String id) {
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return true;
-        }
-        Instant expiresAt = info.getExpiresAt();
-        if (expiresAt == null) {
-            return false;
-        }
-        return Instant.now().isAfter(expiresAt);
-    }
-
-    @Override
-    public Optional<Instant> getExpiresAt(String id) {
-        UploadInfo info = uploads.get(id);
-        if (info == null) {
-            return Optional.empty();
-        }
-        return Optional.ofNullable(info.getExpiresAt());
-    }
 
     private void truncateToOffset(Path file, long safeOffset) {
         try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {

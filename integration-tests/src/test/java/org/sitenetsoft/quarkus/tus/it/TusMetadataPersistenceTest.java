@@ -36,7 +36,6 @@ class TusMetadataPersistenceTest {
         info.setFinalConcat(false);
         info.setPartialIds(List.of("id-1", "id-2"));
         info.setUploaderId("user42");
-        info.setCompletionFired(true);
 
         String json = info.toJson();
         UploadInfo restored = UploadInfo.fromJson(json);
@@ -51,20 +50,17 @@ class TusMetadataPersistenceTest {
         assertEquals(info.isFinalConcat(), restored.isFinalConcat());
         assertEquals(info.getPartialIds(), restored.getPartialIds());
         assertEquals(info.getUploaderId(), restored.getUploaderId());
-        // Persisted so a restart cannot grant a completed upload one more completion event.
-        assertTrue(restored.isCompletionFired());
-        assertFalse(restored.markCompletionFired(), "A restored latch must stay claimed");
     }
 
     @Test
-    void testCompletionLatchDefaultsToUnfiredForOlderMetadata() {
-        // Metadata written before the field existed must not suppress a genuine completion.
+    void testOlderMetadataWithRetiredFieldsStillLoads() {
+        // Metadata written by earlier versions carried a completion latch; it is ignored now.
         UploadInfo restored = UploadInfo.fromJson(
                 "{\"entityLength\":10,\"offset\":0,\"isPartial\":false,"
-                        + "\"deferredLength\":false,\"isFinalConcat\":false}");
+                        + "\"deferredLength\":false,\"isFinalConcat\":false,\"completionFired\":true}");
 
-        assertFalse(restored.isCompletionFired());
-        assertTrue(restored.markCompletionFired(), "First claim on older metadata must succeed");
+        assertEquals(10, restored.getEntityLength());
+        assertEquals(0, restored.getOffset());
     }
 
     // ---- .meta file created on upload creation ----
