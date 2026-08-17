@@ -8,6 +8,7 @@ import jakarta.inject.Singleton;
 import jakarta.enterprise.inject.Alternative;
 import org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadNotFoundException;
+import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStoreException;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -25,6 +26,8 @@ public class FaultyUploadStore extends InMemoryUploadStore {
     public final AtomicBoolean throwSyncFromStage = new AtomicBoolean();
     /** When >= 0, {@link #stageChunk} fails with {@link OffsetMismatchException} claiming this offset. */
     public final AtomicInteger reportStaleOffsetAs = new AtomicInteger(-1);
+    /** When set, a failure of the body stream is wrapped in {@code UploadStoreException}, as an SDK might. */
+    public final AtomicBoolean wrapStreamFailures = new AtomicBoolean();
 
     public final AtomicInteger abortCalls = new AtomicInteger();
     public final AtomicBoolean appendRanOnEventLoop = new AtomicBoolean();
@@ -33,6 +36,7 @@ public class FaultyUploadStore extends InMemoryUploadStore {
     public void reset() {
         throwSyncFromStage.set(false);
         reportStaleOffsetAs.set(-1);
+        wrapStreamFailures.set(false);
         abortCalls.set(0);
         appendRanOnEventLoop.set(false);
     }
@@ -50,6 +54,9 @@ public class FaultyUploadStore extends InMemoryUploadStore {
         int stale = reportStaleOffsetAs.get();
         if (stale >= 0) {
             return Uni.createFrom().failure(new OffsetMismatchException("stale offset", stale));
+        }
+        if (wrapStreamFailures.get()) {
+            data = data.onFailure().transform(e -> new UploadStoreException("sdk wrapped: " + e, e));
         }
         return super.stageChunk(id, offset, data, expectedLength);
     }

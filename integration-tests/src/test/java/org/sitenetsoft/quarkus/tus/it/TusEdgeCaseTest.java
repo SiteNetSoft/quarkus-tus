@@ -7,6 +7,7 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
+import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
@@ -41,6 +42,9 @@ class TusEdgeCaseTest {
 
     @Inject
     UploadProgressService uploadProgressService;
+
+    @Inject
+    io.vertx.mutiny.core.Vertx vertx;
 
     @Inject
     TusRuntimeConfig tusRuntimeConfig;
@@ -281,11 +285,10 @@ class TusEdgeCaseTest {
     }
 
     @Test
-    void testDiscardUploadRefusesWhileLockedAndKeepsData() throws Exception {
+    void testDeleteWhileLockedKeepsData() throws Exception {
         byte[] data = "keep me".getBytes();
         String location = createUpload(data.length);
         String uploadId = extractId(location);
-
         given()
                 .header("Tus-Resumable", "1.0.0")
                 .header("Upload-Offset", "0")
@@ -299,18 +302,105 @@ class TusEdgeCaseTest {
 
         assertTrue(uploadStore.acquireLock(uploadId), "Test needs to hold the lock");
         try {
-            assertFalse(uploadStore.discardUpload(uploadId),
-                    "discardUpload must refuse while the upload is locked");
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().delete(location)
+                    .then()
+                    .statusCode(423);
             assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(),
-                    "Upload entry must survive a refused discard");
-            assertTrue(Files.exists(dataFile), "Data file must survive a refused discard");
+                    "Upload entry must survive a refused delete");
+            assertTrue(Files.exists(dataFile), "Data file must survive a refused delete");
             assertArrayEquals(data, Files.readAllBytes(dataFile), "Data must be intact");
         } finally {
             uploadStore.releaseLock(uploadId);
         }
 
-        assertTrue(uploadStore.discardUpload(uploadId), "Discard must succeed once unlocked");
-        assertFalse(Files.exists(dataFile), "Data file must be gone after a successful discard");
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .when().delete(location)
+                .then()
+                .statusCode(204);
+        assertFalse(Files.exists(dataFile), "Data file must be gone after a successful delete");
+    }
+
+    // ---- Creation-with-upload over HTTP/2 ----
+
+    /**
+     * Over HTTP/2 there is no Transfer-Encoding header: a streamed body without a content
+     * length is just DATA frames. Deciding "has a body" from Content-Length or a literal
+     * "chunked" would treat it as no body and silently drop the bytes.
+     */
+    @Test
+    void testCreationWithUploadOverHttp2WithoutContentLength() throws Exception {
+        byte[] data = "h2 first chunk".getBytes();
+        byte[] more = "h2 second chunk".getBytes();
+        io.vertx.mutiny.core.http.HttpClient client = vertx.createHttpClient(new io.vertx.core.http.HttpClientOptions()
+                .setProtocolVersion(io.vertx.core.http.HttpVersion.HTTP_2)
+                .setHttp2ClearTextUpgrade(false));
+        try {
+            io.vertx.mutiny.core.http.HttpClientResponse response = client
+                    .request(io.vertx.core.http.HttpMethod.POST, io.restassured.RestAssured.port, "localhost", "/tus")
+                    .flatMap(req -> {
+                        req.putHeader("Tus-Resumable", "1.0.0");
+                        req.putHeader("Upload-Length", String.valueOf(data.length + more.length));
+                        req.putHeader("Content-Type", "application/offset+octet-stream");
+                        req.setChunked(true); // no Content-Length; over h2 this is just DATA frames
+                        return req.write(io.vertx.mutiny.core.buffer.Buffer.buffer(data))
+                                .chain(() -> req.end())
+                                .chain(() -> req.response());
+                    })
+                    .await().atMost(java.time.Duration.ofSeconds(10));
+            assertEquals(io.vertx.core.http.HttpVersion.HTTP_2, response.version(), "the test needs an h2c connection");
+            assertEquals(201, response.statusCode());
+            assertEquals(String.valueOf(data.length), response.getHeader("Upload-Offset"),
+                    "the body sent with the creation must have been stored");
+
+            // And a length-less PATCH over the same h2 connection.
+            String location = response.getHeader("Location");
+            io.vertx.mutiny.core.http.HttpClientResponse patched = client
+                    .request(io.vertx.core.http.HttpMethod.PATCH, io.restassured.RestAssured.port, "localhost", location)
+                    .flatMap(req -> {
+                        req.putHeader("Tus-Resumable", "1.0.0");
+                        req.putHeader("Upload-Offset", String.valueOf(data.length));
+                        req.putHeader("Content-Type", "application/offset+octet-stream");
+                        req.setChunked(true);
+                        return req.write(io.vertx.mutiny.core.buffer.Buffer.buffer(more))
+                                .chain(() -> req.end())
+                                .chain(() -> req.response());
+                    })
+                    .await().atMost(java.time.Duration.ofSeconds(10));
+            assertEquals(204, patched.statusCode());
+            assertEquals(String.valueOf(data.length + more.length), patched.getHeader("Upload-Offset"));
+        } finally {
+            client.closeAndAwait();
+        }
+    }
+
+    // ---- Every discard clears the progress entry ----
+
+    /**
+     * Progress bookkeeping is the framework's, not the store's, so every path that discards an
+     * upload has to clear it — the expiry discards in HEAD and PATCH used to leave the entry to
+     * the two-hour TTL.
+     */
+    @Test
+    void testExpiryDiscardOnHeadClearsProgress() {
+        String location = createUpload(100);
+        String uploadId = extractId(location);
+        assertNotNull(uploadProgressService.getProgress(uploadId), "creation starts progress tracking");
+
+        UploadInfo info = uploadStore.findUploadInfo(uploadId).orElseThrow();
+        info.setExpiresAt(Instant.now().minusSeconds(1));
+        uploadStore.updateUploadInfo(uploadId, info);
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .when().head(location)
+                .then()
+                .statusCode(410);
+
+        assertTrue(uploadStore.findUploadInfo(uploadId).isEmpty(), "expired upload is discarded");
+        assertNull(uploadProgressService.getProgress(uploadId), "progress entry must go with it");
     }
 
     // ---- Concurrent PATCH on same upload ----

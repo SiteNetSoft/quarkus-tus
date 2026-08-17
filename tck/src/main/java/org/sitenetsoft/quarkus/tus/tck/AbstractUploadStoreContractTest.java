@@ -385,17 +385,24 @@ public abstract class AbstractUploadStoreContractTest {
         assertFalse(store().discardUpload(UUID.randomUUID().toString()));
     }
 
+    /**
+     * The framework holds the upload's lock when it discards — DELETE takes it, and a finished
+     * concatenation discards its partials under the locks it already holds — so the store must
+     * delete under a held lock rather than refuse. Whether anyone else may be writing is the
+     * framework's problem, and it has already answered it by holding the lock.
+     */
     @Test
-    public void discardRefusesWhileLocked() {
+    public void discardWhileTheCallerHoldsTheLockRemovesTheUpload() {
         String id = create(3);
+        write(id, 0, "abc");
         assertTrue(store().acquireLock(id));
         try {
-            assertFalse(store().discardUpload(id), "must not delete underneath a lock holder");
-            assertTrue(store().findUploadInfo(id).isPresent());
+            assertTrue(store().discardUpload(id), "discard under the caller's own lock must succeed");
+            assertTrue(store().findUploadInfo(id).isEmpty());
+            assertTrue(readBytes(id).isEmpty() || readBytes(id).get().length == 0, "bytes must be gone");
         } finally {
             store().releaseLock(id);
         }
-        assertTrue(store().discardUpload(id));
     }
 
     @Test

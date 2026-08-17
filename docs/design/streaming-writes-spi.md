@@ -40,6 +40,19 @@ written for the buffered world assumed the old timing:
   serves POST and PATCH, and a failed creation-with-upload discards its upload. The TCK now rejects
   synchronous throws and has a failing-stream case; `BufferingUploadStore` runs `appendBytes` on a
   worker. `TusFaultyStoreTest` is the misbehaving-store harness for all of this.
+- The chunk-size and entity-length limits are decided by the framework from what `ChunkStream`
+  counted, not from the store handing `ChunkLimitExceededException` back in its original type — a
+  store (or its SDK) that wraps stream failures used to turn 413/409 into 500.
+- `discardUpload` changed contract: the framework holds the lock when it calls it (`DELETE` takes
+  the lock; a finished concatenation discards its partials under the locks it already holds, closing
+  the gap in which a second final could slip in), and the store no longer takes or checks it. Every
+  discard path in the resource goes through one helper that also clears the progress entry.
+- Over HTTP/2 a length-less creation-with-upload body is just DATA frames, so it is recognised by
+  its content type rather than a `Transfer-Encoding` header — and that test surfaced that Vert.x's
+  `AsyncFile` is bound to the context that opened it, which the HTTP/2 stream context is not; the
+  local store now hops each write onto the file's context.
+- The progress stream synthesises the event from the offset when the in-memory entry is gone (a
+  restart), and a zero-length PATCH reports where the upload stands.
 
 ## The problem is not really `byte[]`
 

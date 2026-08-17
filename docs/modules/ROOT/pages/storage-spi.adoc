@@ -67,7 +67,7 @@ The framework holds the upload's lock around the whole sequence, computes the di
 | drop the part
 |===
 
-`expectedLength` is the declared chunk length, or `-1` when the request used chunked transfer encoding and there is none. The framework never stages a zero-length chunk.
+`expectedLength` is the declared chunk length, or `-1` when there is none (chunked transfer encoding, or a length-less HTTP/2 body). The framework never stages a chunk it knows to be empty; a length-less body that turns out to be empty is staged as zero bytes and then aborted, not committed.
 
 === Contract in brief
 
@@ -75,7 +75,7 @@ The framework holds the upload's lock around the whole sequence, computes the di
 * Anything asked about an unknown id: `findUploadInfo` returns empty, `updateUploadInfo` is a no-op, `stageChunk`/`concatenate` fail with `UploadNotFoundException`, `discardUpload` returns `false`.
 * `abortChunk` is idempotent and safe to call when nothing was staged or when staging itself failed.
 * `concatenate(finalId, sourceIds)` fills a final upload the framework already created with `isFinalConcat=true` and `partialIds`; on success set its offset to its length, clear `isFinalConcat` and `partialIds`, persist. Leave the sources alone -- the framework discards them.
-* `discardUpload` must refuse (return `false`) while another caller holds the lock, rather than delete underneath an in-flight write.
+* `discardUpload` just deletes: the framework holds the upload's lock whenever it calls it (DELETE takes the lock; a finished concatenation discards its partials under the locks it already holds), so the store neither takes nor checks the lock there. Your own cleanup (`cleanupExpiredUploads` and the hooks) must take the lock before deleting, so that it never removes an upload underneath an in-flight write.
 * A failure of `stageChunk` -- unknown id, stale offset, or a failure that came down the body stream (client gone, limit crossed) -- is a failure of the returned `Uni`, propagated as-is; never a synchronous throw, never wrapped. The framework decides the response from the failure's type. After the framework's `abortChunk`, the upload is exactly as it was.
 * The lock is held for the whole of `stageChunk`, i.e. for as long as the client takes to send the chunk. A store that expires abandoned locks must treat a lock as live while bytes are flowing (the bundled store refreshes it on every buffer) and give it a timeout longer than any pause a healthy client may make mid-chunk -- see `quarkus.tus.lock-timeout-seconds`.
 * The `Uni`/`Multi` methods are subscribed to on a Vert.x event loop: do not block in them. (`BufferingUploadStore` runs your `appendBytes` on a worker thread for exactly this reason.)
@@ -108,7 +108,7 @@ public class MyStore extends BufferingUploadStore {
     @Override protected void appendBytes(String id, long offset, byte[] data) { /* append to your storage */ }
     @Override public Uni<Void> concatenate(String finalId, List<String> sourceIds) { /* join, then mark finalId complete */ }
 
-    @Override public boolean discardUpload(String id) { /* refuse if locked; else remove bytes + record */ }
+    @Override public boolean discardUpload(String id) { /* remove bytes + record; the caller holds the lock */ }
     @Override public boolean acquireLock(String id) { return locks.add(id); }
     @Override public void releaseLock(String id) { locks.remove(id); }
     @Override public List<String> cleanupExpiredUploads() { /* remove records whose expiresAt is past */ }
@@ -198,7 +198,7 @@ class MyStoreContractTest extends AbstractUploadStoreContractTest {
 }
 ----
 
-Twenty assertions run: record round-trips, stage-does-not-advance, commit-advances-exactly, abort-leaves-nothing, stale-offset rejection, unknown-id behaviour, multi-buffer and zero-length stages, concatenation, discard, lock exclusivity and expiry cleanup. Both bundled stores pass it, and a store that passes it will behave correctly under the extension.
+Twenty-one assertions run: record round-trips, stage-does-not-advance, commit-advances-exactly, abort-leaves-nothing, stale-offset rejection, unknown-id behaviour, multi-buffer, zero-length and failing-stream stages, concatenation, discard under the caller's lock, lock exclusivity and expiry cleanup. Both bundled stores pass it, and a store that passes it will behave correctly under the extension.
 
 == Default Local File Store
 
