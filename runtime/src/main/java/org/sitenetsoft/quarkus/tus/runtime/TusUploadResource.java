@@ -1,5 +1,6 @@
 package org.sitenetsoft.quarkus.tus.runtime;
 
+import io.smallrye.common.annotation.Blocking;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
 import io.vertx.ext.web.RoutingContext;
@@ -110,7 +111,12 @@ public class TusUploadResource {
 
     // ---------- HEAD: upload status ----------
 
+    // HEAD and POST call the store's synchronous record methods, which the bundled store backs
+    // with file I/O; running them on a worker keeps that off the event loop, as it was when these
+    // methods returned a plain Response. The streaming chains they return work from either kind
+    // of thread.
     @HEAD
+    @Blocking
     @jakarta.ws.rs.Path("/{uploadID}")
     @Operation(summary = "Query upload status")
     @APIResponse(responseCode = "200", description = "Upload status returned in headers")
@@ -185,6 +191,7 @@ public class TusUploadResource {
     // ---------- POST: create upload or final concat ----------
 
     @POST
+    @Blocking
     @Operation(summary = "Create upload or concatenation")
     @APIResponse(responseCode = "201", description = "Upload created")
     @APIResponse(responseCode = "400", description = "Invalid request")
