@@ -121,10 +121,12 @@ Read the [full documentation](docs/modules/ROOT/pages/index.adoc) for detailed g
 The TUS endpoints and configuration are stable: they implement a published protocol and are covered
 by a conformance suite.
 
-The `UploadStore` SPI is not yet stable. Writing a storage backend against it is supported and
-encouraged, but `writeChunkAsync` currently takes a `byte[]`, which rules out streaming uploads to
-object stores, and changing it will break implementors. That is why this release is `0.x`. The SPI
-settles at `1.0.0`.
+The `UploadStore` SPI has been redesigned for `1.0.0` and is not compatible with `0.1.0`: chunk
+bodies now stream through the store as a backpressured `Multi<Buffer>` via a staged
+`stageChunk`/`commitChunk`/`abortChunk` write, so an object-store backend can pipe bytes to S3 as they
+arrive, and every protocol concern (checksums, events, validation, Location building) has moved out
+of the store. A contract test, `org.sitenetsoft:quarkus-tus-tck`, lets a backend prove it honours
+the SPI. See [Custom Storage Backends](docs/modules/ROOT/pages/storage-spi.adoc).
 
 ## License
 

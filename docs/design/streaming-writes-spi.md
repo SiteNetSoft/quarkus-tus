@@ -1,7 +1,23 @@
 # Streaming writes: a proposed shape for `UploadStore`
 
-Status: **sketch, not agreed.** Nothing here is implemented. Targets 1.0.0, since it breaks every
-implementation of the SPI.
+Status: **implemented (2026-08-16)** on the `streaming-spi` branch, targeting 1.0.0. The shape below
+is what shipped, with these resolutions of the open questions at the bottom:
+
+1. `commitChunk` is `Uni<Void>`.
+2. Zero-length bodies never reach the store; the framework short-circuits them.
+3. `validateOffset` is gone — the framework compares against `findUploadInfo().getOffset()` under
+   the lock and the store re-asserts inside `stageChunk`.
+4. The pending-final record is a plain `UploadInfo` (`isFinalConcat=true`, `partialIds`) that the
+   framework builds and the store persists through `createUpload(UploadInfo)`;
+   `concatenate(finalId, sourceIds)` fills it in later. Finished and unfinished concatenation share
+   one path, and the store returns nothing — the framework already has the id.
+
+Two further changes fell out of "the framework owns the protocol": `createUpload` takes a complete
+`UploadInfo` (so `createUploadDeferred`, `setUploaderId`, `setDeferredLength`, `checkServerSizeConstraint`,
+`isExpired`, `getExpiresAt` all left the SPI in favour of `updateUploadInfo`), and completion became
+a *transition* — the commit that reaches `Upload-Length` — instead of a persisted latch, so
+`UploadInfo.completionFired` is gone and a zero-length upload completes on creation. The TCK lives in
+the `tck` module (`org.sitenetsoft:quarkus-tus-tck`).
 
 ## The problem is not really `byte[]`
 

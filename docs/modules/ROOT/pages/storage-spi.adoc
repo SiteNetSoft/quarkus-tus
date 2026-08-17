@@ -2,124 +2,206 @@
 
 include::./includes/attributes.adoc[]
 
-The extension ships with a local filesystem storage backend (`LocalFileUploadStore`). You can replace it with your own implementation (S3, database, distributed storage, etc.) via the `UploadStore` SPI.
+The extension ships with a local filesystem backend (`LocalFileUploadStore`). You can replace it with your own -- S3, GCS, Azure Blob, a database, anything -- by implementing the `UploadStore` SPI. The extension itself never depends on a storage vendor's SDK; the backend lives in your application (or your own library) and brings its own dependencies.
+
+== The store owns bytes; the framework owns the protocol
+
+A store persists the `UploadInfo` records it is handed, moves bytes into place, and answers simple questions about what it holds. It never validates a TUS rule, never computes a checksum, never fires an event and never builds a URL -- the extension does all of that before and after calling into the store. You can write a store knowing only your storage system, without having read the TUS specification.
+
+Bytes are **streamed**. A PATCH body flows from the socket, through the extension, into your store as a backpressured `Multi<Buffer>`; it is never materialised in memory or on disk on the way. That is what lets an S3 store hand each chunk to `UploadPart` as it arrives.
 
 == The UploadStore Interface
 
-The `UploadStore` interface (`org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore`) defines all operations the TUS protocol requires:
+`org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore`:
 
 [source,java]
 ----
 public interface UploadStore {
 
-    // Upload lifecycle
-    Optional<String> createUpload(Long totalLength, Optional<String> uploadMetadata, boolean isPartial);
-    Optional<String> createUploadDeferred(Optional<String> uploadMetadata, boolean isPartial);
+    // Records — the framework builds them, the store persists them
     Optional<UploadInfo> findUploadInfo(String id);
+    String createUpload(UploadInfo info);                 // returns an id, never a URL
+    void updateUploadInfo(String id, UploadInfo info);
+
+    // Bytes — a staged write
+    Uni<Long> stageChunk(String id, long offset, Multi<Buffer> data, long expectedLength);
+    Uni<Void> commitChunk(String id, long offset, long bytesStaged);
+    Uni<Void> abortChunk(String id, long offset);
+
+    // Concatenation — join sources into a final record the framework already created
+    Uni<Void> concatenate(String finalId, List<String> sourceIds);
+
+    // Lifecycle and locking
     boolean discardUpload(String id);
-
-    // Data writing
-    Uni<Long> writeChunkAsync(String id, long offset, byte[] chunk, Optional<UploadInfo.ChecksumInfo> checksum);
-    long writeInitialData(String id, byte[] data);
-    boolean validateOffset(String id, long clientOffset);
-
-    // Deferred length
-    boolean setDeferredLength(String id, long length);
-    boolean hasDeferredLength(String id);
-
-    // Concatenation
-    Optional<String> mergePartialUploadsWithOwnership(String[] ids, Optional<String> uploadMetadata, String requiredOwnerId);
-    Optional<String> mergePartialUploadsUnfinished(String[] ids, Optional<String> uploadMetadata);
-    boolean isConcatReady(String id);
-    boolean finalizeConcatenation(String id);
-
-    // Size constraints
-    boolean checkServerSizeConstraint(Long totalLength);
-
-    // Locking
     boolean acquireLock(String id);
     void releaseLock(String id);
 
-    // Ownership
-    void setUploaderId(String id, String uploaderId);
-    String getUploaderId(String id);
-
-    // Expiration
-    boolean isExpired(String id);
-    Optional<Instant> getExpiresAt(String id);
+    // Maintenance
     List<String> cleanupExpiredUploads();
+    default void cleanupStaleLocks() {}
+    default List<String> cleanupStaleUploads(long staleHours) { return List.of(); }
+    default int cleanupOrphanFiles() { return 0; }
 }
 ----
 
+=== Why writes are staged
+
+The checksum extension requires that a chunk with a bad `Upload-Checksum` be answered with `460` and the upload's offset **unchanged** -- the bytes must not count. When bytes stream, the digest is only known once the last byte has already reached storage. So a write happens in two steps:
+
+. `stageChunk` streams the bytes into place at `offset` but must **not** advance the upload's offset. `findUploadInfo` between stage and commit shows the old offset.
+. `commitChunk` makes them part of the upload (offset becomes `offset + bytesStaged`, `lastActivity` is stamped, the record is persisted); or `abortChunk` discards them and leaves the upload exactly as it was.
+
+The framework holds the upload's lock around the whole sequence, computes the digest as the bytes pass through, and decides commit or abort. Your store never sees a checksum, and it gets correct checksum behaviour for every algorithm for free.
+
+|===
+| | `stageChunk` | `commitChunk` | `abortChunk`
+
+| Local file
+| write at `offset`
+| set offset, persist record
+| truncate the file back to `offset`
+
+| S3 multipart
+| `UploadPart` (needs `expectedLength`)
+| record the part's ETag
+| drop the part
+|===
+
+`expectedLength` is the declared chunk length, or `-1` when the request used chunked transfer encoding and there is none. The framework never stages a zero-length chunk.
+
+=== Contract in brief
+
+* `stageChunk` at an offset that is not the upload's current one must fail with `OffsetMismatchException`. The framework has already validated it under the lock; a mismatch here means a request raced past validation, and writing there would overwrite acknowledged bytes.
+* Anything asked about an unknown id: `findUploadInfo` returns empty, `updateUploadInfo` is a no-op, `stageChunk`/`concatenate` fail with `UploadNotFoundException`, `discardUpload` returns `false`.
+* `abortChunk` is idempotent and safe to call when nothing was staged or when staging itself failed.
+* `concatenate(finalId, sourceIds)` fills a final upload the framework already created with `isFinalConcat=true` and `partialIds`; on success set its offset to its length, clear `isFinalConcat` and `partialIds`, persist. Leave the sources alone -- the framework discards them.
+* `discardUpload` must refuse (return `false`) while another caller holds the lock, rather than delete underneath an in-flight write.
+* The `Uni`/`Multi` methods are subscribed to on a Vert.x event loop: do not block in them.
+* `createUpload` returns an **id**. It is the last segment of the `Location` the extension builds; it must not contain `/`.
+
+Every one of these rules is an assertion in the contract test below.
+
 == Implementing a Custom Backend
 
-Create a CDI bean annotated with `@Alternative` and `@Priority` to override the default `LocalFileUploadStore`. The `@Priority` annotation globally enables the alternative -- use it for production replacements. For test-only alternatives, omit `@Priority` and enable via `QuarkusTestProfile.getEnabledAlternatives()` instead (see xref:testing.adoc[Testing]).
+Create a CDI bean annotated with `@Alternative` and `@Priority` to override `LocalFileUploadStore`. `@Priority` enables the alternative globally -- use it for production replacements. For test-only alternatives, omit `@Priority` and enable it via `QuarkusTestProfile.getEnabledAlternatives()` (see xref:testing.adoc[Testing]).
+
+=== The easy way: `BufferingUploadStore`
+
+If your backend appends whole byte arrays and you do not mind holding one chunk per in-flight upload in memory, extend `org.sitenetsoft.quarkus.tus.runtime.spi.BufferingUploadStore`. It implements the staged write for you -- `stageChunk` collects the stream, `commitChunk` calls your `appendBytes` and advances the record, `abortChunk` drops the buffer -- so you implement only the record methods, `appendBytes`, `concatenate`, `discardUpload`, the lock pair and `cleanupExpiredUploads`:
 
 [source,java]
 ----
-import jakarta.annotation.Priority;
-import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.inject.Alternative;
-import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
+@ApplicationScoped
+@Alternative
+@Priority(1)
+public class MyStore extends BufferingUploadStore {
 
+    private final Map<String, UploadInfo> records = new ConcurrentHashMap<>();
+    private final Set<String> locks = ConcurrentHashMap.newKeySet();
+
+    @Override public Optional<UploadInfo> findUploadInfo(String id) { return Optional.ofNullable(records.get(id)); }
+    @Override public String createUpload(UploadInfo info) { String id = UUID.randomUUID().toString(); records.put(id, info); return id; }
+    @Override public void updateUploadInfo(String id, UploadInfo info) { records.computeIfPresent(id, (k, v) -> info); }
+
+    @Override protected void appendBytes(String id, long offset, byte[] data) { /* append to your storage */ }
+    @Override public Uni<Void> concatenate(String finalId, List<String> sourceIds) { /* join, then mark finalId complete */ }
+
+    @Override public boolean discardUpload(String id) { /* refuse if locked; else remove bytes + record */ }
+    @Override public boolean acquireLock(String id) { return locks.add(id); }
+    @Override public void releaseLock(String id) { locks.remove(id); }
+    @Override public List<String> cleanupExpiredUploads() { /* remove records whose expiresAt is past */ }
+}
+----
+
+The in-memory store used by the extension's own test suite is exactly this, in about a hundred lines, and injects nothing.
+
+=== The streaming way: an S3 sketch
+
+[source,java]
+----
 @ApplicationScoped
 @Alternative
 @Priority(1)
 public class S3UploadStore implements UploadStore {
 
-    @Inject
-    S3Client s3;
+    @Inject S3AsyncClient s3;   // your dependency, not the extension's
 
     @Override
-    public Optional<String> createUpload(Long totalLength, Optional<String> uploadMetadata, boolean isPartial) {
-        String uploadId = UUID.randomUUID().toString();
-        // Initialize multipart upload in S3
-        s3.createMultipartUpload(...);
-        // Return the location URL
-        return Optional.of("/tus/" + uploadId);
+    public Uni<Long> stageChunk(String id, long offset, Multi<Buffer> data, long expectedLength) {
+        UploadInfo info = findUploadInfo(id).orElseThrow(() -> new UploadNotFoundException(id));
+        if (offset != info.getOffset()) {
+            throw new OffsetMismatchException("stale offset", info.getOffset());
+        }
+        // S3 needs a content length per part; expectedLength is -1 for chunked bodies, in
+        // which case a real store would fall back to buffering that one chunk.
+        AsyncRequestBody body = AsyncRequestBody.fromPublisher(
+                AdaptersToFlow.publisher(data.map(b -> b.getByteBuf().nioBuffer())));
+        return Uni.createFrom().completionStage(s3.uploadPart(uploadPartRequest(id, offset, expectedLength), body))
+                .invoke(resp -> rememberPendingEtag(id, offset, resp.eTag()))
+                .replaceWith(expectedLength);
     }
 
     @Override
-    public Uni<Long> writeChunkAsync(String id, long offset, byte[] chunk,
-                                      Optional<UploadInfo.ChecksumInfo> checksum) {
-        return Uni.createFrom().item(() -> {
-            // Upload part to S3
-            s3.uploadPart(...);
-            return offset + chunk.length;
-        });
+    public Uni<Void> commitChunk(String id, long offset, long bytesStaged) {
+        // Record the ETag against the part number, advance the offset, persist the record.
     }
 
-    // ... implement remaining methods
+    @Override
+    public Uni<Void> abortChunk(String id, long offset) {
+        // Forget the pending ETag; the orphaned part is dropped when the multipart upload completes or aborts.
+    }
+
+    @Override
+    public Uni<Void> concatenate(String finalId, List<String> sourceIds) {
+        // UploadPartCopy each source into finalId's multipart upload, then complete it.
+    }
+
+    // records, discard, locks, cleanup ...
 }
 ----
 
-=== Key Implementation Notes
+For a clustered deployment, back `acquireLock`/`releaseLock` with something shared (a database row, Redis). The lock is what serialises concurrent PATCHes to one upload; the bundled store's is per process.
 
-writeChunkAsync:: Returns a `Uni<Long>` with the new offset after writing. Return `-1` if the upload was not found. Gate the completion event on `UploadInfo.markCompletionFired()`, which returns `true` only for the caller that makes the transition — reaching the final offset is not on its own a safe trigger, since a PATCH at the final offset with an empty body satisfies every check and would otherwise replay the event on every request. *Do not trust the supplied offset:* compare it to the upload's current offset and fail with `spi.OffsetMismatchException` if they differ (the extension maps that to 409). Writing at a stale offset would overwrite bytes that were already stored and acknowledged. Throw `spi.ChecksumMismatchException` if checksum validation fails (the extension handles the 460 response). *Important:* Your implementation must fire `TusUploadCompletedEvent` when the upload is complete (i.e., `newOffset == entityLength`). Inject `Event<TusUploadCompletedEvent>` and fire it after updating the offset. See `LocalFileUploadStore` for the reference implementation.
+== Verifying your store: the contract test
 
-createUpload / createUploadDeferred:: Must return the full location path (e.g., `/tus/{uploadId}`). The upload ID is extracted from the last path segment.
+The `org.sitenetsoft:quarkus-tus-tck` artifact contains `AbstractUploadStoreContractTest`, an abstract JUnit 5 class that checks a store against every rule above. Add it to your test classpath and extend it:
 
-mergePartialUploadsWithOwnership / mergePartialUploadsUnfinished:: Both take a `requiredOwnerId`. When it is non-null, every referenced partial that has an uploader must match it, and the method must return `Optional.empty()` otherwise. Skipping this check in either method allows one user to concatenate — and thereby consume and delete — another user's partial uploads.
-+
-Both also take `uploadConcatHeader`, the raw `Upload-Concat` request header. Store it verbatim on the final upload: the protocol requires `HEAD` on a final upload to return the value as the client sent it, so rebuilding it from the parsed IDs would return a different string to clients that sent absolute URLs or different spacing.
+[source,groovy]
+----
+testImplementation 'org.sitenetsoft:quarkus-tus-tck:{project-version}'
+----
 
-acquireLock / releaseLock:: Must provide mutual exclusion for concurrent PATCH requests to the same upload. The default implementation uses `ConcurrentHashMap`-based locks. Acquisition is not reentrant.
+[source,java]
+----
+@QuarkusTest
+class MyStoreContractTest extends AbstractUploadStoreContractTest {
 
-discardUpload:: Must respect the lock: return `false` without deleting anything if the upload is currently being written, rather than removing the data file underneath an in-flight write. The extension answers `423` when a `DELETE` is refused for this reason, and cleanup jobs retry on their next run.
+    @Inject
+    UploadStore store;
 
-cleanupExpiredUploads:: Return only the uploads actually removed. Reporting one that was skipped because it was in use makes the scheduler log claim work it did not do.
+    @Override
+    protected UploadStore store() {
+        return store;
+    }
 
-cleanupExpiredUploads:: Called hourly by the built-in `UploadExpirationScheduler`. Return the list of expired upload IDs that were cleaned up.
+    // Optional: lets the content assertions run. Without it only offsets are checked,
+    // because the SPI has no read API.
+    @Override
+    protected Optional<byte[]> readBytes(String id) {
+        return Optional.ofNullable(myStorage.get(id));
+    }
+}
+----
 
-cleanupStaleLocks / cleanupStaleUploads / cleanupOrphanFiles:: Optional maintenance hooks, also driven by the scheduler. They default to doing nothing, so a store with no locks or files on disk can ignore them — but a store that has either must implement them, or that maintenance never runs.
+Twenty assertions run: record round-trips, stage-does-not-advance, commit-advances-exactly, abort-leaves-nothing, stale-offset rejection, unknown-id behaviour, multi-buffer and zero-length stages, concatenation, discard, lock exclusivity and expiry cleanup. Both bundled stores pass it, and a store that passes it will behave correctly under the extension.
 
 == Default Local File Store
 
 The built-in `LocalFileUploadStore` stores upload data as files on disk:
 
-* Each upload gets a file named `{uploadId}` in the configured directory
-* Upload metadata is kept in memory (`ConcurrentHashMap`)
-* Checksums are validated inline during write
+* Each upload is a file named `{uploadId}` in the configured directory, with a `{uploadId}.meta` JSON sidecar holding its record
+* Chunks are written with Vert.x asynchronous file I/O; `abortChunk` truncates the file back to the staged offset
+* Concatenation pipes the source files into the final one without blocking the event loop
 * Locks are in-memory (single-node only)
 
 Configure the storage directory:

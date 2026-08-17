@@ -173,7 +173,7 @@ class TusCustomStoreTest {
 }
 ----
 
-IMPORTANT: Your custom `UploadStore.writeChunkAsync()` must fire `TusUploadCompletedEvent` when the upload completes (`newOffset == entityLength`). Without this, the `TusUploadCompletedEvent` CDI event will not be fired.
+TIP: A custom store needs no protocol knowledge — the extension fires `TusUploadCompletedEvent` and the other lifecycle events itself. To check that your store honours the SPI contract (staged writes, offsets, locking, concatenation), extend `AbstractUploadStoreContractTest` from the `quarkus-tus-tck` artifact; see xref:storage-spi.adoc#_verifying_your_store_the_contract_test[Custom Storage Backends].
 
 == @QuarkusIntegrationTest (Packaged JAR)
 
