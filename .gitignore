@@ -42,3 +42,7 @@ nb-configuration.xml
 
 # Local MCP server config
 .mcp.json
+
+# JVM crash dumps
+hs_err_pid*.log
+replay_pid*.log
