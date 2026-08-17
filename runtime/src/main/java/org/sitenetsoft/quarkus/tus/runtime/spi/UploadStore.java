@@ -37,8 +37,13 @@ import java.util.Optional;
  * never stages a zero-length chunk.
  *
  * <h2>Threading</h2>
- * The {@code Uni}/{@code Multi} methods are subscribed to on a Vert.x event loop. They must not
- * block; use the store's asynchronous client, or offload to a worker pool.
+ * The {@code Uni}/{@code Multi} methods may be subscribed to on a Vert.x event loop. They must not
+ * block; use the store's asynchronous client, or offload to a worker pool. The synchronous record
+ * methods ({@link #findUploadInfo}, {@link #createUpload}, {@link #updateUploadInfo},
+ * {@link #discardUpload}, the lock pair) are called from worker threads for POST, HEAD and DELETE
+ * but from the event loop during PATCH, so keep them cheap: an in-memory index or a fast local
+ * cache, not a network round trip per call. Making them asynchronous is a candidate for a later
+ * SPI revision.
  * <p>
  * A reusable contract test, {@code AbstractUploadStoreContractTest} in the
  * {@code quarkus-tus} test-fixtures artifact, checks an implementation against every rule below.
