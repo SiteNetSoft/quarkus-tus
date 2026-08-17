@@ -143,7 +143,7 @@ public class TusUploadResource {
         }
 
         if (isExpired(infoOpt.get())) {
-            uploadStore.discardUpload(uploadID);
+            discard(uploadID);
             return Uni.createFrom().item(tus(410).entity("Upload has expired").build());
         }
 
@@ -282,8 +282,14 @@ public class TusUploadResource {
         String location = TUS_PATH + "/" + uploadId;
         String expires = expiresHeader(info);
 
+        // Without a Content-Length, HTTP/1.1 announces a body with Transfer-Encoding: chunked;
+        // HTTP/2 has no such header — a streamed body is just DATA frames — so there the
+        // creation-with-upload content type is what tells a body from a plain creation.
+        String contentTypeHeader = routingContext.request().getHeader("Content-Type");
         boolean hasBody = contentLength != null ? contentLength > 0
-                : "chunked".equalsIgnoreCase(routingContext.request().getHeader("Transfer-Encoding"));
+                : "chunked".equalsIgnoreCase(routingContext.request().getHeader("Transfer-Encoding"))
+                || (routingContext.request().version() == io.vertx.core.http.HttpVersion.HTTP_2
+                        && contentTypeHeader != null && contentTypeHeader.startsWith(OFFSET_OCTET_STREAM));
 
         if (!hasBody || isDeferredLength) {
             return Uni.createFrom().item(createdResponse(location, expires, isDeferredLength, 0));
@@ -292,18 +298,18 @@ public class TusUploadResource {
         // Creation-with-upload: the body is the first chunk.
         String contentType = routingContext.request().getHeader("Content-Type");
         if (contentType == null || !contentType.startsWith(OFFSET_OCTET_STREAM)) {
-            uploadStore.discardUpload(uploadId);
+            discard(uploadId);
             return Uni.createFrom().item(tus(BAD_REQUEST)
                     .entity("Content-Type must be " + OFFSET_OCTET_STREAM + " for creation-with-upload")
                     .build());
         }
         if (contentLength != null && contentLength > tusRuntimeConfig.maxChunkSize()) {
-            uploadStore.discardUpload(uploadId);
+            discard(uploadId);
             return Uni.createFrom().item(tus(REQUEST_ENTITY_TOO_LARGE)
                     .entity("Chunk size exceeds maximum allowed size").build());
         }
         if (contentLength != null && contentLength > uploadSize) {
-            uploadStore.discardUpload(uploadId);
+            discard(uploadId);
             return Uni.createFrom().item(tus(REQUEST_ENTITY_TOO_LARGE)
                     .entity("Body exceeds declared Upload-Length").build());
         }
@@ -322,8 +328,7 @@ public class TusUploadResource {
                     // The client gets an error and no Location, so it will create again rather
                     // than resume: leaving the upload behind only makes work for the cleanup jobs.
                     if (response.getStatus() != CREATED.getStatusCode()) {
-                        uploadStore.discardUpload(uploadId);
-                        uploadProgressService.finishUpload(uploadId);
+                        discard(uploadId);
                     }
                 }));
     }
@@ -418,7 +423,7 @@ public class TusUploadResource {
                 .onItem().transform(finalized -> created)
                 .onFailure().recoverWithItem(e -> {
                     LOG.errorf(e, "Failed to concatenate into %s", finalId);
-                    uploadStore.discardUpload(finalId);
+                    discard(finalId);
                     return tus(INTERNAL_SERVER_ERROR)
                             .entity("Failed to merge partial uploads").build();
                 });
@@ -468,9 +473,9 @@ public class TusUploadResource {
         return uploadStore.concatenate(finalId, partialIds)
                 .emitOn(Infrastructure.getDefaultWorkerPool())
                 .onItem().transform(v -> {
-                    // Release the partials before discarding them: discardUpload takes the lock itself.
-                    locked.forEach(uploadStore::releaseLock);
-                    locked.clear();
+                    // The partials are discarded under the locks this request still holds, so a
+                    // second final over the same partials cannot slip in between and find them
+                    // half gone.
                     for (String partialId : partialIds) {
                         uploadStore.discardUpload(partialId);
                         uploadProgressService.finishUpload(partialId);
@@ -549,7 +554,7 @@ public class TusUploadResource {
         }
 
         if (isExpired(uploadInfoOpt.get())) {
-            uploadStore.discardUpload(uploadID);
+            discard(uploadID);
             return Uni.createFrom().item(tus(410).entity("Upload has expired").build());
         }
 
@@ -661,11 +666,14 @@ public class TusUploadResource {
 
         Uni<Long> write;
         if (contentLength != null && contentLength == 0) {
-            // Nothing to store; the store never sees a zero-length chunk.
+            // Nothing to store; the store never sees a zero-length chunk. Some clients poll with
+            // an empty PATCH, so the progress stream still hears where the upload stands.
             write = Uni.createFrom().item(uploadOffset)
                     .emitOn(Infrastructure.getDefaultWorkerPool())
-                    .onItem().invoke(offset -> chunkReceivedEvent.fire(
-                            new TusChunkReceivedEvent(uploadID, 0, offset, entityLength)));
+                    .onItem().invoke(offset -> {
+                        chunkReceivedEvent.fire(new TusChunkReceivedEvent(uploadID, 0, offset, entityLength));
+                        notifyProgress(uploadID, offset, entityLength);
+                    });
         } else {
             write = writeBody(uploadID, info, uploadOffset, routingContext, checksumInfo, digest, contentLength, stream);
         }
@@ -741,10 +749,20 @@ public class TusUploadResource {
         // deferred(): a store that throws from stageChunk instead of returning a failed Uni
         // still lands in the failure path below, where the lock is released and the error mapped.
         return Uni.createFrom().deferred(() -> uploadStore.stageChunk(uploadID, offset, stream.multi(), expectedLength))
+                // The limits are ours to enforce: whatever the store made of the cut-off stream —
+                // wrapped it, or even reported success — the answer is what we counted.
+                .onFailure().transform(e -> stream.limitExceeded() != null ? stream.limitExceeded() : e)
                 .onItem().transformToUni(staged -> {
+                    if (stream.limitExceeded() != null) {
+                        return Uni.createFrom().<Long>failure(stream.limitExceeded());
+                    }
                     if (!stream.checksumMatches(checksumInfo)) {
                         return uploadStore.abortChunk(uploadID, offset)
                                 .onItem().transformToUni(v -> Uni.createFrom().<Long>failure(new ChecksumMismatch()));
+                    }
+                    if (staged == 0) {
+                        // A length-less body that turned out empty: nothing to commit.
+                        return uploadStore.abortChunk(uploadID, offset).replaceWith(offset);
                     }
                     return uploadStore.commitChunk(uploadID, offset, staged).replaceWith(offset + staged);
                 })
@@ -765,13 +783,7 @@ public class TusUploadResource {
                     long chunkSize = newOffset - offset;
                     uploadProgressService.updateProgress(uploadID, chunkSize);
                     chunkReceivedEvent.fire(new TusChunkReceivedEvent(uploadID, chunkSize, newOffset, entityLength));
-
-                    if (sseServiceInstance.isResolvable()) {
-                        UploadProgress progress = uploadProgressService.getProgress(uploadID);
-                        if (progress != null) {
-                            sseServiceInstance.get().sendProgress(uploadID, progress);
-                        }
-                    }
+                    notifyProgress(uploadID, newOffset, entityLength);
 
                     // Completion is a transition, decided once and here: only the commit that
                     // reaches the declared length fires it. A later empty PATCH at the final
@@ -781,6 +793,26 @@ public class TusUploadResource {
                         fireCompleted(uploadID, current);
                     }
                 });
+    }
+
+    /**
+     * Tells the progress stream where the upload stands. Progress entries live in memory, so
+     * after a restart the store knows the upload but the progress service does not — the
+     * event is then built from the offset itself, or a watcher would stall on the previous
+     * chunk and never see 100%.
+     */
+    private void notifyProgress(String uploadID, long offset, long entityLength) {
+        if (!sseServiceInstance.isResolvable()) {
+            return;
+        }
+        UploadProgress progress = uploadProgressService.getProgress(uploadID);
+        if (progress == null && entityLength >= 0) {
+            progress = new UploadProgress(entityLength);
+            progress.uploadedBytes = offset;
+        }
+        if (progress != null) {
+            sseServiceInstance.get().sendProgress(uploadID, progress);
+        }
     }
 
     private void fireCompleted(String uploadId, UploadInfo info) {
@@ -851,18 +883,15 @@ public class TusUploadResource {
             return tus(NOT_FOUND).build();
         }
 
-        boolean existed = uploadStore.findUploadInfo(uploadID).isPresent();
-        boolean deleted = uploadStore.discardUpload(uploadID);
-
-        // Deleting something that was never there stays idempotent, but refusing to delete an
-        // upload that exists means a write holds its lock — the client should retry.
-        if (!deleted && existed) {
+        // Deleting something that was never there stays idempotent, but a write holding the
+        // lock means the client should retry.
+        Discard outcome = discard(uploadID);
+        if (outcome == Discard.LOCKED) {
             return tus(423).entity("Upload is currently being processed").build();
         }
 
-        LOG.infof("UploadID %s deleted=%s", uploadID, deleted);
+        LOG.infof("UploadID %s deleted=%s", uploadID, outcome == Discard.REMOVED);
 
-        uploadProgressService.finishUpload(uploadID);
         if (sseServiceInstance.isResolvable()) {
             sseServiceInstance.get().unregister(uploadID);
         }
@@ -873,6 +902,26 @@ public class TusUploadResource {
     }
 
     // ---------- helpers ----------
+
+    private enum Discard { REMOVED, ABSENT, LOCKED }
+
+    /**
+     * Discards an upload the way every path in here must: under its lock, so nothing is deleted
+     * underneath an in-flight write, and with the framework's own progress bookkeeping cleared.
+     */
+    private Discard discard(String uploadId) {
+        if (!uploadStore.acquireLock(uploadId)) {
+            return Discard.LOCKED;
+        }
+        boolean removed;
+        try {
+            removed = uploadStore.discardUpload(uploadId);
+        } finally {
+            uploadStore.releaseLock(uploadId);
+        }
+        uploadProgressService.finishUpload(uploadId);
+        return removed ? Discard.REMOVED : Discard.ABSENT;
+    }
 
     private Response.ResponseBuilder tus(Response.Status status) {
         return Response.status(status).header("Tus-Resumable", tusRuntimeConfig.version());

@@ -139,6 +139,38 @@ class TusFaultyStoreTest extends TusUploadTestBase {
         uploadData(location, new byte[100], 0); // lock released, upload still usable
     }
 
+    /**
+     * The framework cuts the body off at max-chunk-size by failing the stream, but a store (or
+     * its SDK) may wrap that failure in its own type. The 413 is the framework's decision from
+     * what it counted, not a matter of the store returning the right exception.
+     */
+    @Test
+    void chunkOverrunIsStill413WhenTheStoreWrapsStreamFailures() throws Exception {
+        String location = createUpload(10_000);
+        String id = extractId(location);
+        store().wrapStreamFailures.set(true);
+        int port = Integer.getInteger("quarkus.http.test-port", 8081);
+        try (java.net.Socket socket = new java.net.Socket("localhost", port)) {
+            socket.setSoTimeout(10_000);
+            java.io.OutputStream out = socket.getOutputStream();
+            out.write(("PATCH /tus/" + id + " HTTP/1.1\r\nHost: localhost\r\nTus-Resumable: 1.0.0\r\n"
+                    + "Upload-Offset: 0\r\nContent-Type: application/offset+octet-stream\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            byte[] part = new byte[600];
+            for (int i = 0; i < 2; i++) { // 1200 bytes > max-chunk-size of 1024
+                out.write((Integer.toHexString(part.length) + "\r\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                out.write(part);
+                out.write("\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                out.flush();
+            }
+            String statusLine = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(socket.getInputStream(), java.nio.charset.StandardCharsets.US_ASCII)).readLine();
+            assertTrue(statusLine.startsWith("HTTP/1.1 413"), statusLine);
+        }
+        assertEquals(1, store().abortCalls.get());
+        assertEquals(0, store().findUploadInfo(id).orElseThrow().getOffset());
+    }
+
     /** BufferingUploadStore exists for stores whose append blocks; it must not run on the event loop. */
     @Test
     void bufferingStoreAppendRunsOffTheEventLoop() {

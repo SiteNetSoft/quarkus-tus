@@ -92,16 +92,9 @@ public class InMemoryUploadStore extends BufferingUploadStore {
 
     @Override
     public boolean discardUpload(String id) {
-        if (!activeLocks.add(id)) {
-            return false;
-        }
-        try {
-            UploadInfo removed = uploads.remove(id);
-            dataStore.remove(id);
-            return removed != null;
-        } finally {
-            activeLocks.remove(id);
-        }
+        UploadInfo removed = uploads.remove(id);
+        dataStore.remove(id);
+        return removed != null;
     }
 
     @Override
@@ -120,8 +113,14 @@ public class InMemoryUploadStore extends BufferingUploadStore {
         List<String> cleaned = new ArrayList<>();
         for (Map.Entry<String, UploadInfo> entry : uploads.entrySet()) {
             Instant expiresAt = entry.getValue().getExpiresAt();
-            if (expiresAt != null && now.isAfter(expiresAt) && discardUpload(entry.getKey())) {
-                cleaned.add(entry.getKey());
+            if (expiresAt != null && now.isAfter(expiresAt) && acquireLock(entry.getKey())) {
+                try {
+                    if (discardUpload(entry.getKey())) {
+                        cleaned.add(entry.getKey());
+                    }
+                } finally {
+                    releaseLock(entry.getKey());
+                }
             }
         }
         return cleaned;

@@ -11,6 +11,7 @@ import java.util.Base64;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The request body as a backpressured {@link Multi} of buffers, observed on the way through:
@@ -30,6 +31,7 @@ final class ChunkStream {
     private final MessageDigest digest;
     private final AtomicLong count = new AtomicLong();
     private final AtomicBoolean subscribed = new AtomicBoolean();
+    private final AtomicReference<ChunkLimitExceededException> limitExceeded = new AtomicReference<>();
 
     /**
      * @param digest        the digest to feed, or null when no checksum was requested
@@ -50,12 +52,12 @@ final class ChunkStream {
                 .onItem().invoke(buffer -> {
                     long total = count.addAndGet(buffer.length());
                     if (total > maxChunkSize) {
-                        throw new ChunkLimitExceededException(
-                                ChunkLimitExceededException.Kind.CHUNK_SIZE, maxChunkSize);
+                        throw limit(new ChunkLimitExceededException(
+                                ChunkLimitExceededException.Kind.CHUNK_SIZE, maxChunkSize));
                     }
                     if (total > maxRemaining) {
-                        throw new ChunkLimitExceededException(
-                                ChunkLimitExceededException.Kind.ENTITY_LENGTH, maxRemaining);
+                        throw limit(new ChunkLimitExceededException(
+                                ChunkLimitExceededException.Kind.ENTITY_LENGTH, maxRemaining));
                     }
                     if (digest != null) {
                         digest.update(buffer.getByteBuf().nioBuffer());
@@ -63,8 +65,22 @@ final class ChunkStream {
                 });
     }
 
+    private ChunkLimitExceededException limit(ChunkLimitExceededException e) {
+        limitExceeded.compareAndSet(null, e);
+        return e;
+    }
+
     Multi<Buffer> multi() {
         return multi;
+    }
+
+    /**
+     * The limit this stream was cut off at, or null. Kept here as well as thrown down the
+     * stream because the response is the framework's decision from what it counted — not
+     * something to depend on the store handing the failure back in its original type.
+     */
+    ChunkLimitExceededException limitExceeded() {
+        return limitExceeded.get();
     }
 
     /** Whether the body has been (or is being) read; if not, it is still paused in Vert.x. */

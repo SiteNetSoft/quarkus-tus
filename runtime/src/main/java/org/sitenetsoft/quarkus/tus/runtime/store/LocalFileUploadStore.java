@@ -245,11 +245,17 @@ public class LocalFileUploadStore implements UploadStore {
         Path file = safePath(id);
         OpenOptions openOptions = new OpenOptions().setWrite(true).setCreate(false);
 
+        // An AsyncFile may only be used on the context that opened it, and the body's buffers
+        // do not necessarily arrive there — over HTTP/2 they come in on the stream's context,
+        // and a worker thread may have opened the file — so every write hops onto the file's
+        // context first.
+        io.vertx.mutiny.core.Context fileContext = vertx.getOrCreateContext();
         return vertx.fileSystem()
                 .open(file.toString(), openOptions)
                 .flatMap(asyncFile -> {
                     asyncFile.setWritePos(offset);
                     return data
+                            .emitOn(command -> fileContext.runOnContext(command))
                             .onItem().transformToUniAndConcatenate(buf -> {
                                 // The lock spans the whole transfer; a slow client must not
                                 // look abandoned while its bytes are still arriving.
@@ -355,19 +361,19 @@ public class LocalFileUploadStore implements UploadStore {
     }
 
     /**
-     * Deletes an upload, refusing while another thread holds its lock.
-     * <p>
-     * This used to delete the data file and drop the lock unconditionally, so a DELETE or a
-     * cleanup job landing mid-write unlinked the file underneath an in-flight write — which
-     * then reported success for bytes that were no longer stored anywhere. Acquisition is not
-     * reentrant, so a caller that already holds the lock cannot discard through this method.
-     *
-     * @return true if an upload was removed; false if it did not exist or is locked
+     * Deletes an upload's bytes and record. The framework holds the upload's lock when it calls
+     * this, so there is nothing to check here; the store's own cleanup jobs go through
+     * {@link #discardIfUnlocked} instead, which takes the lock first so that they never delete
+     * underneath an in-flight write.
      */
     @Override
     public boolean discardUpload(String id) {
+        return discardLockedUpload(id);
+    }
+
+    /** For the store's own maintenance: takes the lock, discards, releases; false if in use. */
+    private boolean discardIfUnlocked(String id) {
         if (!acquireLock(id)) {
-            LOG.warnf("Refusing to discard upload %s: currently being written", id);
             return false;
         }
         try {
@@ -451,7 +457,7 @@ public class LocalFileUploadStore implements UploadStore {
         // retried on the next run. Only what was actually removed is reported as cleaned.
         List<String> cleanedIds = new ArrayList<>();
         for (String id : expiredIds) {
-            if (discardUpload(id)) {
+            if (discardIfUnlocked(id)) {
                 cleanedIds.add(id);
             } else {
                 LOG.infof("Skipped expired upload %s: in use, will retry next run", id);
@@ -493,7 +499,7 @@ public class LocalFileUploadStore implements UploadStore {
         for (String id : staleIds) {
             LOG.infof("Cleaning up stale upload %s (no activity since %s)", id,
                     uploads.get(id) != null ? uploads.get(id).getLastActivity() : "unknown");
-            if (discardUpload(id)) {
+            if (discardIfUnlocked(id)) {
                 cleanedIds.add(id);
             } else {
                 LOG.infof("Skipped stale upload %s: in use, will retry next run", id);

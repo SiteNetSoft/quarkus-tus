@@ -33,8 +33,9 @@ import java.util.Optional;
  *   <li>{@link #commitChunk} makes them part of the upload and advances the offset, or
  *       {@link #abortChunk} discards them and leaves the upload exactly as it was.</li>
  * </ol>
- * The framework holds the upload's lock ({@link #acquireLock}) around the whole sequence, and
- * never stages a zero-length chunk.
+ * The framework holds the upload's lock ({@link #acquireLock}) around the whole sequence. It
+ * never stages a chunk it knows to be empty; a length-less body that turns out to be empty is
+ * staged as zero bytes and then aborted rather than committed.
  *
  * <h2>Threading</h2>
  * The {@code Uni}/{@code Multi} methods may be subscribed to on a Vert.x event loop. They must not
@@ -144,10 +145,14 @@ public interface UploadStore {
     Uni<Void> concatenate(String finalId, List<String> sourceIds);
 
     /**
-     * Deletes an upload's bytes and record. Must refuse while another caller holds the upload's
-     * lock rather than delete underneath an in-flight write.
+     * Deletes an upload's bytes and record. The framework holds the upload's lock when it calls
+     * this — DELETE takes it, and a finished concatenation discards its partials under the locks
+     * it already holds — so the store neither takes nor checks the lock here; whether anyone
+     * else may be writing has already been settled by the caller. A store's own cleanup
+     * ({@link #cleanupExpiredUploads} and the hooks below) must take the lock itself before
+     * deleting.
      *
-     * @return true if an upload was removed; false if it did not exist or is locked
+     * @return true if an upload was removed; false if it did not exist
      */
     boolean discardUpload(String id);
 
