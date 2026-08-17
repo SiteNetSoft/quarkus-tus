@@ -44,12 +44,12 @@ subprojects {
 
 }
 
-// ---- Publishing (runtime + deployment only; integration-tests is not published) ----
+// ---- Publishing (runtime, deployment and tck; integration-tests is not published) ----
 //
 // The Quarkus extension descriptor generated into the runtime jar points at
 // org.sitenetsoft:quarkus-tus-deployment, so the published artifact ids must match exactly
 // or Quarkus cannot resolve the deployment module at augmentation time.
-ext.publishedArtifactIds = [runtime: 'quarkus-tus', deployment: 'quarkus-tus-deployment']
+ext.publishedArtifactIds = [runtime: 'quarkus-tus', deployment: 'quarkus-tus-deployment', tck: 'quarkus-tus-tck']
 
 configure(subprojects.findAll { publishedArtifactIds.containsKey(it.name) }) { proj ->
     apply plugin: 'maven-publish'
@@ -87,9 +87,11 @@ configure(subprojects.findAll { publishedArtifactIds.containsKey(it.name) }) { p
                 artifactId = publishedArtifactIds[proj.name]
                 pom {
                     name = artifactId
-                    description = proj.name == 'runtime'
-                        ? 'Quarkus extension implementing the TUS resumable upload protocol'
-                        : 'Deployment module for the Quarkus TUS resumable upload extension'
+                    description = switch (proj.name) {
+                        case 'runtime' -> 'Quarkus extension implementing the TUS resumable upload protocol'
+                        case 'tck' -> 'Contract test for UploadStore implementations of the Quarkus TUS extension'
+                        default -> 'Deployment module for the Quarkus TUS resumable upload extension'
+                    }
                     url = 'https://github.com/SiteNetSoft/quarkus-tus'
                     licenses {
                         license {
