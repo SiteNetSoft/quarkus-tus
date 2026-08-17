@@ -192,8 +192,13 @@ class TusUploadTest extends TusUploadTestBase {
         uploadStore.findUploadInfo(id2).ifPresent(
                 info -> info.setExpiresAt(Instant.now().minusSeconds(3600)));
 
+        // The store is shared with every other test in this JVM and with leftovers reloaded
+        // from earlier runs, some of which may cross their expiry during this run — so assert
+        // on these three uploads, not on the total.
         List<String> cleaned = uploadStore.cleanupExpiredUploads();
-        assertEquals(2, cleaned.size(), "Should clean up exactly 2 expired uploads");
+        assertTrue(cleaned.contains(id1), "Expired upload 1 should be cleaned");
+        assertTrue(cleaned.contains(id2), "Expired upload 2 should be cleaned");
+        assertFalse(cleaned.contains(id3), "Non-expired upload should not be cleaned");
 
         assertTrue(uploadStore.findUploadInfo(id3).isPresent(),
                 "Non-expired upload should still exist");
