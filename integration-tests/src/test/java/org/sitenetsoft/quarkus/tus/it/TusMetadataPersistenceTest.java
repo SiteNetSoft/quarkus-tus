@@ -2,8 +2,11 @@ package org.sitenetsoft.quarkus.tus.it;
 
 import io.quarkus.test.junit.QuarkusTest;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
+import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
+import org.sitenetsoft.quarkus.tus.runtime.store.LocalFileUploadStore;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -20,6 +23,51 @@ class TusMetadataPersistenceTest {
 
     @ConfigProperty(name = "quarkus.tus.store.local.upload-dir")
     String uploadDir;
+
+    @Inject
+    UploadStore uploadStore;
+
+    // ---- Restart reconciliation ----
+
+    /**
+     * Staged bytes reach the data file before the framework has verified them, so a crash
+     * between stage and commit (or abort) leaves the file longer than the persisted offset.
+     * Only committed offsets are ever persisted; a restart must cut the file back to that,
+     * never adopt the unverified tail as if it had been acknowledged.
+     */
+    @Test
+    void testReloadTruncatesDataFileLongerThanPersistedOffset() throws IOException {
+        String id = java.util.UUID.randomUUID().toString();
+        Path data = Path.of(uploadDir, id);
+        Files.write(data, new byte[500]);
+        UploadInfo info = new UploadInfo();
+        info.setEntityLength(1000L);
+        info.setOffset(200L);
+        Files.writeString(Path.of(uploadDir, id + ".meta"), info.toJson());
+
+        ((LocalFileUploadStore) uploadStore).reloadPersistedUploads();
+
+        assertEquals(200L, uploadStore.findUploadInfo(id).orElseThrow().getOffset());
+        assertEquals(200L, Files.size(data), "unverified staged tail must be cut off");
+        uploadStore.discardUpload(id);
+    }
+
+    /** A file shorter than the persisted offset has really lost data; the file is the truth then. */
+    @Test
+    void testReloadFallsBackToFileSizeWhenDataFileIsShorter() throws IOException {
+        String id = java.util.UUID.randomUUID().toString();
+        Path data = Path.of(uploadDir, id);
+        Files.write(data, new byte[100]);
+        UploadInfo info = new UploadInfo();
+        info.setEntityLength(1000L);
+        info.setOffset(300L);
+        Files.writeString(Path.of(uploadDir, id + ".meta"), info.toJson());
+
+        ((LocalFileUploadStore) uploadStore).reloadPersistedUploads();
+
+        assertEquals(100L, uploadStore.findUploadInfo(id).orElseThrow().getOffset());
+        uploadStore.discardUpload(id);
+    }
 
     // ---- JSON round-trip ----
 

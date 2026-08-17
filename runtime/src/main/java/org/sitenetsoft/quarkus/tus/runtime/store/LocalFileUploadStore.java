@@ -4,6 +4,7 @@ import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.file.OpenOptions;
+import io.vertx.core.file.FileSystemException;
 import io.vertx.mutiny.core.Vertx;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -27,6 +28,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
@@ -35,7 +37,6 @@ public class LocalFileUploadStore implements UploadStore {
 
     private static final Logger LOG = Logger.getLogger(LocalFileUploadStore.class);
 
-    private static final long LOCK_TIMEOUT_MS = 30_000;
     private static final String META_SUFFIX = ".meta";
     private static final String META_TMP_SUFFIX = ".meta.tmp";
 
@@ -44,6 +45,7 @@ public class LocalFileUploadStore implements UploadStore {
     private final AtomicBoolean initValidated = new AtomicBoolean(false);
 
     private Path uploadBaseDir;
+    private long lockTimeoutMs;
 
     @Inject
     Vertx vertx;
@@ -54,6 +56,7 @@ public class LocalFileUploadStore implements UploadStore {
     @PostConstruct
     void init() {
         this.uploadBaseDir = Path.of(tusRuntimeConfig.store().local().uploadDir()).normalize();
+        this.lockTimeoutMs = TimeUnit.SECONDS.toMillis(tusRuntimeConfig.lockTimeoutSeconds());
         try {
             Files.createDirectories(uploadBaseDir);
             LOG.infof("TUS uploads dir: %s", uploadBaseDir);
@@ -104,7 +107,13 @@ public class LocalFileUploadStore implements UploadStore {
         }
     }
 
-    private void reloadPersistedUploads() {
+    /**
+     * Rescans the upload directory and reloads every persisted record. Runs at startup; a record
+     * whose data file disagrees with the persisted offset is reconciled here. Public so that an
+     * operator (or a test) can re-run it; it never touches an upload that is already loaded and
+     * unchanged on disk beyond re-reading its record.
+     */
+    public void reloadPersistedUploads() {
         int loaded = 0, expired = 0, skipped = 0;
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(uploadBaseDir, "*" + META_SUFFIX)) {
             for (Path metaFile : stream) {
@@ -136,12 +145,22 @@ public class LocalFileUploadStore implements UploadStore {
                         continue;
                     }
 
-                    // Reconcile offset with actual file size
+                    // Reconcile the data file with the persisted offset. Only committed offsets
+                    // are ever persisted, while staged bytes reach the file before they are
+                    // verified — so a file longer than the record holds an unverified tail from
+                    // a crash mid-write, and it is cut off. A shorter file has really lost data;
+                    // the record can only follow it.
                     long fileSize = Files.size(dataFile);
-                    if (info.getOffset() != fileSize && !info.isFinalConcat()) {
-                        LOG.warnf("Offset mismatch for upload %s: meta=%d, file=%d — trusting file size",
-                                id, info.getOffset(), fileSize);
-                        info.setOffset(fileSize);
+                    if (!info.isFinalConcat()) {
+                        if (fileSize > info.getOffset()) {
+                            LOG.warnf("Upload %s: data file (%d) is longer than persisted offset %d"
+                                    + " — truncating unverified tail", id, fileSize, info.getOffset());
+                            truncateToOffset(dataFile, info.getOffset());
+                        } else if (fileSize < info.getOffset()) {
+                            LOG.warnf("Upload %s: data file (%d) is shorter than persisted offset %d"
+                                    + " — trusting file size", id, fileSize, info.getOffset());
+                            info.setOffset(fileSize);
+                        }
                     }
 
                     uploads.put(id, info);
@@ -231,16 +250,32 @@ public class LocalFileUploadStore implements UploadStore {
                 .flatMap(asyncFile -> {
                     asyncFile.setWritePos(offset);
                     return data
-                            .onItem().transformToUniAndConcatenate(buf ->
-                                    asyncFile.write(io.vertx.mutiny.core.buffer.Buffer.newInstance(buf))
-                                            .replaceWith((long) buf.length()))
+                            .onItem().transformToUniAndConcatenate(buf -> {
+                                // The lock spans the whole transfer; a slow client must not
+                                // look abandoned while its bytes are still arriving.
+                                touchLock(id);
+                                return asyncFile.write(io.vertx.mutiny.core.buffer.Buffer.newInstance(buf))
+                                        .replaceWith((long) buf.length());
+                            })
                             .collect().with(Collectors.summingLong(Long::longValue))
                             .eventually(asyncFile::close);
                 })
-                .onFailure().invoke(e -> {
-                    LOG.errorf(e, "Error staging chunk for upload %s at %d — truncating to safe offset", id, offset);
-                    truncateToOffset(file, offset);
+                .onFailure().call(e -> {
+                    // Only our own file I/O is an error of ours; anything else came down the
+                    // stream (a limit crossed, the client gone) and is the caller's business.
+                    if (e instanceof FileSystemException || e instanceof IOException) {
+                        LOG.errorf(e, "Error staging chunk for upload %s at %d — truncating to safe offset", id, offset);
+                    } else {
+                        LOG.debugf("Staging of upload %s at %d stopped: %s", id, offset, e.getMessage());
+                    }
+                    return abortChunk(id, offset)
+                            .onFailure().recoverWithNull();
                 });
+    }
+
+    /** Refreshes the lock's timestamp so activity, not acquisition time, decides staleness. */
+    private void touchLock(String id) {
+        activeLocks.computeIfPresent(id, (k, v) -> System.currentTimeMillis());
     }
 
     @Override
@@ -311,12 +346,12 @@ public class LocalFileUploadStore implements UploadStore {
                     return null;
                 }), false))
                 .replaceWithVoid()
-                .onFailure().transform(e -> {
+                .onFailure().call(e -> {
                     LOG.errorf(e, "Failed to concatenate into %s — truncating partial merge", finalId);
-                    truncateToOffset(finalFile, 0);
-                    return e instanceof UploadStoreException ? e
-                            : new UploadStoreException("Failed to concatenate into " + finalId, e);
-                });
+                    return abortChunk(finalId, 0).onFailure().recoverWithNull();
+                })
+                .onFailure().transform(e -> e instanceof UploadStoreException ? e
+                        : new UploadStoreException("Failed to concatenate into " + finalId, e));
     }
 
     /**
@@ -364,7 +399,7 @@ public class LocalFileUploadStore implements UploadStore {
             return true;
         }
         // Check if existing lock has timed out
-        if (now - existing > LOCK_TIMEOUT_MS) {
+        if (now - existing > lockTimeoutMs) {
             if (activeLocks.replace(id, existing, now)) {
                 LOG.warnf("Reclaimed stale lock for upload %s (held for %d ms)", id, now - existing);
                 return true;
@@ -382,7 +417,7 @@ public class LocalFileUploadStore implements UploadStore {
     public void cleanupStaleLocks() {
         long now = System.currentTimeMillis();
         activeLocks.entrySet().removeIf(entry -> {
-            boolean stale = now - entry.getValue() > LOCK_TIMEOUT_MS;
+            boolean stale = now - entry.getValue() > lockTimeoutMs;
             if (stale) {
                 LOG.warnf("Removing stale lock for upload %s (held for %d ms)", entry.getKey(), now - entry.getValue());
             }
