@@ -119,6 +119,9 @@ The in-memory store used by the extension's own test suite is exactly this, in a
 
 === The streaming way: an S3 sketch
 
+A complete, working version of this sketch — `S3UploadStore` in the extension's `integration-tests` module — runs the SPI contract test and a 400 MB upload against MinIO (set `TUS_S3_ENDPOINT`). It cuts the body into 5 MB multipart parts as the bytes arrive and keeps only the sub-part tail between commits, so a 400 MB chunk goes through a 512 MB JVM holding one part at a time. It is a sample to copy, not a published artifact: the extension ships no vendor SDK.
+
+
 [source,java]
 ----
 @ApplicationScoped
