@@ -81,7 +81,7 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `quarkus.tus.max-chunk-size`
 | `long`
 | `10485760` (10 MB)
-| Maximum chunk size per PATCH request in bytes. Enforced on both PATCH uploads and creation-with-upload POST requests. Requests exceeding this limit receive a 413 response.
+| Maximum chunk size per PATCH request in bytes. Enforced on both PATCH uploads and creation-with-upload POST requests. Requests exceeding this limit receive a 413 response. *Raising it above 10 MB also requires raising Quarkus's own body limit, `quarkus.http.limits.max-body-size` (default `10240K`), or the HTTP layer rejects the request before the extension sees it.* Chunk bodies stream through the store, so a large chunk does not mean a large heap: the bundled store was measured writing a 400 MB chunk inside a 512 MB heap.
 
 | `quarkus.tus.lock-timeout-seconds`
 | `long`
