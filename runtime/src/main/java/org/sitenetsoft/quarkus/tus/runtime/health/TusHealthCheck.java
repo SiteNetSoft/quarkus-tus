@@ -17,7 +17,7 @@ public class TusHealthCheck implements HealthCheck {
     @Override
     public HealthCheckResponse call() {
         try {
-            uploadStore.findUploadInfo("health-check-probe");
+            uploadStore.findUploadInfo("health-check-probe").await().atMost(java.time.Duration.ofSeconds(5));
             return HealthCheckResponse.named("TUS Upload Store").up().build();
         } catch (Exception e) {
             return HealthCheckResponse.named("TUS Upload Store").down().withData("error", e.getMessage()).build();

@@ -47,9 +47,9 @@ class TusMetadataPersistenceTest {
 
         ((LocalFileUploadStore) uploadStore).reloadPersistedUploads();
 
-        assertEquals(200L, uploadStore.findUploadInfo(id).orElseThrow().getOffset());
+        assertEquals(200L, Stores.find(uploadStore, id).orElseThrow().getOffset());
         assertEquals(200L, Files.size(data), "unverified staged tail must be cut off");
-        uploadStore.discardUpload(id);
+        Stores.discard(uploadStore, id);
     }
 
     /** A file shorter than the persisted offset has really lost data; the file is the truth then. */
@@ -65,8 +65,8 @@ class TusMetadataPersistenceTest {
 
         ((LocalFileUploadStore) uploadStore).reloadPersistedUploads();
 
-        assertEquals(100L, uploadStore.findUploadInfo(id).orElseThrow().getOffset());
-        uploadStore.discardUpload(id);
+        assertEquals(100L, Stores.find(uploadStore, id).orElseThrow().getOffset());
+        Stores.discard(uploadStore, id);
     }
 
     // ---- JSON round-trip ----

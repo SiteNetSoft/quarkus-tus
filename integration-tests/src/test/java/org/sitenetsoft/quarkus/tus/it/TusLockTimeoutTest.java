@@ -40,13 +40,13 @@ class TusLockTimeoutTest {
         UploadInfo info = new UploadInfo();
         info.setEntityLength(1000L);
         info.setOffset(0L);
-        return uploadStore.createUpload(info);
+        return Stores.create(uploadStore, info);
     }
 
     @Test
     void lockIsNotReclaimedWhileAChunkIsStillStreaming() throws Exception {
         String id = newUpload();
-        assertTrue(uploadStore.acquireLock(id));
+        assertTrue(Stores.lock(uploadStore, id));
         try {
             // Six buffers, 300 ms apart: the write outlives the 1 s timeout by a wide margin.
             Multi<Buffer> slowBody = Multi.createFrom().ticks().every(Duration.ofMillis(300))
@@ -56,26 +56,26 @@ class TusLockTimeoutTest {
                     .subscribeAsCompletionStage();
 
             Thread.sleep(1_400);
-            assertFalse(uploadStore.acquireLock(id), "lock reclaimed while a write was still streaming");
+            assertFalse(Stores.lock(uploadStore, id), "lock reclaimed while a write was still streaming");
 
             assertEquals(60L, staged.get(10, TimeUnit.SECONDS));
             uploadStore.commitChunk(id, 0, 60).await().atMost(Duration.ofSeconds(5));
         } finally {
-            uploadStore.releaseLock(id);
-            uploadStore.discardUpload(id);
+            Stores.unlock(uploadStore, id);
+            Stores.discard(uploadStore, id);
         }
     }
 
     @Test
     void idleLockIsReclaimedAfterTheConfiguredTimeout() throws Exception {
         String id = newUpload();
-        assertTrue(uploadStore.acquireLock(id));
+        assertTrue(Stores.lock(uploadStore, id));
         try {
             Thread.sleep(1_300);
-            assertTrue(uploadStore.acquireLock(id), "an abandoned lock must be reclaimable after the timeout");
+            assertTrue(Stores.lock(uploadStore, id), "an abandoned lock must be reclaimable after the timeout");
         } finally {
-            uploadStore.releaseLock(id);
-            uploadStore.discardUpload(id);
+            Stores.unlock(uploadStore, id);
+            Stores.discard(uploadStore, id);
         }
     }
 }

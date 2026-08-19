@@ -148,7 +148,7 @@ class TusUploadTest extends TusUploadTestBase {
         String location = createUpload(100);
         String uploadId = extractId(location);
 
-        uploadStore.findUploadInfo(uploadId).ifPresent(
+        Stores.find(uploadStore, uploadId).ifPresent(
                 info -> info.setExpiresAt(Instant.now().minusSeconds(3600)));
 
         given()
@@ -164,7 +164,7 @@ class TusUploadTest extends TusUploadTestBase {
         String location = createUpload(data.length);
         String uploadId = extractId(location);
 
-        uploadStore.findUploadInfo(uploadId).ifPresent(
+        Stores.find(uploadStore, uploadId).ifPresent(
                 info -> info.setExpiresAt(Instant.now().minusSeconds(3600)));
 
         given()
@@ -187,24 +187,24 @@ class TusUploadTest extends TusUploadTestBase {
         String id2 = extractId(loc2);
         String id3 = extractId(loc3);
 
-        uploadStore.findUploadInfo(id1).ifPresent(
+        Stores.find(uploadStore, id1).ifPresent(
                 info -> info.setExpiresAt(Instant.now().minusSeconds(3600)));
-        uploadStore.findUploadInfo(id2).ifPresent(
+        Stores.find(uploadStore, id2).ifPresent(
                 info -> info.setExpiresAt(Instant.now().minusSeconds(3600)));
 
         // The store is shared with every other test in this JVM and with leftovers reloaded
         // from earlier runs, some of which may cross their expiry during this run — so assert
         // on these three uploads, not on the total.
-        List<String> cleaned = uploadStore.cleanupExpiredUploads();
+        List<String> cleaned = Stores.await(uploadStore.cleanupExpiredUploads());
         assertTrue(cleaned.contains(id1), "Expired upload 1 should be cleaned");
         assertTrue(cleaned.contains(id2), "Expired upload 2 should be cleaned");
         assertFalse(cleaned.contains(id3), "Non-expired upload should not be cleaned");
 
-        assertTrue(uploadStore.findUploadInfo(id3).isPresent(),
+        assertTrue(Stores.find(uploadStore, id3).isPresent(),
                 "Non-expired upload should still exist");
-        assertTrue(uploadStore.findUploadInfo(id1).isEmpty(),
+        assertTrue(Stores.find(uploadStore, id1).isEmpty(),
                 "Expired upload 1 should be removed");
-        assertTrue(uploadStore.findUploadInfo(id2).isEmpty(),
+        assertTrue(Stores.find(uploadStore, id2).isEmpty(),
                 "Expired upload 2 should be removed");
     }
 
@@ -241,9 +241,9 @@ class TusUploadTest extends TusUploadTestBase {
 
         String id1 = extractId(loc1);
         String id2 = extractId(loc2);
-        assertTrue(uploadStore.findUploadInfo(id1).isEmpty(),
+        assertTrue(Stores.find(uploadStore, id1).isEmpty(),
                 "Partial 1 should be removed after merge");
-        assertTrue(uploadStore.findUploadInfo(id2).isEmpty(),
+        assertTrue(Stores.find(uploadStore, id2).isEmpty(),
                 "Partial 2 should be removed after merge");
     }
 
@@ -252,7 +252,7 @@ class TusUploadTest extends TusUploadTestBase {
         String location = createUpload(100);
         String uploadId = extractId(location);
 
-        assertTrue(uploadStore.acquireLock(uploadId), "Lock should be acquired");
+        assertTrue(Stores.lock(uploadStore, uploadId), "Lock should be acquired");
 
         try {
             given()
@@ -264,7 +264,7 @@ class TusUploadTest extends TusUploadTestBase {
                     .then()
                     .statusCode(423);
         } finally {
-            uploadStore.releaseLock(uploadId);
+            Stores.unlock(uploadStore, uploadId);
         }
     }
 
@@ -274,7 +274,7 @@ class TusUploadTest extends TusUploadTestBase {
         String location = createUpload(data.length);
         String uploadId = extractId(location);
 
-        assertTrue(uploadStore.acquireLock(uploadId), "Lock should be acquired");
+        assertTrue(Stores.lock(uploadStore, uploadId), "Lock should be acquired");
 
         try {
             given()
@@ -286,7 +286,7 @@ class TusUploadTest extends TusUploadTestBase {
                     .then()
                     .statusCode(423);
         } finally {
-            uploadStore.releaseLock(uploadId);
+            Stores.unlock(uploadStore, uploadId);
         }
 
         // After releasing, a normal PATCH should succeed
@@ -338,9 +338,9 @@ class TusUploadTest extends TusUploadTestBase {
         // Partials should be cleaned up after finalization
         String id1 = extractId(loc1);
         String id2 = extractId(loc2);
-        assertTrue(uploadStore.findUploadInfo(id1).isEmpty(),
+        assertTrue(Stores.find(uploadStore, id1).isEmpty(),
                 "Partial 1 should be removed after finalization");
-        assertTrue(uploadStore.findUploadInfo(id2).isEmpty(),
+        assertTrue(Stores.find(uploadStore, id2).isEmpty(),
                 "Partial 2 should be removed after finalization");
     }
 
@@ -351,14 +351,14 @@ class TusUploadTest extends TusUploadTestBase {
         String id1 = extractId(loc1);
         String id2 = extractId(loc2);
 
-        uploadStore.findUploadInfo(id1).ifPresent(
+        Stores.find(uploadStore, id1).ifPresent(
                 info -> info.setExpiresAt(Instant.now().minusSeconds(3600)));
 
         expirationScheduler.cleanupExpiredUploads();
 
-        assertTrue(uploadStore.findUploadInfo(id1).isEmpty(),
+        assertTrue(Stores.find(uploadStore, id1).isEmpty(),
                 "Expired upload should be removed by scheduler");
-        assertTrue(uploadStore.findUploadInfo(id2).isPresent(),
+        assertTrue(Stores.find(uploadStore, id2).isPresent(),
                 "Non-expired upload should still exist");
     }
 }

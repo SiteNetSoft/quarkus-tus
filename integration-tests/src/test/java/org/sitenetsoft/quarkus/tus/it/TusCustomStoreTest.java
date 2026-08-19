@@ -111,7 +111,7 @@ class TusCustomStoreTest {
                 .statusCode(204);
 
         assertFalse(inMemStore.hasData(uploadId), "Data should be removed after delete");
-        assertTrue(uploadStore.findUploadInfo(uploadId).isEmpty(), "Upload info should be removed after delete");
+        assertTrue(Stores.find(uploadStore, uploadId).isEmpty(), "Upload info should be removed after delete");
     }
 
     @Test

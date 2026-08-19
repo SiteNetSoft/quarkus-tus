@@ -99,7 +99,7 @@ class TusEdgeCaseTest {
         String location = createUpload(100);
         String uploadId = extractId(location);
 
-        assertTrue(uploadStore.acquireLock(uploadId), "Test needs to hold the lock");
+        assertTrue(Stores.lock(uploadStore, uploadId), "Test needs to hold the lock");
         try {
             given()
                     .header("Tus-Resumable", "1.0.0")
@@ -110,7 +110,7 @@ class TusEdgeCaseTest {
                     .then()
                     .statusCode(423);
         } finally {
-            uploadStore.releaseLock(uploadId);
+            Stores.unlock(uploadStore, uploadId);
         }
     }
 
@@ -141,7 +141,7 @@ class TusEdgeCaseTest {
                                 .await().atMost(java.time.Duration.ofSeconds(5)),
                 "Staging at a stale offset must fail");
 
-        assertEquals(4, uploadStore.findUploadInfo(uploadId).orElseThrow().getOffset(),
+        assertEquals(4, Stores.find(uploadStore, uploadId).orElseThrow().getOffset(),
                 "Offset must be unchanged after the rejected write");
 
         Path dataFile = Path.of(tusRuntimeConfig.store().local().uploadDir(), uploadId);
@@ -259,7 +259,7 @@ class TusEdgeCaseTest {
         String location = createUpload(100);
         String uploadId = extractId(location);
 
-        assertTrue(uploadStore.acquireLock(uploadId), "Test needs to hold the lock");
+        assertTrue(Stores.lock(uploadStore, uploadId), "Test needs to hold the lock");
         try {
             given()
                     .header("Tus-Resumable", "1.0.0")
@@ -267,7 +267,7 @@ class TusEdgeCaseTest {
                     .then()
                     .statusCode(423);
         } finally {
-            uploadStore.releaseLock(uploadId);
+            Stores.unlock(uploadStore, uploadId);
         }
 
         // The upload must have survived the attempt, and be deletable once unlocked.
@@ -300,19 +300,19 @@ class TusEdgeCaseTest {
 
         Path dataFile = Path.of(tusRuntimeConfig.store().local().uploadDir(), uploadId);
 
-        assertTrue(uploadStore.acquireLock(uploadId), "Test needs to hold the lock");
+        assertTrue(Stores.lock(uploadStore, uploadId), "Test needs to hold the lock");
         try {
             given()
                     .header("Tus-Resumable", "1.0.0")
                     .when().delete(location)
                     .then()
                     .statusCode(423);
-            assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(),
+            assertTrue(Stores.find(uploadStore, uploadId).isPresent(),
                     "Upload entry must survive a refused delete");
             assertTrue(Files.exists(dataFile), "Data file must survive a refused delete");
             assertArrayEquals(data, Files.readAllBytes(dataFile), "Data must be intact");
         } finally {
-            uploadStore.releaseLock(uploadId);
+            Stores.unlock(uploadStore, uploadId);
         }
 
         given()
@@ -389,9 +389,9 @@ class TusEdgeCaseTest {
         String uploadId = extractId(location);
         assertNotNull(uploadProgressService.getProgress(uploadId), "creation starts progress tracking");
 
-        UploadInfo info = uploadStore.findUploadInfo(uploadId).orElseThrow();
+        UploadInfo info = Stores.find(uploadStore, uploadId).orElseThrow();
         info.setExpiresAt(Instant.now().minusSeconds(1));
-        uploadStore.updateUploadInfo(uploadId, info);
+        Stores.update(uploadStore, uploadId, info);
 
         given()
                 .header("Tus-Resumable", "1.0.0")
@@ -399,7 +399,7 @@ class TusEdgeCaseTest {
                 .then()
                 .statusCode(410);
 
-        assertTrue(uploadStore.findUploadInfo(uploadId).isEmpty(), "expired upload is discarded");
+        assertTrue(Stores.find(uploadStore, uploadId).isEmpty(), "expired upload is discarded");
         assertNull(uploadProgressService.getProgress(uploadId), "progress entry must go with it");
     }
 
@@ -460,7 +460,7 @@ class TusEdgeCaseTest {
                 "Losing PATCHes must be rejected with 423 or 409, got: " + statusCodes);
 
         // The stored bytes must be exactly one writer's chunk, not a blend of two.
-        long offset = uploadStore.findUploadInfo(uploadId).orElseThrow().getOffset();
+        long offset = Stores.find(uploadStore, uploadId).orElseThrow().getOffset();
         byte[] onDisk = Files.readAllBytes(Path.of(tusRuntimeConfig.store().local().uploadDir(), uploadId));
         assertEquals(offset, onDisk.length, "File length must match the recorded offset");
         assertTrue(offset > 0 && offset % 4 == 0, "Offset must match one writer's chunk size: " + offset);
@@ -482,15 +482,15 @@ class TusEdgeCaseTest {
         String uploadId = extractId(location);
 
         // Manually acquire a lock with a past timestamp to simulate stale lock
-        assertTrue(uploadStore.acquireLock(uploadId), "Initial lock should be acquired");
+        assertTrue(Stores.lock(uploadStore, uploadId), "Initial lock should be acquired");
 
         // The lock is fresh, so a second acquire should fail
-        assertFalse(uploadStore.acquireLock(uploadId), "Lock should not be re-acquired while held");
+        assertFalse(Stores.lock(uploadStore, uploadId), "Lock should not be re-acquired while held");
 
         // Release and verify re-acquisition
-        uploadStore.releaseLock(uploadId);
-        assertTrue(uploadStore.acquireLock(uploadId), "Lock should be acquirable after release");
-        uploadStore.releaseLock(uploadId);
+        Stores.unlock(uploadStore, uploadId);
+        assertTrue(Stores.lock(uploadStore, uploadId), "Lock should be acquirable after release");
+        Stores.unlock(uploadStore, uploadId);
     }
 
     @Test
@@ -499,14 +499,14 @@ class TusEdgeCaseTest {
             String location = createUpload(100);
             String uploadId = extractId(location);
 
-            assertTrue(uploadStore.acquireLock(uploadId));
+            assertTrue(Stores.lock(uploadStore, uploadId));
 
             // Cleanup should not remove a fresh lock
-            localStore.cleanupStaleLocks();
-            assertFalse(uploadStore.acquireLock(uploadId),
+            Stores.await(localStore.cleanupStaleLocks());
+            assertFalse(Stores.lock(uploadStore, uploadId),
                     "Fresh lock should NOT be cleaned up");
 
-            uploadStore.releaseLock(uploadId);
+            Stores.unlock(uploadStore, uploadId);
         }
     }
 
@@ -696,12 +696,12 @@ class TusEdgeCaseTest {
             String uploadId = extractId(location);
 
             // Manually backdate lastActivity to make it stale
-            var info = uploadStore.findUploadInfo(uploadId).orElseThrow();
+            var info = Stores.find(uploadStore, uploadId).orElseThrow();
             info.setLastActivity(Instant.now().minus(7, ChronoUnit.HOURS));
 
-            List<String> cleaned = localStore.cleanupStaleUploads(6);
+            List<String> cleaned = Stores.await(localStore.cleanupStaleUploads(6));
             assertTrue(cleaned.contains(uploadId), "Stale upload should be cleaned up");
-            assertTrue(uploadStore.findUploadInfo(uploadId).isEmpty(), "Upload should be removed");
+            assertTrue(Stores.find(uploadStore, uploadId).isEmpty(), "Upload should be removed");
         }
     }
 
@@ -712,12 +712,12 @@ class TusEdgeCaseTest {
             String uploadId = extractId(location);
 
             // lastActivity is set at creation time (recent), so should survive
-            List<String> cleaned = localStore.cleanupStaleUploads(6);
+            List<String> cleaned = Stores.await(localStore.cleanupStaleUploads(6));
             assertFalse(cleaned.contains(uploadId), "Active upload should NOT be cleaned up");
-            assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(), "Upload should still exist");
+            assertTrue(Stores.find(uploadStore, uploadId).isPresent(), "Upload should still exist");
 
             // Clean up
-            uploadStore.discardUpload(uploadId);
+            Stores.discard(uploadStore, uploadId);
         }
     }
 
@@ -739,14 +739,14 @@ class TusEdgeCaseTest {
                     .statusCode(204);
 
             // Backdate lastActivity
-            var info = uploadStore.findUploadInfo(uploadId).orElseThrow();
+            var info = Stores.find(uploadStore, uploadId).orElseThrow();
             info.setLastActivity(Instant.now().minus(7, ChronoUnit.HOURS));
 
-            List<String> cleaned = localStore.cleanupStaleUploads(6);
+            List<String> cleaned = Stores.await(localStore.cleanupStaleUploads(6));
             assertFalse(cleaned.contains(uploadId), "Completed upload should NOT be cleaned up as stale");
 
             // Clean up
-            uploadStore.discardUpload(uploadId);
+            Stores.discard(uploadStore, uploadId);
         }
     }
 
@@ -756,15 +756,15 @@ class TusEdgeCaseTest {
             String location = createUpload(100);
             String uploadId = extractId(location);
 
-            var info = uploadStore.findUploadInfo(uploadId).orElseThrow();
+            var info = Stores.find(uploadStore, uploadId).orElseThrow();
             info.setLastActivity(Instant.now().minus(7, ChronoUnit.HOURS));
 
-            List<String> cleaned = localStore.cleanupStaleUploads(0);
+            List<String> cleaned = Stores.await(localStore.cleanupStaleUploads(0));
             assertTrue(cleaned.isEmpty(), "Stale cleanup with 0 hours should do nothing");
-            assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(), "Upload should still exist");
+            assertTrue(Stores.find(uploadStore, uploadId).isPresent(), "Upload should still exist");
 
             // Clean up
-            uploadStore.discardUpload(uploadId);
+            Stores.discard(uploadStore, uploadId);
         }
     }
 
@@ -781,7 +781,7 @@ class TusEdgeCaseTest {
             Files.writeString(orphanFile, "orphaned data");
             assertTrue(Files.exists(orphanFile));
 
-            int cleaned = localStore.cleanupOrphanFiles();
+            int cleaned = Stores.await(localStore.cleanupOrphanFiles());
             assertTrue(cleaned >= 1, "Should clean up at least 1 orphan file");
             assertFalse(Files.exists(orphanFile), "Orphan file should be deleted");
         }
@@ -794,12 +794,12 @@ class TusEdgeCaseTest {
             String location = createUpload(100);
             String uploadId = extractId(location);
 
-            int cleaned = localStore.cleanupOrphanFiles();
-            assertTrue(uploadStore.findUploadInfo(uploadId).isPresent(),
+            int cleaned = Stores.await(localStore.cleanupOrphanFiles());
+            assertTrue(Stores.find(uploadStore, uploadId).isPresent(),
                     "Tracked upload should survive orphan cleanup");
 
             // Clean up
-            uploadStore.discardUpload(uploadId);
+            Stores.discard(uploadStore, uploadId);
         }
     }
 
@@ -819,7 +819,7 @@ class TusEdgeCaseTest {
                     .await().atMost(java.time.Duration.ofSeconds(5));
             uploadStore.commitChunk(uploadId, 0, staged).await().atMost(java.time.Duration.ofSeconds(5));
             assertEquals(data.length, staged, "Initial data should be written");
-            assertEquals(data.length, uploadStore.findUploadInfo(uploadId).orElseThrow().getOffset());
+            assertEquals(data.length, Stores.find(uploadStore, uploadId).orElseThrow().getOffset());
 
             // Verify file size matches offset
             Path uploadDir = Path.of(tusRuntimeConfig.store().local().uploadDir());
@@ -827,7 +827,7 @@ class TusEdgeCaseTest {
             assertEquals(data.length, Files.size(file), "File size should match written data");
 
             // Clean up
-            uploadStore.discardUpload(uploadId);
+            Stores.discard(uploadStore, uploadId);
         }
     }
 

@@ -23,7 +23,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>
  * Subclasses implement the record methods ({@link #findUploadInfo}, {@link #createUpload},
  * {@link #updateUploadInfo}), {@link #appendBytes}, {@link #concatenate}, {@link #discardUpload},
- * the lock pair and {@link #cleanupExpiredUploads}.
+ * the lock pair and {@link #cleanupExpiredUploads}. Only {@link #appendBytes} may block; the
+ * record methods are subscribed to on the event loop like every other SPI method, and a store
+ * whose records are in memory simply returns {@code Uni.createFrom().item(...)}.
  */
 public abstract class BufferingUploadStore implements UploadStore {
 
@@ -38,21 +40,23 @@ public abstract class BufferingUploadStore implements UploadStore {
 
     @Override
     public Uni<Long> stageChunk(String id, long offset, Multi<Buffer> data, long expectedLength) {
-        UploadInfo info = findUploadInfo(id).orElse(null);
-        if (info == null) {
-            return Uni.createFrom().failure(new UploadNotFoundException(id));
-        }
-        if (offset != info.getOffset()) {
-            return Uni.createFrom().failure(new OffsetMismatchException(
-                    "Write at offset " + offset + " but upload " + id + " is at offset " + info.getOffset(),
-                    info.getOffset()));
-        }
-        return data.collect().in(ByteArrayOutputStream::new, (out, buf) -> out.writeBytes(buf.getBytes()))
-                .onItem().transform(out -> {
-                    byte[] bytes = out.toByteArray();
-                    staged.put(id, bytes);
-                    return (long) bytes.length;
-                });
+        return findUploadInfo(id).chain(found -> {
+            UploadInfo info = found.orElse(null);
+            if (info == null) {
+                return Uni.createFrom().failure(new UploadNotFoundException(id));
+            }
+            if (offset != info.getOffset()) {
+                return Uni.createFrom().failure(new OffsetMismatchException(
+                        "Write at offset " + offset + " but upload " + id + " is at offset " + info.getOffset(),
+                        info.getOffset()));
+            }
+            return data.collect().in(ByteArrayOutputStream::new, (out, buf) -> out.writeBytes(buf.getBytes()))
+                    .onItem().transform(out -> {
+                        byte[] bytes = out.toByteArray();
+                        staged.put(id, bytes);
+                        return (long) bytes.length;
+                    });
+        });
     }
 
     @Override
@@ -66,20 +70,24 @@ public abstract class BufferingUploadStore implements UploadStore {
             bytes = new byte[0];
         }
         final byte[] data = bytes;
-        // appendBytes and updateUploadInfo are synchronous by design — this class exists for
-        // stores whose client blocks — so they must not run on the event loop the body arrived on.
-        return Uni.createFrom().<Void>item(() -> {
-                    UploadInfo info = findUploadInfo(id).orElse(null);
-                    if (info == null) {
-                        throw new UploadNotFoundException(id);
-                    }
-                    appendBytes(id, offset, data);
-                    info.setOffset(offset + data.length);
-                    info.setLastActivity(Instant.now());
-                    updateUploadInfo(id, info);
-                    return null;
-                })
-                .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        return findUploadInfo(id).chain(found -> {
+            UploadInfo info = found.orElse(null);
+            if (info == null) {
+                return Uni.createFrom().<Void>failure(new UploadNotFoundException(id));
+            }
+            // appendBytes is synchronous by design — this class exists for stores whose client
+            // blocks — so it must not run on the event loop the body arrived on.
+            return Uni.createFrom().<Void>item(() -> {
+                        appendBytes(id, offset, data);
+                        return null;
+                    })
+                    .runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
+                    .chain(() -> {
+                        info.setOffset(offset + data.length);
+                        info.setLastActivity(Instant.now());
+                        return updateUploadInfo(id, info);
+                    });
+        });
     }
 
     @Override

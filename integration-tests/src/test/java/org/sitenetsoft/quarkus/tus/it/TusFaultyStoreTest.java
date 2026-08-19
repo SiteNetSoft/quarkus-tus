@@ -104,9 +104,9 @@ class TusFaultyStoreTest extends TusUploadTestBase {
 
         String id = store().lastCreatedId;
         assertNotNull(id);
-        assertTrue(store().acquireLock(id), "lock leaked by the failed creation-with-upload");
-        store().releaseLock(id);
-        assertTrue(store().findUploadInfo(id).isEmpty(), "failed creation-with-upload left its upload behind");
+        assertTrue(Stores.lock(store(), id), "lock leaked by the failed creation-with-upload");
+        Stores.unlock(store(), id);
+        assertTrue(Stores.find(store(), id).isEmpty(), "failed creation-with-upload left its upload behind");
     }
 
     /**
@@ -135,7 +135,7 @@ class TusFaultyStoreTest extends TusUploadTestBase {
             Thread.sleep(50);
         }
         assertEquals(1, store().abortCalls.get(), "the store was not told to abort the interrupted chunk");
-        assertEquals(0, store().findUploadInfo(id).orElseThrow().getOffset());
+        assertEquals(0, Stores.find(store(), id).orElseThrow().getOffset());
         uploadData(location, new byte[100], 0); // lock released, upload still usable
     }
 
@@ -168,7 +168,31 @@ class TusFaultyStoreTest extends TusUploadTestBase {
             assertTrue(statusLine.startsWith("HTTP/1.1 413"), statusLine);
         }
         assertEquals(1, store().abortCalls.get());
-        assertEquals(0, store().findUploadInfo(id).orElseThrow().getOffset());
+        assertEquals(0, Stores.find(store(), id).orElseThrow().getOffset());
+    }
+
+    /**
+     * Every SPI method is asynchronous, so the framework has no reason to offload a request to a
+     * worker before touching the store — and it must not go back to doing so, because that is the
+     * whole point of the change: a store that talks to a remote service keeps no local index and
+     * still never occupies a thread while it waits.
+     */
+    @Test
+    void theStoreIsCalledFromTheEventLoopNotAWorker() {
+        String location = createUpload(100);
+        uploadData(location, new byte[10], 0);
+        given().header("Tus-Resumable", "1.0.0").when().head(location).then().statusCode(200);
+
+        assertEventLoop("createUpload");   // POST
+        assertEventLoop("findUploadInfo"); // HEAD/PATCH entry
+        assertEventLoop("acquireLock");    // PATCH under lock
+    }
+
+    private void assertEventLoop(String method) {
+        String thread = store().callingThreads.get(method);
+        assertNotNull(thread, method + " was never called");
+        assertTrue(thread.startsWith("vert.x-eventloop"),
+                method + " ran on " + thread + ", so something is still offloading to a worker");
     }
 
     /** BufferingUploadStore exists for stores whose append blocks; it must not run on the event loop. */

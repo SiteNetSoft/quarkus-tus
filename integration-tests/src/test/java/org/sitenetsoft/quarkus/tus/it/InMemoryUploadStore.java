@@ -39,24 +39,28 @@ public class InMemoryUploadStore extends BufferingUploadStore {
         return dataStore.get(id);
     }
 
+    // Maps answer immediately, so every method here is an already-resolved Uni — which is all
+    // an in-memory store owes the asynchronous SPI.
+
     @Override
-    public Optional<UploadInfo> findUploadInfo(String id) {
-        return Optional.ofNullable(uploads.get(id));
+    public Uni<Optional<UploadInfo>> findUploadInfo(String id) {
+        return Uni.createFrom().item(Optional.ofNullable(uploads.get(id)));
     }
 
     @Override
-    public String createUpload(UploadInfo info) {
+    public Uni<String> createUpload(UploadInfo info) {
         String id = UUID.randomUUID().toString();
         uploads.put(id, info);
         dataStore.put(id, new byte[0]);
-        return id;
+        return Uni.createFrom().item(id);
     }
 
     @Override
-    public void updateUploadInfo(String id, UploadInfo info) {
+    public Uni<Void> updateUploadInfo(String id, UploadInfo info) {
         if (uploads.containsKey(id)) {
             uploads.put(id, info);
         }
+        return Uni.createFrom().voidItem();
     }
 
     @Override
@@ -91,38 +95,40 @@ public class InMemoryUploadStore extends BufferingUploadStore {
     }
 
     @Override
-    public boolean discardUpload(String id) {
+    public Uni<Boolean> discardUpload(String id) {
         UploadInfo removed = uploads.remove(id);
         dataStore.remove(id);
-        return removed != null;
+        return Uni.createFrom().item(removed != null);
     }
 
     @Override
-    public boolean acquireLock(String id) {
-        return activeLocks.add(id);
+    public Uni<Boolean> acquireLock(String id) {
+        return Uni.createFrom().item(activeLocks.add(id));
     }
 
     @Override
-    public void releaseLock(String id) {
+    public Uni<Void> releaseLock(String id) {
         activeLocks.remove(id);
+        return Uni.createFrom().voidItem();
     }
 
     @Override
-    public List<String> cleanupExpiredUploads() {
+    public Uni<List<String>> cleanupExpiredUploads() {
         Instant now = Instant.now();
         List<String> cleaned = new ArrayList<>();
         for (Map.Entry<String, UploadInfo> entry : uploads.entrySet()) {
             Instant expiresAt = entry.getValue().getExpiresAt();
-            if (expiresAt != null && now.isAfter(expiresAt) && acquireLock(entry.getKey())) {
+            if (expiresAt != null && now.isAfter(expiresAt) && activeLocks.add(entry.getKey())) {
                 try {
-                    if (discardUpload(entry.getKey())) {
+                    if (uploads.remove(entry.getKey()) != null) {
+                        dataStore.remove(entry.getKey());
                         cleaned.add(entry.getKey());
                     }
                 } finally {
-                    releaseLock(entry.getKey());
+                    activeLocks.remove(entry.getKey());
                 }
             }
         }
-        return cleaned;
+        return Uni.createFrom().item(cleaned);
     }
 }
