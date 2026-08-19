@@ -289,3 +289,31 @@ pulling every byte through the application.
    store's `UploadInfo`. Either the store keeps it (and the SPI grows a way to express it) or the
    framework gains its own small persistent record. This is the one part of the concatenation split
    that is not obviously clean.
+
+## Asynchronous record methods (2026-08-19)
+
+The record methods (`findUploadInfo`, `createUpload`, `updateUploadInfo`, `discardUpload`, the lock
+pair, the cleanup hooks) now return `Uni` like everything else, so the SPI has one threading model
+instead of two: **every method may be subscribed to on the event loop and none may block.**
+
+Why, given the S3 sample managed without it: the sample had to keep its records in a map and make one
+blocking `CreateMultipartUpload` call on a worker. Sync record methods forced *every* store to have a
+fast local answer, which rules out the stateless multi-replica deployment the SPI is supposed to
+enable — records in DynamoDB, locks in Redis. Since 1.0.0 was already breaking the SPI, folding this
+in costs one break instead of two.
+
+What it changed beyond the signatures:
+
+- `TusUploadResource` has **no `@Blocking` left**. POST used to run on a worker purely because the
+  bundled store's `createUpload` wrote a file there; the store now moves that to a worker itself
+  (`LocalFileUploadStore.blocking(...)`), and the resource stays on the event loop throughout.
+  `TusFaultyStoreTest.theStoreIsCalledFromTheEventLoopNotAWorker` fails if `@Blocking` comes back.
+- CDI lifecycle events still fire on a worker *inside* the chain, so an observer has run before the
+  client sees the response — the ordering `@Blocking` used to give. Firing them fire-and-forget looked
+  equivalent and was not: it made `TusUploadCreatedEvent` race the 201.
+- `TusUploadAuthorizer.isDenied` takes the `UploadInfo` the caller already fetched instead of looking
+  it up again, which also removes a second store round trip per request.
+- The SSE resources and the health check await the store: they are sink- or probe-based, run on a
+  worker, and are rare next to chunk traffic.
+- The TCK and the tests await through helpers (`AbstractUploadStoreContractTest.find/lock/...`,
+  `Stores` in the test module), so contract assertions stay readable.

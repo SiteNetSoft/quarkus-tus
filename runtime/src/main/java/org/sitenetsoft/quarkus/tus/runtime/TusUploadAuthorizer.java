@@ -5,7 +5,6 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.core.SecurityContext;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
-import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 /**
  * Decides whether a request may act on a given upload.
@@ -19,26 +18,24 @@ import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 public class TusUploadAuthorizer {
 
     @Inject
-    UploadStore uploadStore;
-
-    @Inject
     TusBuildTimeConfig tusBuildTimeConfig;
 
     /**
      * Whether the caller may not act on this upload. Uploads with no recorded uploader —
      * created while authentication was disabled — stay accessible, so enabling auth does not
-     * strand them.
+     * strand them. Pure: the caller passes the record it already fetched, so this never goes
+     * to the store.
      */
-    public boolean isDenied(String uploadId, SecurityContext securityContext) {
-        return isDenied(uploadId, currentUserId(securityContext));
+    public boolean isDenied(UploadInfo info, SecurityContext securityContext) {
+        return isDenied(info, currentUserId(securityContext));
     }
 
-    /** As {@link #isDenied(String, SecurityContext)}, for callers that already resolved the user. */
-    public boolean isDenied(String uploadId, String currentUserId) {
-        if (!tusBuildTimeConfig.authEnabled()) {
+    /** As {@link #isDenied(UploadInfo, SecurityContext)}, for callers that already resolved the user. */
+    public boolean isDenied(UploadInfo info, String currentUserId) {
+        if (!tusBuildTimeConfig.authEnabled() || info == null) {
             return false;
         }
-        String ownerId = uploadStore.findUploadInfo(uploadId).map(UploadInfo::getUploaderId).orElse(null);
+        String ownerId = info.getUploaderId();
         return ownerId != null && !ownerId.equals(currentUserId);
     }
 

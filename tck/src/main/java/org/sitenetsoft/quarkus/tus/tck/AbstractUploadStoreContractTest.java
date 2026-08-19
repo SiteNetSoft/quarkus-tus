@@ -94,22 +94,53 @@ public abstract class AbstractUploadStoreContractTest {
     }
 
     protected String create(long entityLength) {
-        return store().createUpload(record(entityLength));
+        return createRecord(record(entityLength));
+    }
+
+    // Every SPI method is asynchronous; a contract test is not, so each is awaited through one
+    // of these. Anything a test asserts on has already settled by the time it looks.
+
+    protected Optional<UploadInfo> find(String id) {
+        return await(store().findUploadInfo(id));
+    }
+
+    protected String createRecord(UploadInfo info) {
+        return await(store().createUpload(info));
+    }
+
+    protected void update(String id, UploadInfo info) {
+        await(store().updateUploadInfo(id, info));
+    }
+
+    protected boolean discard(String id) {
+        return await(store().discardUpload(id));
+    }
+
+    protected boolean lock(String id) {
+        return await(store().acquireLock(id));
+    }
+
+    protected void unlock(String id) {
+        await(store().releaseLock(id));
+    }
+
+    protected List<String> cleanupExpired() {
+        return await(store().cleanupExpiredUploads());
     }
 
     protected UploadInfo info(String id) {
-        return store().findUploadInfo(id).orElseThrow(() -> new AssertionError("upload " + id + " vanished"));
+        return find(id).orElseThrow(() -> new AssertionError("upload " + id + " vanished"));
     }
 
     /** Stage + commit under the lock, as the extension does. Returns the new offset. */
     protected long write(String id, long offset, String content) {
-        assertTrue(store().acquireLock(id), "lock must be free");
+        assertTrue(lock(id), "lock must be free");
         try {
             long staged = stage(id, offset, bytes(content), content.length());
             await(store().commitChunk(id, offset, staged));
             return offset + staged;
         } finally {
-            store().releaseLock(id);
+            unlock(id);
         }
     }
 
@@ -126,7 +157,7 @@ public abstract class AbstractUploadStoreContractTest {
         record.setMetadata("filename dGVzdA==");
         record.setPartial(true);
         record.setUploaderId("alice");
-        String id = store().createUpload(record);
+        String id = createRecord(record);
 
         assertNotNull(id);
         assertFalse(id.isBlank());
@@ -142,20 +173,20 @@ public abstract class AbstractUploadStoreContractTest {
 
     @Test
     public void findUploadInfoIsEmptyForUnknownId() {
-        assertTrue(store().findUploadInfo(UUID.randomUUID().toString()).isEmpty());
+        assertTrue(find(UUID.randomUUID().toString()).isEmpty());
     }
 
     @Test
     public void updateUploadInfoPersistsProtocolChanges() {
         UploadInfo record = record(-1);
         record.setDeferredLength(true);
-        String id = store().createUpload(record);
+        String id = createRecord(record);
 
         UploadInfo current = info(id);
         current.setUploaderId("bob");
         current.setEntityLength(500);
         current.setDeferredLength(false);
-        store().updateUploadInfo(id, current);
+        update(id, current);
 
         UploadInfo reread = info(id);
         assertEquals("bob", reread.getUploaderId());
@@ -166,8 +197,8 @@ public abstract class AbstractUploadStoreContractTest {
     @Test
     public void updateUploadInfoOnUnknownIdIsANoOp() {
         String id = UUID.randomUUID().toString();
-        store().updateUploadInfo(id, record(10));
-        assertTrue(store().findUploadInfo(id).isEmpty(), "updateUploadInfo must not create records");
+        update(id, record(10));
+        assertTrue(find(id).isEmpty(), "updateUploadInfo must not create records");
     }
 
     // ---- staged writes ----
@@ -175,7 +206,7 @@ public abstract class AbstractUploadStoreContractTest {
     @Test
     public void stageDoesNotAdvanceOffsetUntilCommit() {
         String id = create(10);
-        assertTrue(store().acquireLock(id));
+        assertTrue(lock(id));
         try {
             long staged = await(store().stageChunk(id, 0, bytes("hello"), 5));
             assertEquals(5, staged);
@@ -185,7 +216,7 @@ public abstract class AbstractUploadStoreContractTest {
             assertEquals(5, info(id).getOffset(), "commit advances by the staged count");
             assertNotNull(info(id).getLastActivity());
         } finally {
-            store().releaseLock(id);
+            unlock(id);
         }
         assertContent(id, "hello");
     }
@@ -203,13 +234,13 @@ public abstract class AbstractUploadStoreContractTest {
     @Test
     public void multiBufferStageSumsTheBuffers() {
         String id = create(9);
-        assertTrue(store().acquireLock(id));
+        assertTrue(lock(id));
         try {
             long staged = await(store().stageChunk(id, 0, bytes("abc", "def", "ghi"), 9));
             assertEquals(9, staged);
             await(store().commitChunk(id, 0, staged));
         } finally {
-            store().releaseLock(id);
+            unlock(id);
         }
         assertEquals(9, info(id).getOffset());
         assertContent(id, "abcdefghi");
@@ -220,14 +251,14 @@ public abstract class AbstractUploadStoreContractTest {
         String id = create(10);
         write(id, 0, "ab");
 
-        assertTrue(store().acquireLock(id));
+        assertTrue(lock(id));
         try {
             long staged = await(store().stageChunk(id, 2, bytes("XXXX"), 4));
             assertEquals(4, staged);
             await(store().abortChunk(id, 2));
             assertEquals(2, info(id).getOffset(), "abort must leave the offset where it was");
         } finally {
-            store().releaseLock(id);
+            unlock(id);
         }
         assertContent(id, "ab");
 
@@ -274,13 +305,13 @@ public abstract class AbstractUploadStoreContractTest {
         IllegalStateException boom = new IllegalStateException("stream cut");
         Multi<Buffer> failing = Multi.createBy().concatenating().streams(bytes("de"), Multi.createFrom().failure(boom));
 
-        assertTrue(store().acquireLock(id));
+        assertTrue(lock(id));
         try {
             Throwable seen = assertThrows(Throwable.class, () -> stage(id, 3, failing, -1));
             assertSame(boom, seen, "the stream's failure must be propagated unwrapped");
             await(store().abortChunk(id, 3));
         } finally {
-            store().releaseLock(id);
+            unlock(id);
         }
         assertEquals(3, info(id).getOffset());
         assertContent(id, "abc");
@@ -297,13 +328,13 @@ public abstract class AbstractUploadStoreContractTest {
     public void zeroLengthStageAndCommitLeaveOffsetAlone() {
         String id = create(10);
         write(id, 0, "abc");
-        assertTrue(store().acquireLock(id));
+        assertTrue(lock(id));
         try {
             long staged = await(store().stageChunk(id, 3, Multi.createFrom().empty(), 0));
             assertEquals(0, staged);
             await(store().commitChunk(id, 3, 0));
         } finally {
-            store().releaseLock(id);
+            unlock(id);
         }
         assertEquals(3, info(id).getOffset());
         assertContent(id, "abc");
@@ -312,13 +343,13 @@ public abstract class AbstractUploadStoreContractTest {
     @Test
     public void unknownExpectedLengthIsAccepted() {
         String id = create(10);
-        assertTrue(store().acquireLock(id));
+        assertTrue(lock(id));
         try {
             long staged = await(store().stageChunk(id, 0, bytes("hello"), -1));
             assertEquals(5, staged);
             await(store().commitChunk(id, 0, staged));
         } finally {
-            store().releaseLock(id);
+            unlock(id);
         }
         assertEquals(5, info(id).getOffset());
     }
@@ -336,19 +367,19 @@ public abstract class AbstractUploadStoreContractTest {
         finalRecord.setFinalConcat(true);
         finalRecord.setPartialIds(List.of(a, b));
         finalRecord.setUploadConcatMergedValue("final;/tus/" + a + " /tus/" + b);
-        String finalId = store().createUpload(finalRecord);
+        String finalId = createRecord(finalRecord);
         assertEquals(0, info(finalId).getOffset());
         assertTrue(info(finalId).isFinalConcat());
 
-        assertTrue(store().acquireLock(finalId));
-        assertTrue(store().acquireLock(a));
-        assertTrue(store().acquireLock(b));
+        assertTrue(lock(finalId));
+        assertTrue(lock(a));
+        assertTrue(lock(b));
         try {
             await(store().concatenate(finalId, List.of(a, b)));
         } finally {
-            store().releaseLock(b);
-            store().releaseLock(a);
-            store().releaseLock(finalId);
+            unlock(b);
+            unlock(a);
+            unlock(finalId);
         }
 
         UploadInfo done = info(finalId);
@@ -360,8 +391,8 @@ public abstract class AbstractUploadStoreContractTest {
                 "the verbatim Upload-Concat value must survive");
         assertContent(finalId, "hello world");
 
-        assertTrue(store().findUploadInfo(a).isPresent(), "sources are the framework's to discard");
-        assertTrue(store().findUploadInfo(b).isPresent());
+        assertTrue(find(a).isPresent(), "sources are the framework's to discard");
+        assertTrue(find(b).isPresent());
     }
 
     @Test
@@ -378,11 +409,11 @@ public abstract class AbstractUploadStoreContractTest {
     public void discardRemovesRecordAndBytes() {
         String id = create(3);
         write(id, 0, "abc");
-        assertTrue(store().discardUpload(id));
-        assertTrue(store().findUploadInfo(id).isEmpty());
+        assertTrue(discard(id));
+        assertTrue(find(id).isEmpty());
         assertTrue(readBytes(id).isEmpty() || readBytes(id).get().length == 0, "bytes must be gone");
-        assertFalse(store().discardUpload(id), "discarding again reports nothing removed");
-        assertFalse(store().discardUpload(UUID.randomUUID().toString()));
+        assertFalse(discard(id), "discarding again reports nothing removed");
+        assertFalse(discard(UUID.randomUUID().toString()));
     }
 
     /**
@@ -395,25 +426,25 @@ public abstract class AbstractUploadStoreContractTest {
     public void discardWhileTheCallerHoldsTheLockRemovesTheUpload() {
         String id = create(3);
         write(id, 0, "abc");
-        assertTrue(store().acquireLock(id));
+        assertTrue(lock(id));
         try {
-            assertTrue(store().discardUpload(id), "discard under the caller's own lock must succeed");
-            assertTrue(store().findUploadInfo(id).isEmpty());
+            assertTrue(discard(id), "discard under the caller's own lock must succeed");
+            assertTrue(find(id).isEmpty());
             assertTrue(readBytes(id).isEmpty() || readBytes(id).get().length == 0, "bytes must be gone");
         } finally {
-            store().releaseLock(id);
+            unlock(id);
         }
     }
 
     @Test
     public void lockIsExclusiveAndReleasable() {
         String id = create(3);
-        assertTrue(store().acquireLock(id));
-        assertFalse(store().acquireLock(id), "second acquisition must fail while held");
-        store().releaseLock(id);
-        assertTrue(store().acquireLock(id), "acquirable again after release");
-        store().releaseLock(id);
-        store().releaseLock(id); // releasing an unheld lock is harmless
+        assertTrue(lock(id));
+        assertFalse(lock(id), "second acquisition must fail while held");
+        unlock(id);
+        assertTrue(lock(id), "acquirable again after release");
+        unlock(id);
+        unlock(id); // releasing an unheld lock is harmless
     }
 
     // ---- expiry ----
@@ -422,14 +453,14 @@ public abstract class AbstractUploadStoreContractTest {
     public void cleanupExpiredUploadsRemovesOnlyExpiredRecords() {
         UploadInfo expired = record(3);
         expired.setExpiresAt(Instant.now().minus(1, ChronoUnit.HOURS));
-        String expiredId = store().createUpload(expired);
+        String expiredId = createRecord(expired);
         String liveId = create(3);
 
-        List<String> cleaned = store().cleanupExpiredUploads();
+        List<String> cleaned = cleanupExpired();
 
         assertTrue(cleaned.contains(expiredId), "expired upload must be reported as cleaned");
         assertFalse(cleaned.contains(liveId));
-        assertTrue(store().findUploadInfo(expiredId).isEmpty());
-        assertTrue(store().findUploadInfo(liveId).isPresent());
+        assertTrue(find(expiredId).isEmpty());
+        assertTrue(find(liveId).isPresent());
     }
 }

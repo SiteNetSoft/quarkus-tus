@@ -32,8 +32,11 @@ public class FaultyUploadStore extends InMemoryUploadStore {
     public final AtomicInteger abortCalls = new AtomicInteger();
     public final AtomicBoolean appendRanOnEventLoop = new AtomicBoolean();
     public volatile String lastCreatedId;
+    /** Thread each SPI method was last called on, so a test can see where the framework calls from. */
+    public final java.util.Map<String, String> callingThreads = new java.util.concurrent.ConcurrentHashMap<>();
 
     public void reset() {
+        callingThreads.clear();
         throwSyncFromStage.set(false);
         reportStaleOffsetAs.set(-1);
         wrapStreamFailures.set(false);
@@ -42,8 +45,21 @@ public class FaultyUploadStore extends InMemoryUploadStore {
     }
 
     @Override
-    public String createUpload(org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo info) {
-        return lastCreatedId = super.createUpload(info);
+    public Uni<String> createUpload(org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo info) {
+        callingThreads.put("createUpload", Thread.currentThread().getName());
+        return super.createUpload(info).invoke(id -> lastCreatedId = id);
+    }
+
+    @Override
+    public Uni<Boolean> acquireLock(String id) {
+        callingThreads.put("acquireLock", Thread.currentThread().getName());
+        return super.acquireLock(id);
+    }
+
+    @Override
+    public Uni<java.util.Optional<org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo>> findUploadInfo(String id) {
+        callingThreads.putIfAbsent("findUploadInfo", Thread.currentThread().getName());
+        return super.findUploadInfo(id);
     }
 
     @Override

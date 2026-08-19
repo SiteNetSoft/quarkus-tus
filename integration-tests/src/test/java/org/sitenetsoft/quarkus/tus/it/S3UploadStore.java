@@ -44,8 +44,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * that seeds the next stage. The last commit — the one that reaches {@code Upload-Length} —
  * uploads the tail as the final part and completes the multipart upload.
  * <p>
- * Records live in memory (the SPI's documented "local index" limitation) and are lost with the
- * process; the object store keeps only the bytes.
+ * Every SPI method is asynchronous, so nothing here blocks a request thread — `createUpload`
+ * hands back a {@code Uni} over S3's own {@code CompletionStage} rather than joining it. The
+ * upload records are still kept in a map because the in-flight multipart state (part ETags, the
+ * tail) lives in memory anyway; a store that persisted that state could answer the record methods
+ * straight from its backend, which is what asynchronous record methods make possible.
  */
 @Singleton
 @Alternative
@@ -89,6 +92,7 @@ public class S3UploadStore implements UploadStore {
                 .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
                 .build();
         try {
+            // Startup, not a request: blocking here is fine.
             s3.createBucket(CreateBucketRequest.builder().bucket(bucket).build()).join();
         } catch (CompletionException e) {
             if (!(e.getCause() instanceof BucketAlreadyOwnedByYouException)
@@ -112,41 +116,43 @@ public class S3UploadStore implements UploadStore {
     // ---- records ----
 
     @Override
-    public Optional<UploadInfo> findUploadInfo(String id) {
-        return Optional.ofNullable(records.get(id));
+    public Uni<Optional<UploadInfo>> findUploadInfo(String id) {
+        return Uni.createFrom().item(Optional.ofNullable(records.get(id)));
     }
 
     @Override
-    public String createUpload(UploadInfo info) {
+    public Uni<String> createUpload(UploadInfo info) {
         String id = UUID.randomUUID().toString();
         Multipart mp = new Multipart();
-        try {
-            if (info.getEntityLength() == 0) {
+        // Nothing blocks: the SDK's async client returns a CompletionStage, and the SPI lets us
+        // hand back a Uni, so the request thread is free while S3 answers.
+        Uni<Void> started = info.getEntityLength() == 0
                 // S3 cannot complete a multipart upload with no parts; an empty upload is an
                 // empty object from the start.
-                s3.putObject(PutObjectRequest.builder().bucket(bucket).key(id).build(),
-                        AsyncRequestBody.empty()).join();
-                mp.complete = true;
-            } else {
-                // The record methods are synchronous by SPI design, so this is a blocking
-                // network call — the very limitation the SPI documents. Fine on a worker
-                // (POST is @Blocking); a production store would keep this off the event loop.
-                mp.s3UploadId = s3.createMultipartUpload(CreateMultipartUploadRequest.builder()
-                        .bucket(bucket).key(id).build()).join().uploadId();
-            }
-        } catch (CompletionException e) {
-            throw new UploadStoreException("Failed to start S3 upload for " + id, e.getCause());
-        }
-        multiparts.put(id, mp);
-        records.put(id, info);
-        return id;
+                ? Uni.createFrom().completionStage(s3.putObject(
+                                PutObjectRequest.builder().bucket(bucket).key(id).build(), AsyncRequestBody.empty()))
+                        .invoke(() -> mp.complete = true)
+                        .replaceWithVoid()
+                : Uni.createFrom().completionStage(s3.createMultipartUpload(
+                                CreateMultipartUploadRequest.builder().bucket(bucket).key(id).build()))
+                        .invoke(response -> mp.s3UploadId = response.uploadId())
+                        .replaceWithVoid();
+        return started
+                .onFailure().transform(e -> new UploadStoreException("Failed to start S3 upload for " + id,
+                        e instanceof CompletionException ? e.getCause() : e))
+                .invoke(() -> {
+                    multiparts.put(id, mp);
+                    records.put(id, info);
+                })
+                .replaceWith(id);
     }
 
     @Override
-    public void updateUploadInfo(String id, UploadInfo info) {
+    public Uni<Void> updateUploadInfo(String id, UploadInfo info) {
         if (records.containsKey(id)) {
             records.put(id, info);
         }
+        return Uni.createFrom().voidItem();
     }
 
     // ---- staged writes ----
@@ -318,50 +324,70 @@ public class S3UploadStore implements UploadStore {
     // ---- discard, locks, cleanup ----
 
     @Override
-    public boolean discardUpload(String id) {
+    public Uni<Boolean> discardUpload(String id) {
         UploadInfo removed = records.remove(id);
         Multipart mp = multiparts.remove(id);
+        Uni<Void> cleaned = Uni.createFrom().voidItem();
         if (mp != null) {
-            try {
-                if (mp.s3UploadId != null) {
-                    s3.abortMultipartUpload(AbortMultipartUploadRequest.builder()
-                            .bucket(bucket).key(id).uploadId(mp.s3UploadId).build()).join();
-                }
-                s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(id).build()).join();
-            } catch (CompletionException e) {
-                LOG.warnf(e.getCause(), "Failed to delete S3 data for %s", id);
+            if (mp.s3UploadId != null) {
+                cleaned = cleaned.chain(() -> Uni.createFrom().completionStage(s3.abortMultipartUpload(
+                        AbortMultipartUploadRequest.builder().bucket(bucket).key(id).uploadId(mp.s3UploadId).build()))
+                        .replaceWithVoid());
             }
+            cleaned = cleaned.chain(() -> Uni.createFrom().completionStage(s3.deleteObject(
+                            DeleteObjectRequest.builder().bucket(bucket).key(id).build()))
+                    .replaceWithVoid());
         }
-        return removed != null;
+        return cleaned
+                .onFailure().recoverWithItem(e -> {
+                    LOG.warnf(e, "Failed to delete S3 data for %s", id);
+                    return null;
+                })
+                .replaceWith(removed != null);
     }
 
     @Override
-    public boolean acquireLock(String id) {
-        return locks.add(id);
+    public Uni<Boolean> acquireLock(String id) {
+        return Uni.createFrom().item(locks.add(id));
     }
 
     @Override
-    public void releaseLock(String id) {
+    public Uni<Void> releaseLock(String id) {
         locks.remove(id);
+        return Uni.createFrom().voidItem();
     }
 
     @Override
-    public List<String> cleanupExpiredUploads() {
+    public Uni<List<String>> cleanupExpiredUploads() {
         Instant now = Instant.now();
-        List<String> cleaned = new ArrayList<>();
+        List<String> expired = new ArrayList<>();
         for (Map.Entry<String, UploadInfo> entry : records.entrySet()) {
             Instant expiresAt = entry.getValue().getExpiresAt();
-            if (expiresAt != null && now.isAfter(expiresAt) && acquireLock(entry.getKey())) {
-                try {
-                    if (discardUpload(entry.getKey())) {
-                        cleaned.add(entry.getKey());
-                    }
-                } finally {
-                    releaseLock(entry.getKey());
-                }
+            if (expiresAt != null && now.isAfter(expiresAt)) {
+                expired.add(entry.getKey());
             }
         }
-        return cleaned;
+        List<String> cleaned = new ArrayList<>();
+        Uni<Void> chain = Uni.createFrom().voidItem();
+        for (String id : expired) {
+            chain = chain.chain(() -> {
+                if (!locks.add(id)) {
+                    return Uni.createFrom().voidItem();
+                }
+                return discardUpload(id)
+                        .eventually(() -> {
+                            locks.remove(id);
+                            return Uni.createFrom().voidItem();
+                        })
+                        .invoke(removed -> {
+                            if (removed) {
+                                cleaned.add(id);
+                            }
+                        })
+                        .replaceWithVoid();
+            });
+        }
+        return chain.replaceWith(cleaned);
     }
 
     // ---- test hooks ----

@@ -196,33 +196,55 @@ public class LocalFileUploadStore implements UploadStore {
         return resolved;
     }
 
+    // Records live in memory, so reads and locks answer on the calling thread; anything that
+    // touches a file or a sidecar runs on a worker, never on the event loop that subscribed.
+
     @Override
-    public Optional<UploadInfo> findUploadInfo(String id) {
-        return Optional.ofNullable(uploads.get(id));
+    public Uni<Optional<UploadInfo>> findUploadInfo(String id) {
+        return Uni.createFrom().item(Optional.ofNullable(uploads.get(id)));
     }
 
     @Override
-    public String createUpload(UploadInfo info) {
-        String id = UUID.randomUUID().toString();
-        Path file = safePath(id);
-        try {
-            if (!Files.exists(file)) {
-                Files.createFile(file);
+    public Uni<String> createUpload(UploadInfo info) {
+        return blocking(() -> {
+            String id = UUID.randomUUID().toString();
+            Path file = safePath(id);
+            try {
+                if (!Files.exists(file)) {
+                    Files.createFile(file);
+                }
+            } catch (IOException e) {
+                throw new UploadStoreException("Failed to create upload file for " + id, e);
             }
-        } catch (IOException e) {
-            throw new UploadStoreException("Failed to create upload file for " + id, e);
-        }
-        uploads.put(id, info);
-        persistMetadata(id, info);
-        return id;
-    }
-
-    @Override
-    public void updateUploadInfo(String id, UploadInfo info) {
-        if (uploads.containsKey(id)) {
             uploads.put(id, info);
             persistMetadata(id, info);
+            return id;
+        });
+    }
+
+    @Override
+    public Uni<Void> updateUploadInfo(String id, UploadInfo info) {
+        if (!uploads.containsKey(id)) {
+            return Uni.createFrom().voidItem();
         }
+        uploads.put(id, info);
+        return blocking(() -> {
+            persistMetadata(id, info);
+            return null;
+        });
+    }
+
+    /** Runs {@code work} on a Vert.x worker; a thrown exception fails the Uni. */
+    private <T> Uni<T> blocking(java.util.concurrent.Callable<T> work) {
+        return vertx.executeBlocking(Uni.createFrom().item(() -> {
+            try {
+                return work.call();
+            } catch (RuntimeException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new UploadStoreException(e.getMessage(), e);
+            }
+        }), false);
     }
 
     @Override
@@ -367,19 +389,19 @@ public class LocalFileUploadStore implements UploadStore {
      * underneath an in-flight write.
      */
     @Override
-    public boolean discardUpload(String id) {
-        return discardLockedUpload(id);
+    public Uni<Boolean> discardUpload(String id) {
+        return blocking(() -> discardLockedUpload(id));
     }
 
     /** For the store's own maintenance: takes the lock, discards, releases; false if in use. */
     private boolean discardIfUnlocked(String id) {
-        if (!acquireLock(id)) {
+        if (!tryLock(id)) {
             return false;
         }
         try {
             return discardLockedUpload(id);
         } finally {
-            releaseLock(id);
+            activeLocks.remove(id);
         }
     }
 
@@ -398,7 +420,11 @@ public class LocalFileUploadStore implements UploadStore {
     }
 
     @Override
-    public boolean acquireLock(String id) {
+    public Uni<Boolean> acquireLock(String id) {
+        return Uni.createFrom().item(tryLock(id));
+    }
+
+    private boolean tryLock(String id) {
         long now = System.currentTimeMillis();
         Long existing = activeLocks.putIfAbsent(id, now);
         if (existing == null) {
@@ -415,12 +441,13 @@ public class LocalFileUploadStore implements UploadStore {
     }
 
     @Override
-    public void releaseLock(String id) {
+    public Uni<Void> releaseLock(String id) {
         activeLocks.remove(id);
+        return Uni.createFrom().voidItem();
     }
 
     @Override
-    public void cleanupStaleLocks() {
+    public Uni<Void> cleanupStaleLocks() {
         long now = System.currentTimeMillis();
         activeLocks.entrySet().removeIf(entry -> {
             boolean stale = now - entry.getValue() > lockTimeoutMs;
@@ -429,6 +456,7 @@ public class LocalFileUploadStore implements UploadStore {
             }
             return stale;
         });
+        return Uni.createFrom().voidItem();
     }
 
 
@@ -441,7 +469,11 @@ public class LocalFileUploadStore implements UploadStore {
     }
 
     @Override
-    public List<String> cleanupExpiredUploads() {
+    public Uni<List<String>> cleanupExpiredUploads() {
+        return blocking(this::cleanupExpiredUploadsNow);
+    }
+
+    private List<String> cleanupExpiredUploadsNow() {
         List<String> expiredIds = new ArrayList<>();
         Instant now = Instant.now();
 
@@ -475,7 +507,11 @@ public class LocalFileUploadStore implements UploadStore {
      * Removes incomplete uploads that have had no activity for the given number of hours.
      */
     @Override
-    public List<String> cleanupStaleUploads(long staleHours) {
+    public Uni<List<String>> cleanupStaleUploads(long staleHours) {
+        return blocking(() -> cleanupStaleUploadsNow(staleHours));
+    }
+
+    private List<String> cleanupStaleUploadsNow(long staleHours) {
         if (staleHours <= 0) {
             return List.of();
         }
@@ -518,7 +554,11 @@ public class LocalFileUploadStore implements UploadStore {
      * and no .meta sidecar file. These are orphans from crashes or incomplete cleanup.
      */
     @Override
-    public int cleanupOrphanFiles() {
+    public Uni<Integer> cleanupOrphanFiles() {
+        return blocking(this::cleanupOrphanFilesNow);
+    }
+
+    private int cleanupOrphanFilesNow() {
         int cleaned = 0;
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(uploadBaseDir)) {
             for (Path file : stream) {

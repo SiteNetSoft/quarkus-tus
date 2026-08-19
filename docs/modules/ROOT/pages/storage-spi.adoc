@@ -19,9 +19,9 @@ Bytes are **streamed**. A PATCH body flows from the socket, through the extensio
 public interface UploadStore {
 
     // Records — the framework builds them, the store persists them
-    Optional<UploadInfo> findUploadInfo(String id);
-    String createUpload(UploadInfo info);                 // returns an id, never a URL
-    void updateUploadInfo(String id, UploadInfo info);
+    Uni<Optional<UploadInfo>> findUploadInfo(String id);
+    Uni<String> createUpload(UploadInfo info);            // returns an id, never a URL
+    Uni<Void> updateUploadInfo(String id, UploadInfo info);
 
     // Bytes — a staged write
     Uni<Long> stageChunk(String id, long offset, Multi<Buffer> data, long expectedLength);
@@ -32,15 +32,15 @@ public interface UploadStore {
     Uni<Void> concatenate(String finalId, List<String> sourceIds);
 
     // Lifecycle and locking
-    boolean discardUpload(String id);
-    boolean acquireLock(String id);
-    void releaseLock(String id);
+    Uni<Boolean> discardUpload(String id);
+    Uni<Boolean> acquireLock(String id);
+    Uni<Void> releaseLock(String id);
 
     // Maintenance
-    List<String> cleanupExpiredUploads();
-    default void cleanupStaleLocks() {}
-    default List<String> cleanupStaleUploads(long staleHours) { return List.of(); }
-    default int cleanupOrphanFiles() { return 0; }
+    Uni<List<String>> cleanupExpiredUploads();
+    default Uni<Void> cleanupStaleLocks() { return Uni.createFrom().voidItem(); }
+    default Uni<List<String>> cleanupStaleUploads(long staleHours) { return Uni.createFrom().item(List.of()); }
+    default Uni<Integer> cleanupOrphanFiles() { return Uni.createFrom().item(0); }
 }
 ----
 
@@ -78,7 +78,7 @@ The framework holds the upload's lock around the whole sequence, computes the di
 * `discardUpload` just deletes: the framework holds the upload's lock whenever it calls it (DELETE takes the lock; a finished concatenation discards its partials under the locks it already holds), so the store neither takes nor checks the lock there. Your own cleanup (`cleanupExpiredUploads` and the hooks) must take the lock before deleting, so that it never removes an upload underneath an in-flight write.
 * A failure of `stageChunk` -- unknown id, stale offset, or a failure that came down the body stream (client gone, limit crossed) -- is a failure of the returned `Uni`, propagated as-is; never a synchronous throw, never wrapped. The framework decides the response from the failure's type. After the framework's `abortChunk`, the upload is exactly as it was.
 * The lock is held for the whole of `stageChunk`, i.e. for as long as the client takes to send the chunk. A store that expires abandoned locks must treat a lock as live while bytes are flowing (the bundled store refreshes it on every buffer) and give it a timeout longer than any pause a healthy client may make mid-chunk -- see `quarkus.tus.lock-timeout-seconds`.
-* The `Uni`/`Multi` methods are subscribed to on a Vert.x event loop: do not block in them. (`BufferingUploadStore` runs your `appendBytes` on a worker thread for exactly this reason.)
+* Every method is subscribed to on a Vert.x event loop: do not block in any of them. Use your backend's asynchronous client, or push blocking work onto a worker (`vertx.executeBlocking(...)`, `uni.runSubscriptionOn(Infrastructure.getDefaultWorkerPool())`). Records that live in memory just return `Uni.createFrom().item(...)`; records that live in a database or another service can be a round trip, so a store needs no local index. (`BufferingUploadStore` runs your `appendBytes` on a worker for exactly this reason.)
 * `createUpload` returns an **id**. It is the last segment of the `Location` the extension builds; it must not contain `/`.
 
 Every one of these rules is an assertion in the contract test below.
@@ -101,17 +101,17 @@ public class MyStore extends BufferingUploadStore {
     private final Map<String, UploadInfo> records = new ConcurrentHashMap<>();
     private final Set<String> locks = ConcurrentHashMap.newKeySet();
 
-    @Override public Optional<UploadInfo> findUploadInfo(String id) { return Optional.ofNullable(records.get(id)); }
-    @Override public String createUpload(UploadInfo info) { String id = UUID.randomUUID().toString(); records.put(id, info); return id; }
-    @Override public void updateUploadInfo(String id, UploadInfo info) { records.computeIfPresent(id, (k, v) -> info); }
+    @Override public Uni<Optional<UploadInfo>> findUploadInfo(String id) { return Uni.createFrom().item(Optional.ofNullable(records.get(id))); }
+    @Override public Uni<String> createUpload(UploadInfo info) { String id = UUID.randomUUID().toString(); records.put(id, info); return Uni.createFrom().item(id); }
+    @Override public Uni<Void> updateUploadInfo(String id, UploadInfo info) { records.computeIfPresent(id, (k, v) -> info); return Uni.createFrom().voidItem(); }
 
-    @Override protected void appendBytes(String id, long offset, byte[] data) { /* append to your storage */ }
+    @Override protected void appendBytes(String id, long offset, byte[] data) { /* append to your storage; runs on a worker */ }
     @Override public Uni<Void> concatenate(String finalId, List<String> sourceIds) { /* join, then mark finalId complete */ }
 
-    @Override public boolean discardUpload(String id) { /* remove bytes + record; the caller holds the lock */ }
-    @Override public boolean acquireLock(String id) { return locks.add(id); }
-    @Override public void releaseLock(String id) { locks.remove(id); }
-    @Override public List<String> cleanupExpiredUploads() { /* remove records whose expiresAt is past */ }
+    @Override public Uni<Boolean> discardUpload(String id) { /* remove bytes + record; the caller holds the lock */ }
+    @Override public Uni<Boolean> acquireLock(String id) { return Uni.createFrom().item(locks.add(id)); }
+    @Override public Uni<Void> releaseLock(String id) { locks.remove(id); return Uni.createFrom().voidItem(); }
+    @Override public Uni<List<String>> cleanupExpiredUploads() { /* remove records whose expiresAt is past */ }
 }
 ----
 

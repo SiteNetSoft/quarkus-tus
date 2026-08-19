@@ -15,6 +15,7 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 import org.sitenetsoft.quarkus.tus.runtime.TusUploadAuthorizer;
 import org.sitenetsoft.quarkus.tus.runtime.TusUtils;
+import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
 import org.sitenetsoft.quarkus.tus.runtime.spi.UploadStore;
 
 @Path("/tus/events")
@@ -37,7 +38,12 @@ public class TusSseResource {
     @Inject
     Sse sse;
 
+    // Sink-based SSE methods run on a worker, so the store is awaited here — bounded, and a
+    // registration is rare next to the chunk traffic it observes.
+    private static final java.time.Duration STORE_TIMEOUT = java.time.Duration.ofSeconds(10);
+
     @GET
+    @io.smallrye.common.annotation.Blocking
     @Path("/{uploadId}")
     @Produces(MediaType.SERVER_SENT_EVENTS)
     public void streamUploadEvents(
@@ -64,8 +70,8 @@ public class TusSseResource {
         // Registering a sink displaces any existing subscriber, so an unknown or unowned ID
         // must not get this far. 404 rather than 403 keeps a denial indistinguishable from a
         // missing upload.
-        if (uploadStore.findUploadInfo(uploadId).isEmpty()
-                || authorizer.isDenied(uploadId, securityContext)) {
+        UploadInfo info = uploadStore.findUploadInfo(uploadId).await().atMost(STORE_TIMEOUT).orElse(null);
+        if (info == null || authorizer.isDenied(info, securityContext)) {
             throw new NotFoundException();
         }
 

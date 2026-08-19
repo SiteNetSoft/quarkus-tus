@@ -38,13 +38,13 @@ import java.util.Optional;
  * staged as zero bytes and then aborted rather than committed.
  *
  * <h2>Threading</h2>
- * The {@code Uni}/{@code Multi} methods may be subscribed to on a Vert.x event loop. They must not
- * block; use the store's asynchronous client, or offload to a worker pool. The synchronous record
- * methods ({@link #findUploadInfo}, {@link #createUpload}, {@link #updateUploadInfo},
- * {@link #discardUpload}, the lock pair) are called from worker threads for POST, HEAD and DELETE
- * but from the event loop during PATCH, so keep them cheap: an in-memory index or a fast local
- * cache, not a network round trip per call. Making them asynchronous is a candidate for a later
- * SPI revision.
+ * Every method returns a {@code Uni} (or takes a {@code Multi}) and may be subscribed to on a
+ * Vert.x event loop, so none of them may block: use the backend's asynchronous client, or
+ * offload blocking work to a worker pool ({@code vertx.executeBlocking},
+ * {@code Uni.runSubscriptionOn(Infrastructure.getDefaultWorkerPool())}). A store whose records
+ * live in a remote service (a database, Redis, DynamoDB) needs no local index — each record
+ * method can be a round trip — but a store that can answer from memory should, since the
+ * record methods are called several times per request.
  * <p>
  * A reusable contract test, {@code AbstractUploadStoreContractTest} in the
  * {@code org.sitenetsoft:quarkus-tus-tck} artifact, checks an implementation against every rule
@@ -53,9 +53,10 @@ import java.util.Optional;
 public interface UploadStore {
 
     /**
-     * Returns the record for {@code id}, or empty if no such upload exists (or it was discarded).
+     * Resolves to the record for {@code id}, or empty if no such upload exists (or it was
+     * discarded).
      */
-    Optional<UploadInfo> findUploadInfo(String id);
+    Uni<Optional<UploadInfo>> findUploadInfo(String id);
 
     /**
      * Persists a new upload record and prepares whatever storage it needs (an empty file, a
@@ -68,9 +69,9 @@ public interface UploadStore {
      * and return the id.
      *
      * @return the new upload's id — an opaque id, never a URL or path
-     * @throws UploadStoreException if the record or its storage could not be created
+     * @throws UploadStoreException (as a failure) if the record or its storage could not be created
      */
-    String createUpload(UploadInfo info);
+    Uni<String> createUpload(UploadInfo info);
 
     /**
      * Replaces the persisted record for {@code id}. The framework calls this after changing a
@@ -80,7 +81,7 @@ public interface UploadStore {
      * <p>
      * A no-op if the upload does not exist.
      */
-    void updateUploadInfo(String id, UploadInfo info);
+    Uni<Void> updateUploadInfo(String id, UploadInfo info);
 
     /**
      * Streams a chunk into storage at {@code offset}.
@@ -154,7 +155,7 @@ public interface UploadStore {
      *
      * @return true if an upload was removed; false if it did not exist
      */
-    boolean discardUpload(String id);
+    Uni<Boolean> discardUpload(String id);
 
     /**
      * Takes the upload's exclusive lock, which the framework holds across a chunk write and a
@@ -169,9 +170,9 @@ public interface UploadStore {
      *
      * @return false if the lock is held by someone else
      */
-    boolean acquireLock(String id);
+    Uni<Boolean> acquireLock(String id);
 
-    void releaseLock(String id);
+    Uni<Void> releaseLock(String id);
 
     /**
      * Removes every upload whose {@link UploadInfo#getExpiresAt()} is in the past, skipping
@@ -179,7 +180,7 @@ public interface UploadStore {
      *
      * @return the ids actually removed
      */
-    List<String> cleanupExpiredUploads();
+    Uni<List<String>> cleanupExpiredUploads();
 
     /**
      * Releases locks whose holder died. Called by the scheduler roughly once a minute.
@@ -188,7 +189,8 @@ public interface UploadStore {
      * need not implement them — but a store that does hold locks or write files must, or its
      * maintenance simply never runs.
      */
-    default void cleanupStaleLocks() {
+    default Uni<Void> cleanupStaleLocks() {
+        return Uni.createFrom().voidItem();
     }
 
     /**
@@ -196,8 +198,8 @@ public interface UploadStore {
      *
      * @return the uploads actually removed, which is what the scheduler logs
      */
-    default List<String> cleanupStaleUploads(long staleHours) {
-        return List.of();
+    default Uni<List<String>> cleanupStaleUploads(long staleHours) {
+        return Uni.createFrom().item(List.of());
     }
 
     /**
@@ -205,7 +207,7 @@ public interface UploadStore {
      *
      * @return how many were removed
      */
-    default int cleanupOrphanFiles() {
-        return 0;
+    default Uni<Integer> cleanupOrphanFiles() {
+        return Uni.createFrom().item(0);
     }
 }

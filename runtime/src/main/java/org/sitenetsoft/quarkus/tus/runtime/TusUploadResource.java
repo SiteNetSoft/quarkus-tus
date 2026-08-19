@@ -1,6 +1,7 @@
 package org.sitenetsoft.quarkus.tus.runtime;
 
 import io.smallrye.common.annotation.Blocking;
+import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
 import io.vertx.ext.web.RoutingContext;
@@ -111,12 +112,7 @@ public class TusUploadResource {
 
     // ---------- HEAD: upload status ----------
 
-    // HEAD and POST call the store's synchronous record methods, which the bundled store backs
-    // with file I/O; running them on a worker keeps that off the event loop, as it was when these
-    // methods returned a plain Response. The streaming chains they return work from either kind
-    // of thread.
     @HEAD
-    @Blocking
     @jakarta.ws.rs.Path("/{uploadID}")
     @Operation(summary = "Query upload status")
     @APIResponse(responseCode = "200", description = "Upload status returned in headers")
@@ -137,29 +133,30 @@ public class TusUploadResource {
             return Uni.createFrom().item(tus(BAD_REQUEST).entity("Invalid upload ID format").build());
         }
 
-        Optional<UploadInfo> infoOpt = uploadStore.findUploadInfo(uploadID);
-        if (infoOpt.isEmpty() || isOwnershipDenied(uploadID, getCurrentUserId(securityContext))) {
-            return Uni.createFrom().item(tus(NOT_FOUND).build());
-        }
+        String currentUserId = getCurrentUserId(securityContext);
+        return uploadStore.findUploadInfo(uploadID).chain(infoOpt -> {
+            if (infoOpt.isEmpty() || isOwnershipDenied(infoOpt.get(), currentUserId)) {
+                return Uni.createFrom().item(tus(NOT_FOUND).build());
+            }
+            UploadInfo info = infoOpt.get();
 
-        if (isExpired(infoOpt.get())) {
-            discard(uploadID);
-            return Uni.createFrom().item(tus(410).entity("Upload has expired").build());
-        }
+            if (isExpired(info)) {
+                return discard(uploadID).replaceWith(() -> tus(410).entity("Upload has expired").build());
+            }
 
-        UploadInfo info = infoOpt.get();
-        if (!info.isFinalConcat()) {
-            return Uni.createFrom().item(headResponse(info));
-        }
+            if (!info.isFinalConcat()) {
+                return Uni.createFrom().item(headResponse(info));
+            }
 
-        // Auto-finalize an unfinished concatenation once every partial is complete.
-        return finalizeConcatenationIfReady(uploadID, info)
-                .onItem().transform(finalized -> headResponse(
-                        uploadStore.findUploadInfo(uploadID).orElse(info)))
-                .onFailure().recoverWithItem(e -> {
-                    LOG.errorf(e, "Failed to finalize concatenation %s during HEAD", uploadID);
-                    return headResponse(uploadStore.findUploadInfo(uploadID).orElse(info));
-                });
+            // Auto-finalize an unfinished concatenation once every partial is complete.
+            return finalizeConcatenationIfReady(uploadID, info)
+                    .onFailure().recoverWithItem(e -> {
+                        LOG.errorf(e, "Failed to finalize concatenation %s during HEAD", uploadID);
+                        return false;
+                    })
+                    .chain(finalized -> uploadStore.findUploadInfo(uploadID))
+                    .map(current -> headResponse(current.orElse(info)));
+        });
     }
 
     private Response headResponse(UploadInfo info) {
@@ -190,8 +187,10 @@ public class TusUploadResource {
 
     // ---------- POST: create upload or final concat ----------
 
+    // No @Blocking anywhere: every store method is asynchronous, so no request thread waits on
+    // storage. What still needs a worker is application code — the lifecycle events — and the
+    // chains hop onto one before firing them.
     @POST
-    @Blocking
     @Operation(summary = "Create upload or concatenation")
     @APIResponse(responseCode = "201", description = "Upload created")
     @APIResponse(responseCode = "400", description = "Invalid request")
@@ -258,14 +257,39 @@ public class TusUploadResource {
 
         UploadInfo info = UploadRecords.newUpload(uploadSize, uploadMetadata, isPartial, isDeferredLength,
                 currentUserId, tusRuntimeConfig.expirationHours());
-        String uploadId;
-        try {
-            uploadId = uploadStore.createUpload(info);
-        } catch (UploadStoreException e) {
-            LOG.error("Store failed to create upload", e);
-            return Uni.createFrom().item(tus(INTERNAL_SERVER_ERROR).build());
-        }
+        final long size = uploadSize;
+        final boolean deferred = isDeferredLength;
+        final boolean partial = isPartial;
 
+        return uploadStore.createUpload(info)
+                .onFailure().recoverWithUni(e -> {
+                    LOG.error("Store failed to create upload", e);
+                    return Uni.createFrom().nullItem();
+                })
+                .chain(uploadId -> uploadId == null
+                        ? Uni.createFrom().item(tus(INTERNAL_SERVER_ERROR).build())
+                        : afterCreate(uploadId, info, size, deferred, partial, uploadMetadata,
+                                contentLength, routingContext, stream));
+    }
+
+    /**
+     * The part of creation that follows the store having a record: events, then the optional
+     * body. Runs on a worker — the events reach application code, which may do anything — and
+     * inside the chain, so an observer has run before the client sees the Location.
+     */
+    private Uni<Response> afterCreate(String uploadId, UploadInfo info, long uploadSize, boolean isDeferredLength,
+                                      boolean isPartial, String uploadMetadata, Long contentLength,
+                                      RoutingContext routingContext, AtomicReference<ChunkStream> stream) {
+        return Uni.createFrom().voidItem()
+                .emitOn(Infrastructure.getDefaultWorkerPool())
+                .chain(() -> announceAndWrite(uploadId, info, uploadSize, isDeferredLength, isPartial,
+                        uploadMetadata, contentLength, routingContext, stream));
+    }
+
+    private Uni<Response> announceAndWrite(String uploadId, UploadInfo info, long uploadSize,
+                                           boolean isDeferredLength, boolean isPartial, String uploadMetadata,
+                                           Long contentLength, RoutingContext routingContext,
+                                           AtomicReference<ChunkStream> stream) {
         if (!isDeferredLength) {
             uploadProgressService.startUpload(uploadId, uploadSize);
         }
@@ -285,52 +309,47 @@ public class TusUploadResource {
         // Without a Content-Length, HTTP/1.1 announces a body with Transfer-Encoding: chunked;
         // HTTP/2 has no such header — a streamed body is just DATA frames — so there the
         // creation-with-upload content type is what tells a body from a plain creation.
-        String contentTypeHeader = routingContext.request().getHeader("Content-Type");
+        String contentType = routingContext.request().getHeader("Content-Type");
         boolean hasBody = contentLength != null ? contentLength > 0
                 : "chunked".equalsIgnoreCase(routingContext.request().getHeader("Transfer-Encoding"))
                 || (routingContext.request().version() == io.vertx.core.http.HttpVersion.HTTP_2
-                        && contentTypeHeader != null && contentTypeHeader.startsWith(OFFSET_OCTET_STREAM));
+                        && contentType != null && contentType.startsWith(OFFSET_OCTET_STREAM));
 
         if (!hasBody || isDeferredLength) {
             return Uni.createFrom().item(createdResponse(location, expires, isDeferredLength, 0));
         }
 
         // Creation-with-upload: the body is the first chunk.
-        String contentType = routingContext.request().getHeader("Content-Type");
         if (contentType == null || !contentType.startsWith(OFFSET_OCTET_STREAM)) {
-            discard(uploadId);
-            return Uni.createFrom().item(tus(BAD_REQUEST)
+            return discard(uploadId).replaceWith(() -> tus(BAD_REQUEST)
                     .entity("Content-Type must be " + OFFSET_OCTET_STREAM + " for creation-with-upload")
                     .build());
         }
         if (contentLength != null && contentLength > tusRuntimeConfig.maxChunkSize()) {
-            discard(uploadId);
-            return Uni.createFrom().item(tus(REQUEST_ENTITY_TOO_LARGE)
+            return discard(uploadId).replaceWith(() -> tus(REQUEST_ENTITY_TOO_LARGE)
                     .entity("Chunk size exceeds maximum allowed size").build());
         }
         if (contentLength != null && contentLength > uploadSize) {
-            discard(uploadId);
-            return Uni.createFrom().item(tus(REQUEST_ENTITY_TOO_LARGE)
+            return discard(uploadId).replaceWith(() -> tus(REQUEST_ENTITY_TOO_LARGE)
                     .entity("Body exceeds declared Upload-Length").build());
         }
 
-        if (!uploadStore.acquireLock(uploadId)) {
-            return Uni.createFrom().item(tus(423).entity("Upload is currently being processed").build());
-        }
-
-        return detached(writeBody(uploadId, info, 0, routingContext, null, null, contentLength, stream)
-                .onItem().transform(newOffset -> createdResponse(location, expires, false, newOffset))
-                .onFailure(ChunkLimitExceededException.class).recoverWithItem(e ->
-                        tus(REQUEST_ENTITY_TOO_LARGE).entity(e.getMessage()).build())
-                .plug(u -> recoverWriteFailures(u, uploadId))
-                .eventually(() -> uploadStore.releaseLock(uploadId))
-                .onItem().invoke(response -> {
+        return uploadStore.acquireLock(uploadId).chain(locked -> {
+            if (!locked) {
+                return Uni.createFrom().item(tus(423).entity("Upload is currently being processed").build());
+            }
+            return detached(writeBody(uploadId, info, 0, routingContext, null, null, contentLength, stream)
+                    .onItem().transform(newOffset -> createdResponse(location, expires, false, newOffset))
+                    .onFailure(ChunkLimitExceededException.class).recoverWithItem(e ->
+                            tus(REQUEST_ENTITY_TOO_LARGE).entity(e.getMessage()).build())
+                    .plug(u -> recoverWriteFailures(u, uploadId))
+                    .eventually(() -> uploadStore.releaseLock(uploadId))
                     // The client gets an error and no Location, so it will create again rather
                     // than resume: leaving the upload behind only makes work for the cleanup jobs.
-                    if (response.getStatus() != CREATED.getStatusCode()) {
-                        discard(uploadId);
-                    }
-                }));
+                    .call(response -> response.getStatus() == CREATED.getStatusCode()
+                            ? Uni.createFrom().voidItem()
+                            : discard(uploadId).replaceWithVoid()));
+        });
     }
 
     private Response createdResponse(String location, String expires, boolean deferred, long offset) {
@@ -378,54 +397,62 @@ public class TusUploadResource {
         // be summed and copied, so one uploaded partial could be inflated into a file many times
         // its size.
         Set<String> seen = new HashSet<>();
-        boolean allPartialsComplete = true;
-        long totalLength = 0;
         for (String partialId : ids) {
             if (!seen.add(partialId)) {
                 return Uni.createFrom().item(tus(BAD_REQUEST)
                         .entity("Upload-Concat references the same partial upload more than once").build());
             }
-            Optional<UploadInfo> partialOpt = uploadStore.findUploadInfo(partialId);
-            if (partialOpt.isEmpty() || isOwnershipDenied(partialId, currentUserId)) {
-                return Uni.createFrom().item(mergeFailureResponse());
-            }
-            UploadInfo partial = partialOpt.get();
-            if (!partial.isPartial() || partial.getEntityLength() < 0) {
-                return Uni.createFrom().item(mergeFailureResponse());
-            }
-            if (partial.getOffset() != partial.getEntityLength()) {
-                allPartialsComplete = false;
-            }
-            totalLength += partial.getEntityLength();
         }
 
-        if (totalLength > tusRuntimeConfig.maxSize()) {
-            return Uni.createFrom().item(tus(REQUEST_ENTITY_TOO_LARGE)
-                    .entity("Concatenated upload would exceed the maximum size").build());
-        }
+        return Multi.createFrom().iterable(List.of(ids))
+                .onItem().transformToUniAndConcatenate(uploadStore::findUploadInfo)
+                .collect().asList()
+                .chain(partials -> {
+                    boolean allPartialsComplete = true;
+                    long totalLength = 0;
+                    for (Optional<UploadInfo> partialOpt : partials) {
+                        if (partialOpt.isEmpty() || isOwnershipDenied(partialOpt.get(), currentUserId)) {
+                            return Uni.createFrom().item(mergeFailureResponse());
+                        }
+                        UploadInfo partial = partialOpt.get();
+                        if (!partial.isPartial() || partial.getEntityLength() < 0) {
+                            return Uni.createFrom().item(mergeFailureResponse());
+                        }
+                        if (partial.getOffset() != partial.getEntityLength()) {
+                            allPartialsComplete = false;
+                        }
+                        totalLength += partial.getEntityLength();
+                    }
 
-        UploadInfo finalInfo = UploadRecords.newFinalConcat(totalLength, uploadMetadata, currentUserId,
-                List.of(ids), uploadConcatHeader, tusRuntimeConfig.expirationHours());
-        String finalId;
-        try {
-            finalId = uploadStore.createUpload(finalInfo);
-        } catch (UploadStoreException e) {
-            LOG.error("Store failed to create final upload", e);
-            return Uni.createFrom().item(tus(INTERNAL_SERVER_ERROR).build());
-        }
+                    if (totalLength > tusRuntimeConfig.maxSize()) {
+                        return Uni.createFrom().item(tus(REQUEST_ENTITY_TOO_LARGE)
+                                .entity("Concatenated upload would exceed the maximum size").build());
+                    }
 
-        Response created = tus(CREATED).header("Location", TUS_PATH + "/" + finalId).build();
-        if (!allPartialsComplete) {
-            return Uni.createFrom().item(created);
-        }
-
-        return finalizeConcatenationIfReady(finalId, finalInfo)
-                .onItem().transform(finalized -> created)
-                .onFailure().recoverWithItem(e -> {
-                    LOG.errorf(e, "Failed to concatenate into %s", finalId);
-                    discard(finalId);
-                    return tus(INTERNAL_SERVER_ERROR)
-                            .entity("Failed to merge partial uploads").build();
+                    UploadInfo finalInfo = UploadRecords.newFinalConcat(totalLength, uploadMetadata, currentUserId,
+                            List.of(ids), uploadConcatHeader, tusRuntimeConfig.expirationHours());
+                    final boolean ready = allPartialsComplete;
+                    return uploadStore.createUpload(finalInfo)
+                            .onFailure().recoverWithUni(e -> {
+                                LOG.error("Store failed to create final upload", e);
+                                return Uni.createFrom().nullItem();
+                            })
+                            .chain(finalId -> {
+                                if (finalId == null) {
+                                    return Uni.createFrom().item(tus(INTERNAL_SERVER_ERROR).build());
+                                }
+                                Response created = tus(CREATED).header("Location", TUS_PATH + "/" + finalId).build();
+                                if (!ready) {
+                                    return Uni.createFrom().item(created);
+                                }
+                                return finalizeConcatenationIfReady(finalId, finalInfo)
+                                        .replaceWith(created)
+                                        .onFailure().recoverWithUni(e -> {
+                                            LOG.errorf(e, "Failed to concatenate into %s", finalId);
+                                            return discard(finalId).replaceWith(() -> tus(INTERNAL_SERVER_ERROR)
+                                                    .entity("Failed to merge partial uploads").build());
+                                        });
+                            });
                 });
     }
 
@@ -440,55 +467,74 @@ public class TusUploadResource {
         if (!finalInfo.isFinalConcat() || partialIds == null || partialIds.isEmpty()) {
             return Uni.createFrom().item(false);
         }
-        if (!uploadStore.acquireLock(finalId)) {
-            return Uni.createFrom().item(false);
-        }
+        return uploadStore.acquireLock(finalId).chain(gotFinalLock -> {
+            if (!gotFinalLock) {
+                return Uni.createFrom().item(false);
+            }
+            List<String> locked = new ArrayList<>();
+            return lockCompletePartials(partialIds, locked)
+                    // Re-read under the lock: a concurrent HEAD may already have finalized it.
+                    .chain(ready -> ready ? uploadStore.findUploadInfo(finalId)
+                            : Uni.createFrom().item(Optional.<UploadInfo>empty()))
+                    .chain(currentOpt -> {
+                        if (currentOpt.isEmpty() || !currentOpt.get().isFinalConcat()) {
+                            return Uni.createFrom().item(false);
+                        }
+                        UploadInfo info = currentOpt.get();
+                        return uploadStore.concatenate(finalId, partialIds)
+                                // The partials are discarded under the locks this request still
+                                // holds, so a second final over the same partials cannot slip in
+                                // between and find them half gone.
+                                .chain(() -> discardAll(partialIds))
+                                .emitOn(Infrastructure.getDefaultWorkerPool())
+                                .invoke(() -> concatenationCompletedEvent.fire(new TusConcatenationCompletedEvent(
+                                        finalId, partialIds.toArray(new String[0]), info.getEntityLength(),
+                                        info.getMetadata(), info.getUploaderId())))
+                                .replaceWith(true);
+                    })
+                    .eventually(() -> releaseAll(locked).chain(() -> uploadStore.releaseLock(finalId)));
+        });
+    }
 
-        List<String> locked = new ArrayList<>();
-        boolean ready = true;
+    /**
+     * Takes each partial's lock in turn, recording what was taken in {@code locked} so the caller
+     * can release it, and stops at the first partial that is locked elsewhere, missing or
+     * incomplete. Resolves to whether every partial is locked and complete.
+     */
+    private Uni<Boolean> lockCompletePartials(List<String> partialIds, List<String> locked) {
+        Uni<Boolean> chain = Uni.createFrom().item(true);
         for (String partialId : partialIds) {
-            if (!uploadStore.acquireLock(partialId)) {
-                ready = false;
-                break;
-            }
-            locked.add(partialId);
-            Optional<UploadInfo> partial = uploadStore.findUploadInfo(partialId);
-            if (partial.isEmpty() || partial.get().getOffset() != partial.get().getEntityLength()) {
-                ready = false;
-                break;
-            }
-        }
-        // Re-read under the lock: a concurrent HEAD may already have finalized it.
-        Optional<UploadInfo> current = uploadStore.findUploadInfo(finalId);
-        if (current.isEmpty() || !current.get().isFinalConcat()) {
-            ready = false;
-        }
-        if (!ready) {
-            locked.forEach(uploadStore::releaseLock);
-            uploadStore.releaseLock(finalId);
-            return Uni.createFrom().item(false);
-        }
-
-        UploadInfo info = current.get();
-        return uploadStore.concatenate(finalId, partialIds)
-                .emitOn(Infrastructure.getDefaultWorkerPool())
-                .onItem().transform(v -> {
-                    // The partials are discarded under the locks this request still holds, so a
-                    // second final over the same partials cannot slip in between and find them
-                    // half gone.
-                    for (String partialId : partialIds) {
-                        uploadStore.discardUpload(partialId);
-                        uploadProgressService.finishUpload(partialId);
+            chain = chain.chain(stillReady -> {
+                if (!stillReady) {
+                    return Uni.createFrom().item(false);
+                }
+                return uploadStore.acquireLock(partialId).chain(gotLock -> {
+                    if (!gotLock) {
+                        return Uni.createFrom().item(false);
                     }
-                    concatenationCompletedEvent.fire(new TusConcatenationCompletedEvent(
-                            finalId, partialIds.toArray(new String[0]), info.getEntityLength(),
-                            info.getMetadata(), info.getUploaderId()));
-                    return true;
-                })
-                .eventually(() -> {
-                    locked.forEach(uploadStore::releaseLock);
-                    uploadStore.releaseLock(finalId);
+                    locked.add(partialId);
+                    return uploadStore.findUploadInfo(partialId).map(partial -> partial.isPresent()
+                            && partial.get().getOffset() == partial.get().getEntityLength());
                 });
+            });
+        }
+        return chain;
+    }
+
+    /** Discards every id in turn, clearing its progress entry; the caller holds their locks. */
+    private Uni<Void> discardAll(List<String> ids) {
+        return Multi.createFrom().iterable(ids)
+                .onItem().transformToUniAndConcatenate(id -> uploadStore.discardUpload(id)
+                        .invoke(() -> uploadProgressService.finishUpload(id)))
+                .collect().last()
+                .replaceWithVoid();
+    }
+
+    private Uni<Void> releaseAll(List<String> ids) {
+        return Multi.createFrom().iterable(List.copyOf(ids))
+                .onItem().transformToUniAndConcatenate(uploadStore::releaseLock)
+                .collect().last()
+                .replaceWithVoid();
     }
 
     // ---------- PATCH: add bytes ----------
@@ -548,109 +594,132 @@ public class TusUploadResource {
                     .entity("Upload-Offset header is required and must be non-negative").build());
         }
 
-        Optional<UploadInfo> uploadInfoOpt = uploadStore.findUploadInfo(uploadID);
-        if (uploadInfoOpt.isEmpty() || isOwnershipDenied(uploadID, getCurrentUserId(securityContext))) {
-            return Uni.createFrom().item(tus(NOT_FOUND).build());
-        }
-
-        if (isExpired(uploadInfoOpt.get())) {
-            discard(uploadID);
-            return Uni.createFrom().item(tus(410).entity("Upload has expired").build());
-        }
-
-        UploadInfo info = uploadInfoOpt.get();
-
-        // TUS spec: PATCH on a final upload URL is forbidden, whether or not the
-        // concatenation has been finalized yet (isFinalConcat means "merge still pending").
-        if (info.getUploadConcatMergedValue() != null || info.isFinalConcat()) {
-            return Uni.createFrom().item(tus(FORBIDDEN)
-                    .entity("Cannot patch a final concatenated upload").build());
-        }
-
-        if (contentLength != null && contentLength > tusRuntimeConfig.maxChunkSize()) {
-            return Uni.createFrom().item(tus(REQUEST_ENTITY_TOO_LARGE)
-                    .entity("Chunk size exceeds maximum allowed size").build());
-        }
-
-        // Parsed before the lock is taken so that a rejection cannot leak it. A blank header
-        // is treated as absent; a present-but-unparseable one is a client error rather than
-        // something to silently skip, since the client believes its data is being verified.
-        // checksum-trailer would read Upload-Checksum from the request trailers here, but
-        // HttpServerRequest cannot expose them until eclipse-vertx/vert.x#5253 ships. See the
-        // checksum-trailer branch, which builds against a patched vertx-core.
-        ChecksumInfo checksumInfo = null;
-        MessageDigest digest = null;
-        if (uploadChecksum != null && !uploadChecksum.isBlank()) {
-            Optional<ChecksumInfo> parsed = TusUtils.parseChecksumHeader(uploadChecksum);
-            if (parsed.isEmpty()) {
-                return Uni.createFrom().item(tus(BAD_REQUEST).entity("Malformed Upload-Checksum header").build());
-            }
-            checksumInfo = parsed.get();
-            Optional<MessageDigest> digestOpt = isSupportedChecksumAlgorithm(checksumInfo.algorithm())
-                    ? ChunkStream.digestFor(checksumInfo.algorithm()) : Optional.empty();
-            if (digestOpt.isEmpty()) {
-                return Uni.createFrom().item(tus(BAD_REQUEST).entity("Unsupported checksum algorithm").build());
-            }
-            digest = digestOpt.get();
-        }
-
-        if (!uploadStore.acquireLock(uploadID)) {
-            return Uni.createFrom().item(tus(423).entity("Upload is currently being processed").build());
-        }
-
-        // Everything from here until the write is handed off runs under the lock. Validating
-        // the offset outside it allowed two requests to both pass validation and then write in
-        // turn, the second silently overwriting the first. The flag hands lock ownership to
-        // the async chain, whose eventually() releases it; every earlier exit releases here.
-        boolean releaseLockOnExit = true;
-        try {
-            Optional<UploadInfo> lockedInfoOpt = uploadStore.findUploadInfo(uploadID);
-            if (lockedInfoOpt.isEmpty()) {
+        String currentUserId = getCurrentUserId(securityContext);
+        final long offset = uploadOffset;
+        return uploadStore.findUploadInfo(uploadID).chain(uploadInfoOpt -> {
+            if (uploadInfoOpt.isEmpty() || isOwnershipDenied(uploadInfoOpt.get(), currentUserId)) {
                 return Uni.createFrom().item(tus(NOT_FOUND).build());
             }
-            info = lockedInfoOpt.get();
+
+            UploadInfo info = uploadInfoOpt.get();
+
+            if (isExpired(info)) {
+                return discard(uploadID).replaceWith(() -> tus(410).entity("Upload has expired").build());
+            }
+
+            // TUS spec: PATCH on a final upload URL is forbidden, whether or not the
+            // concatenation has been finalized yet (isFinalConcat means "merge still pending").
+            if (info.getUploadConcatMergedValue() != null || info.isFinalConcat()) {
+                return Uni.createFrom().item(tus(FORBIDDEN)
+                        .entity("Cannot patch a final concatenated upload").build());
+            }
+
+            if (contentLength != null && contentLength > tusRuntimeConfig.maxChunkSize()) {
+                return Uni.createFrom().item(tus(REQUEST_ENTITY_TOO_LARGE)
+                        .entity("Chunk size exceeds maximum allowed size").build());
+            }
+
+            // Parsed before the lock is taken so that a rejection cannot leak it. A blank header
+            // is treated as absent; a present-but-unparseable one is a client error rather than
+            // something to silently skip, since the client believes its data is being verified.
+            // checksum-trailer would read Upload-Checksum from the request trailers here, but
+            // HttpServerRequest cannot expose them until eclipse-vertx/vert.x#5253 ships. See the
+            // checksum-trailer branch, which builds against a patched vertx-core.
+            ChecksumInfo checksumInfo = null;
+            MessageDigest digest = null;
+            if (uploadChecksum != null && !uploadChecksum.isBlank()) {
+                Optional<ChecksumInfo> parsed = TusUtils.parseChecksumHeader(uploadChecksum);
+                if (parsed.isEmpty()) {
+                    return Uni.createFrom().item(tus(BAD_REQUEST).entity("Malformed Upload-Checksum header").build());
+                }
+                checksumInfo = parsed.get();
+                Optional<MessageDigest> digestOpt = isSupportedChecksumAlgorithm(checksumInfo.algorithm())
+                        ? ChunkStream.digestFor(checksumInfo.algorithm()) : Optional.empty();
+                if (digestOpt.isEmpty()) {
+                    return Uni.createFrom().item(tus(BAD_REQUEST).entity("Unsupported checksum algorithm").build());
+                }
+                digest = digestOpt.get();
+            }
+
+            final ChecksumInfo expectedChecksum = checksumInfo;
+            final MessageDigest bodyDigest = digest;
+            return uploadStore.acquireLock(uploadID).chain(locked -> {
+                if (!locked) {
+                    return Uni.createFrom().item(tus(423).entity("Upload is currently being processed").build());
+                }
+                // From here the lock is held, and every path below releases it: the rejections
+                // through releasingLock, the write through patchUnderLock's eventually. Validating
+                // the offset outside the lock allowed two requests to both pass validation and
+                // then write in turn, the second silently overwriting the first.
+                return patchUnderLockValidated(uploadID, offset, contentLength, uploadLength,
+                        expectedChecksum, bodyDigest, routingContext, stream);
+            });
+        });
+    }
+
+    /** Answers {@code response} after releasing the upload's lock. */
+    private Uni<Response> releasingLock(String uploadID, Response response) {
+        return uploadStore.releaseLock(uploadID).replaceWith(response);
+    }
+
+    /**
+     * The checks that must happen under the upload's lock — the record as it stands now, a
+     * deferred length becoming known, the offset — and then the write. The caller holds the
+     * lock; every path here releases it.
+     */
+    private Uni<Response> patchUnderLockValidated(String uploadID, long uploadOffset, Long contentLength,
+                                                  Long uploadLength, ChecksumInfo checksumInfo,
+                                                  MessageDigest digest, RoutingContext routingContext,
+                                                  AtomicReference<ChunkStream> stream) {
+        return uploadStore.findUploadInfo(uploadID).chain(lockedInfoOpt -> {
+            if (lockedInfoOpt.isEmpty()) {
+                return releasingLock(uploadID, tus(NOT_FOUND).build());
+            }
+            UploadInfo info = lockedInfoOpt.get();
 
             boolean lengthStillDeferred = info.isDeferredLength() && info.getEntityLength() < 0;
+            Uni<Boolean> stillDeferred;
             if (uploadLength != null && lengthStillDeferred) {
                 if (uploadLength < 0 || uploadLength > tusRuntimeConfig.maxSize()) {
-                    return Uni.createFrom().item(tus(BAD_REQUEST).entity("Failed to set upload length").build());
+                    return releasingLock(uploadID, tus(BAD_REQUEST).entity("Failed to set upload length").build());
                 }
                 info.setEntityLength(uploadLength);
                 info.setDeferredLength(false);
                 info.setLastActivity(Instant.now());
-                uploadStore.updateUploadInfo(uploadID, info);
-                uploadProgressService.startUpload(uploadID, uploadLength);
-                lengthStillDeferred = false;
-                LOG.infof("Set deferred length for upload %s to %d", uploadID, uploadLength);
-                if (uploadLength == 0) {
-                    fireCompleted(uploadID, info);
+                stillDeferred = uploadStore.updateUploadInfo(uploadID, info)
+                        .invoke(() -> {
+                            uploadProgressService.startUpload(uploadID, uploadLength);
+                            LOG.infof("Set deferred length for upload %s to %d", uploadID, uploadLength);
+                            if (uploadLength == 0) {
+                                fireCompleted(uploadID, info);
+                            }
+                        })
+                        .replaceWith(false);
+            } else {
+                stillDeferred = Uni.createFrom().item(lengthStillDeferred);
+            }
+
+            return stillDeferred.chain(deferred -> {
+                if (deferred) {
+                    return releasingLock(uploadID, tus(BAD_REQUEST)
+                            .entity("Upload-Length must be set before uploading data").build());
                 }
-            }
 
-            if (lengthStillDeferred) {
-                return Uni.createFrom().item(tus(BAD_REQUEST)
-                        .entity("Upload-Length must be set before uploading data").build());
-            }
+                if (uploadOffset != info.getOffset()) {
+                    return releasingLock(uploadID, tus(CONFLICT)
+                            .header("Upload-Offset", String.valueOf(info.getOffset()))
+                            .entity("Upload offset mismatch").build());
+                }
 
-            if (uploadOffset != info.getOffset()) {
-                return Uni.createFrom().item(tus(CONFLICT)
-                        .header("Upload-Offset", String.valueOf(info.getOffset()))
-                        .entity("Upload offset mismatch").build());
-            }
+                if (contentLength != null && !fitsWithin(contentLength, uploadOffset, info.getEntityLength())) {
+                    return releasingLock(uploadID,
+                            tus(CONFLICT).entity("Chunk exceeds declared upload size").build());
+                }
 
-            if (contentLength != null && !fitsWithin(contentLength, uploadOffset, info.getEntityLength())) {
-                return Uni.createFrom().item(tus(CONFLICT).entity("Chunk exceeds declared upload size").build());
-            }
-
-            Uni<Response> result = patchUnderLock(uploadID, info, uploadOffset, routingContext,
-                    checksumInfo, digest, contentLength, stream);
-            releaseLockOnExit = false;
-            return result;
-        } finally {
-            if (releaseLockOnExit) {
-                uploadStore.releaseLock(uploadID);
-            }
-        }
+                return patchUnderLock(uploadID, info, uploadOffset, routingContext,
+                        checksumInfo, digest, contentLength, stream);
+            });
+        });
     }
 
     /**
@@ -744,6 +813,9 @@ public class TusUploadResource {
         long remaining = entityLength >= 0 ? entityLength - offset : Long.MAX_VALUE;
         ChunkStream stream = new ChunkStream(routingContext, digest, tusRuntimeConfig.maxChunkSize(), remaining);
         streamRef.set(stream);
+        // Completion is a transition, decided once: only the commit that reaches the declared
+        // length fires it, and the record it reports is re-read after that commit.
+        java.util.concurrent.atomic.AtomicBoolean completed = new java.util.concurrent.atomic.AtomicBoolean();
         long expectedLength = contentLength != null ? contentLength : -1;
 
         // deferred(): a store that throws from stageChunk instead of returning a failed Uni
@@ -785,14 +857,16 @@ public class TusUploadResource {
                     chunkReceivedEvent.fire(new TusChunkReceivedEvent(uploadID, chunkSize, newOffset, entityLength));
                     notifyProgress(uploadID, newOffset, entityLength);
 
-                    // Completion is a transition, decided once and here: only the commit that
-                    // reaches the declared length fires it. A later empty PATCH at the final
-                    // offset does not, and neither does a restart.
+                    // A later empty PATCH at the final offset does not complete, nor a restart.
                     if (offset < entityLength && newOffset == entityLength) {
-                        UploadInfo current = uploadStore.findUploadInfo(uploadID).orElse(info);
-                        fireCompleted(uploadID, current);
+                        completed.set(true);
                     }
-                });
+                })
+                .call(newOffset -> completed.get()
+                        ? uploadStore.findUploadInfo(uploadID)
+                                .invoke(current -> fireCompleted(uploadID, current.orElse(info)))
+                                .replaceWithVoid()
+                        : Uni.createFrom().voidItem());
     }
 
     /**
@@ -864,41 +938,42 @@ public class TusUploadResource {
     @jakarta.ws.rs.Path("/{uploadID}")
     @Operation(summary = "Terminate and delete upload")
     @APIResponse(responseCode = "204", description = "Upload terminated")
-    public Response delete(
+    public Uni<Response> delete(
             @PathParam("uploadID") String uploadID,
             @HeaderParam("Tus-Resumable") String tusResumable,
             @Context SecurityContext securityContext
     ) {
         if (tusResumable == null || !tusResumable.equals(tusRuntimeConfig.version())) {
-            return Response.status(412)
+            return Uni.createFrom().item(Response.status(412)
                     .header("Tus-Version", tusRuntimeConfig.version())
-                    .build();
+                    .build());
         }
 
         if (!TusUtils.isValidUuid(uploadID)) {
-            return tus(BAD_REQUEST).entity("Invalid upload ID format").build();
+            return Uni.createFrom().item(tus(BAD_REQUEST).entity("Invalid upload ID format").build());
         }
 
-        if (isOwnershipDenied(uploadID, getCurrentUserId(securityContext))) {
-            return tus(NOT_FOUND).build();
-        }
-
-        // Deleting something that was never there stays idempotent, but a write holding the
-        // lock means the client should retry.
-        Discard outcome = discard(uploadID);
-        if (outcome == Discard.LOCKED) {
-            return tus(423).entity("Upload is currently being processed").build();
-        }
-
-        LOG.infof("UploadID %s deleted=%s", uploadID, outcome == Discard.REMOVED);
-
-        if (sseServiceInstance.isResolvable()) {
-            sseServiceInstance.get().unregister(uploadID);
-        }
-
-        uploadTerminatedEvent.fire(new TusUploadTerminatedEvent(uploadID));
-
-        return tus(NO_CONTENT).build();
+        String currentUserId = getCurrentUserId(securityContext);
+        return uploadStore.findUploadInfo(uploadID).chain(infoOpt -> {
+            if (infoOpt.isPresent() && isOwnershipDenied(infoOpt.get(), currentUserId)) {
+                return Uni.createFrom().item(tus(NOT_FOUND).build());
+            }
+            // Deleting something that was never there stays idempotent, but a write holding the
+            // lock means the client should retry.
+            return discard(uploadID)
+                    .emitOn(Infrastructure.getDefaultWorkerPool())
+                    .map(outcome -> {
+                        if (outcome == Discard.LOCKED) {
+                            return tus(423).entity("Upload is currently being processed").build();
+                        }
+                        LOG.infof("UploadID %s deleted=%s", uploadID, outcome == Discard.REMOVED);
+                        if (sseServiceInstance.isResolvable()) {
+                            sseServiceInstance.get().unregister(uploadID);
+                        }
+                        uploadTerminatedEvent.fire(new TusUploadTerminatedEvent(uploadID));
+                        return tus(NO_CONTENT).build();
+                    });
+        });
     }
 
     // ---------- helpers ----------
@@ -909,18 +984,16 @@ public class TusUploadResource {
      * Discards an upload the way every path in here must: under its lock, so nothing is deleted
      * underneath an in-flight write, and with the framework's own progress bookkeeping cleared.
      */
-    private Discard discard(String uploadId) {
-        if (!uploadStore.acquireLock(uploadId)) {
-            return Discard.LOCKED;
-        }
-        boolean removed;
-        try {
-            removed = uploadStore.discardUpload(uploadId);
-        } finally {
-            uploadStore.releaseLock(uploadId);
-        }
-        uploadProgressService.finishUpload(uploadId);
-        return removed ? Discard.REMOVED : Discard.ABSENT;
+    private Uni<Discard> discard(String uploadId) {
+        return uploadStore.acquireLock(uploadId).chain(locked -> {
+            if (!locked) {
+                return Uni.createFrom().item(Discard.LOCKED);
+            }
+            return uploadStore.discardUpload(uploadId)
+                    .eventually(() -> uploadStore.releaseLock(uploadId))
+                    .invoke(() -> uploadProgressService.finishUpload(uploadId))
+                    .map(removed -> removed ? Discard.REMOVED : Discard.ABSENT);
+        });
     }
 
     private Response.ResponseBuilder tus(Response.Status status) {
@@ -946,8 +1019,8 @@ public class TusUploadResource {
         return authorizer.currentUserId(securityContext);
     }
 
-    private boolean isOwnershipDenied(String uploadID, String currentUserId) {
-        return authorizer.isDenied(uploadID, currentUserId);
+    private boolean isOwnershipDenied(UploadInfo info, String currentUserId) {
+        return authorizer.isDenied(info, currentUserId);
     }
 
     private boolean isSupportedChecksumAlgorithm(String algorithm) {
