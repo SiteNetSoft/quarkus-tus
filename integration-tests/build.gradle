@@ -13,6 +13,11 @@ dependencies {
     testImplementation project(':tck')
     testImplementation 'io.rest-assured:rest-assured'
     testImplementation 'org.awaitility:awaitility:4.3.0'
+    // The streaming S3 sample store (S3UploadStore) and its tests; test scope only, so no SDK
+    // reaches the published jars. Its tests run only when TUS_S3_ENDPOINT points at an S3.
+    testImplementation platform('software.amazon.awssdk:bom:2.31.77')
+    testImplementation 'software.amazon.awssdk:s3'
+    testImplementation 'software.amazon.awssdk:netty-nio-client'
     implementation 'io.quarkus:quarkus-elytron-security-properties-file'
     implementation 'io.quarkus:quarkus-micrometer-registry-prometheus'
     implementation 'io.quarkus:quarkus-smallrye-health'
