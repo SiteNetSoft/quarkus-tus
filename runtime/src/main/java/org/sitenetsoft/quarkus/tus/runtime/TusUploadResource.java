@@ -17,7 +17,6 @@ import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
 import org.eclipse.microprofile.openapi.annotations.tags.Tag;
 import org.jboss.logging.Logger;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
-import org.sitenetsoft.quarkus.tus.runtime.event.*;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadInfo;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadProgress;
 import org.sitenetsoft.quarkus.tus.runtime.spi.OffsetMismatchException;
@@ -75,25 +74,13 @@ public class TusUploadResource {
     TusUploadAuthorizer authorizer;
 
     @Inject
-    Instance<TusSseService> sseServiceInstance;
+    UploadWriter writer;
 
     @Inject
-    UploadProgressService uploadProgressService;
+    UploadConcatenator concatenator;
 
     @Inject
-    Event<TusUploadCreatedEvent> uploadCreatedEvent;
-
-    @Inject
-    Event<TusChunkReceivedEvent> chunkReceivedEvent;
-
-    @Inject
-    Event<TusUploadTerminatedEvent> uploadTerminatedEvent;
-
-    @Inject
-    Event<TusUploadCompletedEvent> uploadCompletedEvent;
-
-    @Inject
-    Event<TusConcatenationCompletedEvent> concatenationCompletedEvent;
+    UploadEvents events;
 
     // ---------- OPTIONS: server capabilities ----------
 
@@ -149,7 +136,7 @@ public class TusUploadResource {
             }
 
             // Auto-finalize an unfinished concatenation once every partial is complete.
-            return finalizeConcatenationIfReady(uploadID, info)
+            return concatenator.finalizeIfReady(uploadID, info)
                     .onFailure().recoverWithItem(e -> {
                         LOG.errorf(e, "Failed to finalize concatenation %s during HEAD", uploadID);
                         return false;
@@ -290,17 +277,12 @@ public class TusUploadResource {
                                            boolean isDeferredLength, boolean isPartial, String uploadMetadata,
                                            Long contentLength, RoutingContext routingContext,
                                            AtomicReference<ChunkStream> stream) {
-        if (!isDeferredLength) {
-            uploadProgressService.startUpload(uploadId, uploadSize);
-        }
-
-        uploadCreatedEvent.fire(new TusUploadCreatedEvent(
-                uploadId, uploadSize, isDeferredLength, isPartial, uploadMetadata));
+        events.uploadCreated(uploadId, uploadSize, isDeferredLength, isPartial, uploadMetadata);
 
         // A zero-length upload is complete the moment it exists; there will never be a chunk
         // to make the transition.
         if (!isDeferredLength && uploadSize == 0) {
-            fireCompleted(uploadId, info);
+            events.uploadCompleted(uploadId, info);
         }
 
         String location = TUS_PATH + "/" + uploadId;
@@ -338,7 +320,7 @@ public class TusUploadResource {
             if (!locked) {
                 return Uni.createFrom().item(tus(423).entity("Upload is currently being processed").build());
             }
-            return detached(writeBody(uploadId, info, 0, routingContext, null, null, contentLength, stream)
+            return detached(writer.write(uploadId, info, 0, routingContext, null, null, contentLength, stream)
                     .onItem().transform(newOffset -> createdResponse(location, expires, false, newOffset))
                     .onFailure(ChunkLimitExceededException.class).recoverWithItem(e ->
                             tus(REQUEST_ENTITY_TOO_LARGE).entity(e.getMessage()).build())
@@ -445,7 +427,7 @@ public class TusUploadResource {
                                 if (!ready) {
                                     return Uni.createFrom().item(created);
                                 }
-                                return finalizeConcatenationIfReady(finalId, finalInfo)
+                                return concatenator.finalizeIfReady(finalId, finalInfo)
                                         .replaceWith(created)
                                         .onFailure().recoverWithUni(e -> {
                                             LOG.errorf(e, "Failed to concatenate into %s", finalId);
@@ -454,87 +436,6 @@ public class TusUploadResource {
                                         });
                             });
                 });
-    }
-
-    /**
-     * Joins the partials into {@code finalId} if every one of them is complete, under the final
-     * upload's lock and every partial's lock. Resolves to {@code true} if the concatenation
-     * happened, {@code false} if it is not ready or another request is doing it; fails only if
-     * the store's join failed.
-     */
-    private Uni<Boolean> finalizeConcatenationIfReady(String finalId, UploadInfo finalInfo) {
-        List<String> partialIds = finalInfo.getPartialIds();
-        if (!finalInfo.isFinalConcat() || partialIds == null || partialIds.isEmpty()) {
-            return Uni.createFrom().item(false);
-        }
-        return uploadStore.acquireLock(finalId).chain(gotFinalLock -> {
-            if (!gotFinalLock) {
-                return Uni.createFrom().item(false);
-            }
-            List<String> locked = new ArrayList<>();
-            return lockCompletePartials(partialIds, locked)
-                    // Re-read under the lock: a concurrent HEAD may already have finalized it.
-                    .chain(ready -> ready ? uploadStore.findUploadInfo(finalId)
-                            : Uni.createFrom().item(Optional.<UploadInfo>empty()))
-                    .chain(currentOpt -> {
-                        if (currentOpt.isEmpty() || !currentOpt.get().isFinalConcat()) {
-                            return Uni.createFrom().item(false);
-                        }
-                        UploadInfo info = currentOpt.get();
-                        return uploadStore.concatenate(finalId, partialIds)
-                                // The partials are discarded under the locks this request still
-                                // holds, so a second final over the same partials cannot slip in
-                                // between and find them half gone.
-                                .chain(() -> discardAll(partialIds))
-                                .emitOn(Infrastructure.getDefaultWorkerPool())
-                                .invoke(() -> concatenationCompletedEvent.fire(new TusConcatenationCompletedEvent(
-                                        finalId, partialIds.toArray(new String[0]), info.getEntityLength(),
-                                        info.getMetadata(), info.getUploaderId())))
-                                .replaceWith(true);
-                    })
-                    .eventually(() -> releaseAll(locked).chain(() -> uploadStore.releaseLock(finalId)));
-        });
-    }
-
-    /**
-     * Takes each partial's lock in turn, recording what was taken in {@code locked} so the caller
-     * can release it, and stops at the first partial that is locked elsewhere, missing or
-     * incomplete. Resolves to whether every partial is locked and complete.
-     */
-    private Uni<Boolean> lockCompletePartials(List<String> partialIds, List<String> locked) {
-        Uni<Boolean> chain = Uni.createFrom().item(true);
-        for (String partialId : partialIds) {
-            chain = chain.chain(stillReady -> {
-                if (!stillReady) {
-                    return Uni.createFrom().item(false);
-                }
-                return uploadStore.acquireLock(partialId).chain(gotLock -> {
-                    if (!gotLock) {
-                        return Uni.createFrom().item(false);
-                    }
-                    locked.add(partialId);
-                    return uploadStore.findUploadInfo(partialId).map(partial -> partial.isPresent()
-                            && partial.get().getOffset() == partial.get().getEntityLength());
-                });
-            });
-        }
-        return chain;
-    }
-
-    /** Discards every id in turn, clearing its progress entry; the caller holds their locks. */
-    private Uni<Void> discardAll(List<String> ids) {
-        return Multi.createFrom().iterable(ids)
-                .onItem().transformToUniAndConcatenate(id -> uploadStore.discardUpload(id)
-                        .invoke(() -> uploadProgressService.finishUpload(id)))
-                .collect().last()
-                .replaceWithVoid();
-    }
-
-    private Uni<Void> releaseAll(List<String> ids) {
-        return Multi.createFrom().iterable(List.copyOf(ids))
-                .onItem().transformToUniAndConcatenate(uploadStore::releaseLock)
-                .collect().last()
-                .replaceWithVoid();
     }
 
     // ---------- PATCH: add bytes ----------
@@ -688,10 +589,10 @@ public class TusUploadResource {
                 info.setLastActivity(Instant.now());
                 stillDeferred = uploadStore.updateUploadInfo(uploadID, info)
                         .invoke(() -> {
-                            uploadProgressService.startUpload(uploadID, uploadLength);
+                            events.lengthKnown(uploadID, uploadLength);
                             LOG.infof("Set deferred length for upload %s to %d", uploadID, uploadLength);
                             if (uploadLength == 0) {
-                                fireCompleted(uploadID, info);
+                                events.uploadCompleted(uploadID, info);
                             }
                         })
                         .replaceWith(false);
@@ -733,19 +634,11 @@ public class TusUploadResource {
         final String expires = expiresHeader(info);
         final long entityLength = info.getEntityLength();
 
-        Uni<Long> write;
-        if (contentLength != null && contentLength == 0) {
-            // Nothing to store; the store never sees a zero-length chunk. Some clients poll with
-            // an empty PATCH, so the progress stream still hears where the upload stands.
-            write = Uni.createFrom().item(uploadOffset)
-                    .emitOn(Infrastructure.getDefaultWorkerPool())
-                    .onItem().invoke(offset -> {
-                        chunkReceivedEvent.fire(new TusChunkReceivedEvent(uploadID, 0, offset, entityLength));
-                        notifyProgress(uploadID, offset, entityLength);
-                    });
-        } else {
-            write = writeBody(uploadID, info, uploadOffset, routingContext, checksumInfo, digest, contentLength, stream);
-        }
+        // Some clients poll with an empty PATCH; the store never sees a chunk it could not write.
+        Uni<Long> write = contentLength != null && contentLength == 0
+                ? writer.writeNothing(uploadID, uploadOffset, entityLength)
+                : writer.write(uploadID, info, uploadOffset, routingContext, checksumInfo, digest,
+                        contentLength, stream);
 
         return detached(write
                 .onItem().transform(newOffset -> {
@@ -772,7 +665,7 @@ public class TusUploadResource {
         return Uni.createFrom().emitter(emitter -> pipeline.subscribe().with(emitter::complete, emitter::fail));
     }
 
-    /** Maps the failures {@link #writeBody} can produce to their TUS responses. */
+    /** Maps the failures {@link UploadWriter} can produce to their TUS responses. */
     private Uni<Response> recoverWriteFailures(Uni<Response> write, String uploadID) {
         return write
                 .onFailure(OffsetMismatchException.class).recoverWithItem(e -> {
@@ -797,109 +690,6 @@ public class TusUploadResource {
                     LOG.error("Error while writing to upload " + uploadID, e);
                     return tus(INTERNAL_SERVER_ERROR).entity("Internal server error").build();
                 });
-    }
-
-    /**
-     * Streams the request body into the store at {@code offset}: stage, then commit if the
-     * checksum matched or abort if it did not, then progress bookkeeping and events. Resolves
-     * to the new offset. The caller holds the upload's lock and releases it afterwards; nothing
-     * here does. Fails with {@link ChecksumMismatch}, {@link ChunkLimitExceededException},
-     * {@link OffsetMismatchException}, {@link UploadNotFoundException} or the store's failure.
-     */
-    private Uni<Long> writeBody(String uploadID, UploadInfo info, long offset, RoutingContext routingContext,
-                                ChecksumInfo checksumInfo, MessageDigest digest, Long contentLength,
-                                AtomicReference<ChunkStream> streamRef) {
-        final long entityLength = info.getEntityLength();
-        long remaining = entityLength >= 0 ? entityLength - offset : Long.MAX_VALUE;
-        ChunkStream stream = new ChunkStream(routingContext, digest, tusRuntimeConfig.maxChunkSize(), remaining);
-        streamRef.set(stream);
-        // Completion is a transition, decided once: only the commit that reaches the declared
-        // length fires it, and the record it reports is re-read after that commit.
-        java.util.concurrent.atomic.AtomicBoolean completed = new java.util.concurrent.atomic.AtomicBoolean();
-        long expectedLength = contentLength != null ? contentLength : -1;
-
-        // deferred(): a store that throws from stageChunk instead of returning a failed Uni
-        // still lands in the failure path below, where the lock is released and the error mapped.
-        return Uni.createFrom().deferred(() -> uploadStore.stageChunk(uploadID, offset, stream.multi(), expectedLength))
-                // The limits are ours to enforce: whatever the store made of the cut-off stream —
-                // wrapped it, or even reported success — the answer is what we counted.
-                .onFailure().transform(e -> stream.limitExceeded() != null ? stream.limitExceeded() : e)
-                .onItem().transformToUni(staged -> {
-                    if (stream.limitExceeded() != null) {
-                        return Uni.createFrom().<Long>failure(stream.limitExceeded());
-                    }
-                    if (!stream.checksumMatches(checksumInfo)) {
-                        return uploadStore.abortChunk(uploadID, offset)
-                                .onItem().transformToUni(v -> Uni.createFrom().<Long>failure(new ChecksumMismatch()));
-                    }
-                    if (staged == 0) {
-                        // A length-less body that turned out empty: nothing to commit.
-                        return uploadStore.abortChunk(uploadID, offset).replaceWith(offset);
-                    }
-                    return uploadStore.commitChunk(uploadID, offset, staged).replaceWith(offset + staged);
-                })
-                .onFailure(e -> !(e instanceof ChecksumMismatch) && !(e instanceof OffsetMismatchException)).call(e -> {
-                    // A store that fails mid-stage may already have discarded its bytes; abort
-                    // anyway so the offset is guaranteed to be where the client left it. An
-                    // abort failure must not mask the original error. Not after a stale offset,
-                    // though: nothing was staged, and abortChunk(offset) would tell the store to
-                    // roll the upload back below where it really is.
-                    return uploadStore.abortChunk(uploadID, offset)
-                            .onFailure().recoverWithItem(abortErr -> {
-                                LOG.warnf(abortErr, "Failed to abort staged chunk for upload %s", uploadID);
-                                return null;
-                            });
-                })
-                .emitOn(Infrastructure.getDefaultWorkerPool())
-                .onItem().invoke(newOffset -> {
-                    long chunkSize = newOffset - offset;
-                    uploadProgressService.updateProgress(uploadID, chunkSize);
-                    chunkReceivedEvent.fire(new TusChunkReceivedEvent(uploadID, chunkSize, newOffset, entityLength));
-                    notifyProgress(uploadID, newOffset, entityLength);
-
-                    // A later empty PATCH at the final offset does not complete, nor a restart.
-                    if (offset < entityLength && newOffset == entityLength) {
-                        completed.set(true);
-                    }
-                })
-                .call(newOffset -> completed.get()
-                        ? uploadStore.findUploadInfo(uploadID)
-                                .invoke(current -> fireCompleted(uploadID, current.orElse(info)))
-                                .replaceWithVoid()
-                        : Uni.createFrom().voidItem());
-    }
-
-    /**
-     * Tells the progress stream where the upload stands. Progress entries live in memory, so
-     * after a restart the store knows the upload but the progress service does not — the
-     * event is then built from the offset itself, or a watcher would stall on the previous
-     * chunk and never see 100%.
-     */
-    private void notifyProgress(String uploadID, long offset, long entityLength) {
-        if (!sseServiceInstance.isResolvable()) {
-            return;
-        }
-        UploadProgress progress = uploadProgressService.getProgress(uploadID);
-        if (progress == null && entityLength >= 0) {
-            progress = new UploadProgress(entityLength);
-            progress.uploadedBytes = offset;
-        }
-        if (progress != null) {
-            sseServiceInstance.get().sendProgress(uploadID, progress);
-        }
-    }
-
-    private void fireCompleted(String uploadId, UploadInfo info) {
-        uploadProgressService.finishUpload(uploadId);
-        uploadCompletedEvent.fire(new TusUploadCompletedEvent(
-                uploadId, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));
-    }
-
-    /** Signals a checksum mismatch inside the write pipeline; never leaves this class. */
-    private static final class ChecksumMismatch extends RuntimeException {
-        ChecksumMismatch() {
-            super("Checksum mismatch", null, false, false);
-        }
     }
 
     private static boolean fitsWithin(long contentLength, long offset, long entityLength) {
@@ -967,10 +757,7 @@ public class TusUploadResource {
                             return tus(423).entity("Upload is currently being processed").build();
                         }
                         LOG.infof("UploadID %s deleted=%s", uploadID, outcome == Discard.REMOVED);
-                        if (sseServiceInstance.isResolvable()) {
-                            sseServiceInstance.get().unregister(uploadID);
-                        }
-                        uploadTerminatedEvent.fire(new TusUploadTerminatedEvent(uploadID));
+                        events.uploadTerminated(uploadID);
                         return tus(NO_CONTENT).build();
                     });
         });
@@ -991,7 +778,7 @@ public class TusUploadResource {
             }
             return uploadStore.discardUpload(uploadId)
                     .eventually(() -> uploadStore.releaseLock(uploadId))
-                    .invoke(() -> uploadProgressService.finishUpload(uploadId))
+                    .invoke(() -> events.uploadDiscarded(uploadId))
                     .map(removed -> removed ? Discard.REMOVED : Discard.ABSENT);
         });
     }

@@ -12,6 +12,9 @@ import io.quarkus.runtime.configuration.ConfigurationException;
 import org.sitenetsoft.quarkus.tus.runtime.TusMethodOverrideFilter;
 import org.sitenetsoft.quarkus.tus.runtime.TusResumableResponseFilter;
 import org.sitenetsoft.quarkus.tus.runtime.TusUploadAuthorizer;
+import org.sitenetsoft.quarkus.tus.runtime.UploadConcatenator;
+import org.sitenetsoft.quarkus.tus.runtime.UploadEvents;
+import org.sitenetsoft.quarkus.tus.runtime.UploadWriter;
 import org.sitenetsoft.quarkus.tus.runtime.TusUploadResource;
 import org.sitenetsoft.quarkus.tus.runtime.UploadExpirationScheduler;
 import org.sitenetsoft.quarkus.tus.runtime.UploadProgressService;
@@ -114,6 +117,9 @@ class TusProcessor {
                 .setUnremovable()
                 .addBeanClasses(
                         TusUploadResource.class,
+                        UploadWriter.class,
+                        UploadConcatenator.class,
+                        UploadEvents.class,
                         TusUploadAuthorizer.class,
                         TusResumableResponseFilter.class,
                         LocalFileUploadStore.class,
