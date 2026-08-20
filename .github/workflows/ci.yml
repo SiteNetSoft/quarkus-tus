@@ -11,8 +11,29 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-latest
 
+    # The S3 store tests (S3UploadStoreContractTest, TusS3StreamingTest) run only when this
+    # points at an S3; without it they skip, and the SPI's streaming claim would go unchecked
+    # on every push. MinIO below is that S3.
+    env:
+      TUS_S3_ENDPOINT: http://localhost:9000
+
     steps:
       - uses: actions/checkout@v7
+
+      # Started as a step rather than a service container: the official MinIO image needs a
+      # command ("server /data"), which services: cannot pass.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio12345 \
+            quay.io/minio/minio server /data
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
+              echo "MinIO is up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy"; docker logs minio; exit 1
 
       - name: Set up Java 25
         uses: actions/setup-java@v5
@@ -29,6 +50,29 @@ jobs:
 
       - name: Integration tests
         run: ./gradlew :integration-tests:integrationTest
+
+      # A skipped test reports the same as a passing one at the job level, so the S3 tests are
+      # checked to have actually run: a mistyped endpoint or a MinIO that never came up would
+      # otherwise look green while proving nothing.
+      - name: Verify the S3 store tests ran
+        if: always()
+        run: |
+          results=integration-tests/build/test-results/test
+          for suite in TusS3StreamingTest S3UploadStoreContractTest; do
+            file="$results/TEST-org.sitenetsoft.quarkus.tus.it.$suite.xml"
+            if [ ! -f "$file" ]; then
+              echo "::error::$suite did not run at all"; exit 1
+            fi
+            if ! grep -q 'skipped="0"' "$file"; then
+              echo "::error::$suite was skipped — TUS_S3_ENDPOINT or MinIO is not reaching the tests"
+              head -3 "$file"; exit 1
+            fi
+            echo "$suite: $(grep -o 'tests="[0-9]*"' "$file" | head -1) ran against MinIO"
+          done
+
+      - name: MinIO logs
+        if: failure()
+        run: docker logs minio || true
 
       - name: Upload coverage reports
         if: always()
