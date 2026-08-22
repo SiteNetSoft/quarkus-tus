@@ -15,7 +15,6 @@
 - Java 25, `JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64`; run tests with `./gradlew :integration-tests:test` (231 tests green on master before this work).
 - No storage-vendor SDKs in `runtime`/`deployment`. Runtime deps stay: quarkus-arc, quarkus-rest, quarkus-scheduler, quarkus-vertx.
 - Dependency versions come from the Quarkus BOM — never pin.
-- No Claude/AI attribution in commits.
 - Decided in the spec (do not relitigate): flat `stageChunk`/`commitChunk`/`abortChunk`, not a handle; concatenation fixed in the same pass; stores never return Locations.
 - Open questions resolved here: (1) `commitChunk` is `Uni<Void>`; (2) zero-length bodies never reach the store — the framework short-circuits; (3) `validateOffset` is removed, the framework compares against `findUploadInfo().getOffset()` under the lock and the store re-asserts inside `stageChunk`; (4) the pending-final record is a plain `UploadInfo` (`isFinalConcat=true`, `partialIds`) that the framework builds and the store persists through `createUpload(UploadInfo)` — `concatenate(finalId, sourceIds)` fills it in later, so finished and unfinished concatenation share one path.
 - Completion is decided by **transition** (a commit that moves offset from `< entityLength` to `== entityLength`, or creation/deferred-length-set of a zero-length upload), not by a persisted latch. `UploadInfo.completionFired` is removed.
