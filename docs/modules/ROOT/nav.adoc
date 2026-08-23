@@ -5,4 +5,5 @@
 * xref:sse.adoc[SSE Upload Progress]
 * xref:authentication.adoc[Authentication]
 * xref:parallel-uploads.adoc[Parallel Uploads]
+* xref:client.adoc[TUS Client]
 * xref:testing.adoc[Testing]
