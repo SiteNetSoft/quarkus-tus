@@ -198,6 +198,12 @@ public class TusClient {
      * partial, so a transient failure on one partial doesn't spend down another partial's retries.
      * Bounded to {@code parallelism} concurrent partials at a time; the final concatenate lists the
      * partials' URLs in their original range order regardless of which one finished uploading first.
+     *
+     * <p><strong>Fail-fast:</strong> {@code merge} propagates the first partial's failure as soon as
+     * it occurs and cancels every other still-in-flight partial's {@code Uni} (each of which cancels
+     * its own in-progress HTTP request in turn) rather than waiting for the remaining partials to
+     * finish first -- one partial exhausting its retry budget ends the whole parallel upload promptly
+     * instead of after every sibling partial has also run to completion or exhaustion.
      */
     private Uni<TusUploadResult> uploadParallel(UploadSource source, long length, int parallelism, long chunkSize,
             Map<String, String> metadata, Consumer<TusUploadProgress> onProgress, String checksumAlgorithm) {
