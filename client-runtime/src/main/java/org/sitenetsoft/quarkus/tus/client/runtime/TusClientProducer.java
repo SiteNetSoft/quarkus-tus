@@ -18,18 +18,33 @@ import org.sitenetsoft.quarkus.tus.client.runtime.config.TusClientRuntimeConfig;
 @ApplicationScoped
 public class TusClientProducer {
 
+    static final String URL_NOT_SET_REASON = "quarkus.tus.client.url is not set";
+
+    /**
+     * Pure decision logic factored out of the producer method so it can be unit-tested without a CDI
+     * container: given whether {@code Instance<TusRequestCustomizer>} resolution is ambiguous, returns
+     * the {@link TusClient#unavailable(String)} reason to use, or {@code null} if resolution should
+     * proceed normally (not ambiguous).
+     */
+    static String ambiguousCustomizerReason(boolean isAmbiguous) {
+        if (!isAmbiguous) {
+            return null;
+        }
+        return "Multiple TusRequestCustomizer beans are present; the client cannot pick one. "
+                + "Leave exactly one TusRequestCustomizer bean, or build TusClientOptions "
+                + "programmatically with an explicit customizer.";
+    }
+
     @Produces
     @ApplicationScoped
     public TusClient tusClient(Vertx vertx, TusClientRuntimeConfig config,
             Instance<TusRequestCustomizer> customizers) {
         if (config.url().isEmpty()) {
-            return TusClient.unavailable("quarkus.tus.client.url is not set");
+            return TusClient.unavailable(URL_NOT_SET_REASON);
         }
-        if (customizers.isAmbiguous()) {
-            return TusClient.unavailable(
-                    "Multiple TusRequestCustomizer beans are present; the client cannot pick one. "
-                            + "Leave exactly one TusRequestCustomizer bean, or build TusClientOptions "
-                            + "programmatically with an explicit customizer.");
+        String ambiguityReason = ambiguousCustomizerReason(customizers.isAmbiguous());
+        if (ambiguityReason != null) {
+            return TusClient.unavailable(ambiguityReason);
         }
 
         TusClientOptions.Builder builder = TusClientOptions.builder(config.url().get())
