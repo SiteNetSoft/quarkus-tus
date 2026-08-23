@@ -170,7 +170,7 @@ Because the TUS checksum extension puts the digest in a request header rather th
 
 == Defer-Length
 
-When the total size isn't known up front (e.g. streaming from a process whose output length is unknown until it ends), leave the source's `length()` at `-1`. The client issues a `creation-defer-length` POST, uploads chunks without a declared total, and declares the final `Upload-Length` on the PATCH that turns out to be the last one -- once the upstream source signals completion.
+When the total size isn't known up front (e.g. streaming from a process whose output length is unknown until it ends), leave the source's `length()` at `-1`. The client issues a `creation-defer-length` POST, uploads chunks without a declared total, and once the upstream source signals completion sends one final, empty-bodied PATCH that declares the confirmed `Upload-Length`.
 
 Defer-length and `parallelism > 1` are mutually exclusive: parallel upload needs a known length up front to split into ranges, so requesting both fails eagerly with a `TusClientException`.
 

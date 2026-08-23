@@ -76,7 +76,9 @@ configure(subprojects.findAll { publishedArtifactIds.containsKey(it.name) }) { p
         options.addStringOption('Xdoclint:none', '-quiet')
         // The deployment modules expose only package-private build steps, so javadoc finds
         // nothing to document and errors. Central still wants the jar, empty is fine.
-        if (proj.name == 'deployment' || proj.name == 'client-deployment' || proj.name == 'client-runtime') {
+        // client-runtime is public API, kept failOnError so real javadoc errors don't slip
+        // through unnoticed.
+        if (proj.name == 'deployment' || proj.name == 'client-deployment') {
             failOnError = false
         }
     }
@@ -91,6 +93,7 @@ configure(subprojects.findAll { publishedArtifactIds.containsKey(it.name) }) { p
                     description = switch (proj.name) {
                         case 'runtime' -> 'Quarkus extension implementing the TUS resumable upload protocol'
                         case 'tck' -> 'Contract test for UploadStore implementations of the Quarkus TUS extension'
+                        case 'client-runtime' -> 'TUS resumable upload client for Quarkus'
                         default -> 'Deployment module for the Quarkus TUS resumable upload extension'
                     }
                     url = 'https://github.com/SiteNetSoft/quarkus-tus'
