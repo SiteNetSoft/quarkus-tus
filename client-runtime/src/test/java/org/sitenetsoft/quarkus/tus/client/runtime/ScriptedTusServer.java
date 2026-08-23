@@ -7,6 +7,7 @@ import io.vertx.core.http.HttpServer;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -29,6 +30,7 @@ final class ScriptedTusServer implements AutoCloseable {
 
     private final Vertx vertx;
     private final ConcurrentLinkedDeque<Canned> responses = new ConcurrentLinkedDeque<>();
+    private final Map<String, ConcurrentLinkedDeque<Canned>> routed = new ConcurrentHashMap<>();
     private final List<Recorded> recorded = new CopyOnWriteArrayList<>();
     private HttpServer server;
     private int port;
@@ -39,6 +41,21 @@ final class ScriptedTusServer implements AutoCloseable {
 
     void enqueue(Canned response) {
         responses.addLast(response);
+    }
+
+    /**
+     * Scripts a per-{@code (method, path)} FIFO of responses, consulted before the global queue.
+     * Needed whenever several requests of the same method race concurrently (e.g. parallel partial
+     * PATCHes) so the global FIFO can't tell them apart by arrival order alone: routing by exact path
+     * pins each request's response regardless of interleaving.
+     */
+    void route(String method, String path, Canned... responses) {
+        routed.computeIfAbsent(routeKey(method, path), ignored -> new ConcurrentLinkedDeque<>())
+                .addAll(List.of(responses));
+    }
+
+    private static String routeKey(String method, String path) {
+        return method + " " + path;
     }
 
     List<Recorded> recorded() {
@@ -54,7 +71,11 @@ final class ScriptedTusServer implements AutoCloseable {
         server = vertx.createHttpServer().requestHandler(req -> req.bodyHandler(body -> {
             recorded.add(new Recorded(req.method().name(), req.path(),
                     MultiMap.caseInsensitiveMultiMap().addAll(req.headers()), body.copy()));
-            Canned canned = responses.pollFirst();
+            ConcurrentLinkedDeque<Canned> perPath = routed.get(routeKey(req.method().name(), req.path()));
+            Canned canned = perPath != null ? perPath.pollFirst() : null;
+            if (canned == null) {
+                canned = responses.pollFirst();
+            }
             if (canned == null) {
                 req.response().setStatusCode(599).end();
                 return;

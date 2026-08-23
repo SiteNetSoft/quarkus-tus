@@ -19,7 +19,10 @@ import org.sitenetsoft.quarkus.tus.client.runtime.source.UploadSource;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -84,12 +87,27 @@ public class TusClient {
 
     public Uni<TusUploadResult> upload(TusUploadRequest request) {
         int parallelism = request.parallelism().orElse(options.parallelism());
+        UploadSource source = request.source();
+
         if (parallelism > 1) {
-            throw new UnsupportedOperationException(
-                    "Parallel uploads (parallelism > 1) are not implemented yet; that's Task 10/11.");
+            // Both checked synchronously, before any request goes out -- same rationale as the
+            // checksum/replayable guard below. The third guard (the "concatenation" extension itself)
+            // can only be known after an OPTIONS round trip, so it's checked inside the capabilities
+            // flatMap alongside the other capability checks, not here.
+            if (!source.replayable()) {
+                throw new TusClientException(
+                        "parallelism > 1 requires a replayable source, but this source is not "
+                                + "replayable (one-shot sources cannot be split into concurrently "
+                                + "uploaded ranges)");
+            }
+            if (source.length() < 0) {
+                throw new TusClientException(
+                        "parallelism > 1 requires a known length, but this source's length is not "
+                                + "known up front (defer-length and parallel upload are mutually "
+                                + "exclusive)");
+            }
         }
 
-        UploadSource source = request.source();
         String checksumAlgorithm = request.checksumAlgorithm().orElse(options.checksumAlgorithm().orElse(null));
         if (checksumAlgorithm != null) {
             if (!source.replayable()) {
@@ -111,6 +129,15 @@ public class TusClient {
         long chunkSize = request.chunkSize().orElse(options.chunkSize());
         Consumer<TusUploadProgress> onProgress = request.onProgress().orElse(null);
 
+        if (parallelism > 1) {
+            return capabilities.flatMap(caps -> {
+                requireChecksumCapability(caps, checksumAlgorithm);
+                requireConcatenationCapability(caps);
+                return uploadParallel(source, length, parallelism, chunkSize, request.metadata(), onProgress,
+                        checksumAlgorithm);
+            });
+        }
+
         boolean deferLength = length < 0;
         TusCreateOptions createOptions = deferLength
                 ? TusCreateOptions.builder().deferLength().metadata(request.metadata()).build()
@@ -130,6 +157,138 @@ public class TusClient {
                         : uploadRange(created, source, created.offset(), length, chunkSize, onProgress,
                                 checksumAlgorithm)
                                 .map(finalOffset -> new TusUploadResult(created.url(), finalOffset)));
+    }
+
+    /**
+     * One contiguous byte range of a parallel upload, and the index it must be placed back at (in the
+     * source's original order) once all ranges have finished uploading concurrently and in whatever
+     * order they happen to complete.
+     */
+    private record PartialRange(int index, long from, long to) {
+        long length() {
+            return to - from;
+        }
+    }
+
+    /**
+     * Splits {@code [0, length)} into {@code parallelism} contiguous, non-overlapping ranges; the
+     * last range absorbs whatever remainder doesn't divide evenly.
+     */
+    private static List<PartialRange> splitRanges(long length, int parallelism) {
+        List<PartialRange> ranges = new ArrayList<>(parallelism);
+        // Ceiling division: every range but the last is exactly `base` bytes, and the last one takes
+        // whatever's left over (equal to `base` when length divides evenly, smaller otherwise -- e.g.
+        // 11 bytes over 3 ranges is 4, 4, 3, not 3, 3, 5).
+        long base = (length + parallelism - 1) / parallelism;
+        long from = 0;
+        for (int i = 0; i < parallelism; i++) {
+            long to = (i == parallelism - 1) ? length : Math.min(from + base, length);
+            ranges.add(new PartialRange(i, from, to));
+            from = to;
+        }
+        return ranges;
+    }
+
+    /**
+     * Uploads {@code source} as {@code parallelism} concurrently-uploaded TUS partial uploads, then
+     * concatenates them (in source-range order) into one final upload. Each partial is created with
+     * {@code Upload-Concat: partial} and no metadata -- the request's metadata is carried only by the
+     * final concatenating creation, per the TUS concatenation extension. Each partial gets its own
+     * retry budget: {@link #uploadRange} (via {@link #attemptFromOffset}) is reused unchanged per
+     * partial, so a transient failure on one partial doesn't spend down another partial's retries.
+     * Bounded to {@code parallelism} concurrent partials at a time; the final concatenate lists the
+     * partials' URLs in their original range order regardless of which one finished uploading first.
+     */
+    private Uni<TusUploadResult> uploadParallel(UploadSource source, long length, int parallelism, long chunkSize,
+            Map<String, String> metadata, Consumer<TusUploadProgress> onProgress, String checksumAlgorithm) {
+        List<PartialRange> ranges = splitRanges(length, parallelism);
+        AtomicLong totalConfirmed = new AtomicLong(0);
+
+        return Multi.createFrom().iterable(ranges)
+                .onItem().transformToUni(
+                        range -> uploadPartial(source, range, chunkSize, totalConfirmed, length, onProgress,
+                                checksumAlgorithm))
+                .merge(parallelism)
+                .collect().asList()
+                .flatMap(indexedUrls -> {
+                    List<String> orderedUrls = indexedUrls.stream()
+                            .sorted(Comparator.comparingInt(IndexedUrl::index))
+                            .map(IndexedUrl::url)
+                            .toList();
+                    TusCreateOptions concatOptions = TusCreateOptions.builder().metadata(metadata).build();
+                    return protocol.concatenate(orderedUrls, concatOptions)
+                            .map(finalUpload -> new TusUploadResult(finalUpload.url(), length));
+                });
+    }
+
+    private record IndexedUrl(int index, String url) {
+    }
+
+    /**
+     * Creates and fully uploads one partial (a {@link PartialRange} slice of {@code source}), through
+     * the same retry-wrapped range loop the sequential path uses ({@link #uploadRange}). The slice is
+     * exposed to that loop as a fresh, offset-shifted {@link UploadSource} so the loop can keep
+     * addressing it as {@code [0, range.length())} exactly like a whole, non-parallel upload -- the
+     * shift back to the range's true position in {@code source} happens once, in
+     * {@link #rangeSource}.
+     */
+    private Uni<IndexedUrl> uploadPartial(UploadSource source, PartialRange range, long chunkSize,
+            AtomicLong totalConfirmed, long totalLength, Consumer<TusUploadProgress> onProgress,
+            String checksumAlgorithm) {
+        UploadSource slice = rangeSource(source, range.from(), range.to());
+        TusCreateOptions partialCreateOptions = TusCreateOptions.builder().length(range.length()).partial().build();
+        AtomicLong lastReportedForThisPartial = new AtomicLong(0);
+        Consumer<TusUploadProgress> aggregatedProgress = onProgress == null
+                ? null
+                : progress -> {
+                    long delta = progress.bytesSent() - lastReportedForThisPartial.getAndSet(progress.bytesSent());
+                    long overall = totalConfirmed.addAndGet(delta);
+                    reportProgress(onProgress, overall, totalLength);
+                };
+        return protocol.create(partialCreateOptions)
+                .flatMap(created -> uploadRange(created, slice, created.offset(), range.length(), chunkSize,
+                        aggregatedProgress, checksumAlgorithm)
+                        .map(finalOffset -> new IndexedUrl(range.index(), created.url())));
+    }
+
+    /**
+     * An offset-shifted view of {@code base} covering only {@code [from, to)}: {@code length()}
+     * reports the range's own length rather than the whole source's, and {@code slice(fromOffset)}
+     * translates a range-relative offset back into {@code base}'s absolute one. This is what lets
+     * {@link #uploadRange}/{@link #uploadChunks} -- written against a single, whole-source upload --
+     * drive one partial's range without any change to that loop.
+     */
+    private static UploadSource rangeSource(UploadSource base, long from, long to) {
+        return new UploadSource() {
+            @Override
+            public long length() {
+                return to - from;
+            }
+
+            @Override
+            public Multi<Buffer> slice(long fromOffset) {
+                return base.slice(from + fromOffset);
+            }
+
+            @Override
+            public boolean replayable() {
+                return base.replayable();
+            }
+        };
+    }
+
+    /**
+     * Requires the server to advertise {@code concatenation}, needed whenever {@code parallelism > 1}
+     * (parallel upload is implemented as several partial uploads joined by the concatenation
+     * extension).
+     */
+    private void requireConcatenationCapability(TusServerCapabilities caps) {
+        if (!caps.supports("concatenation")) {
+            throw new TusCapabilityException(
+                    "Server does not advertise the concatenation extension, required for parallel "
+                            + "uploads (parallelism > 1)",
+                    "concatenation");
+        }
     }
 
     /**
