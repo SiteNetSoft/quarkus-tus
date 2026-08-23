@@ -226,17 +226,21 @@ class TusClientTest {
 
     @Test
     void oneShotSourceCannotResume() {
+        // A one-shot source (replayable() == false) -- known length here, but the same holds for
+        // an unknown one -- goes through uploadOneShot's paced-drain loop, which has no retry at
+        // all (the source cannot be re-read to resume from a resynced offset): a failed PATCH
+        // fails the upload immediately, with no HEAD resync and no further PATCH attempt.
         client.close();
         client = TusClient.create(vertx,
                 TusClientOptions.builder(server.url()).retryBackoff(Duration.ofMillis(10)).build());
         enqueueOptions("creation");
         server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
         server.enqueue(ScriptedTusServer.Canned.of(500, Map.of("Tus-Resumable", "1.0.0")));
-        var failure = assertThrows(TusClientException.class, () ->
+        assertThrows(TusServerErrorException.class, () ->
                 client.upload(TusUploadRequest.builder(
                         UploadSource.oneShot(Multi.createFrom().item(Buffer.buffer("hello world")), 11))
                         .chunkSize(4).build()).await().atMost(TIMEOUT));
-        assertTrue(failure.getMessage().contains("not replayable"));
+        assertEquals(3, server.recorded().size(), "no retry: OPTIONS, POST, one failing PATCH, nothing more");
     }
 
     @Test
@@ -249,6 +253,32 @@ class TusClientTest {
         String expected = "sha1 " + Base64.getEncoder().encodeToString(
                 MessageDigest.getInstance("SHA-1").digest("hello world".getBytes()));
         assertEquals(expected, server.recorded().get(2).headers().get("Upload-Checksum"));
+    }
+
+    @Test
+    void checksumAgainstAnUnknownLengthSourceFailsFastInsteadOfSilentlyDroppingIt() {
+        // A source can be replayable() (the guard that already exists) yet still report an
+        // unknown length -- e.g. a custom SPI source streaming from somewhere that only learns
+        // its own length once exhausted. That combination used to sail past the replayable()
+        // check and route into uploadDeferLength, which never sends Upload-Checksum at all: the
+        // checksum silently vanished instead of failing. No request should go out at all.
+        UploadSource unknownLengthReplayable = new UploadSource() {
+            @Override
+            public long length() {
+                return -1;
+            }
+
+            @Override
+            public Multi<Buffer> slice(long fromOffset) {
+                return Multi.createFrom().item(Buffer.buffer("hello world"));
+            }
+        };
+        var failure = assertThrows(TusClientException.class, () ->
+                client.upload(TusUploadRequest.builder(unknownLengthReplayable)
+                        .checksumAlgorithm("sha1").build()));
+        assertTrue(failure.getMessage().toLowerCase().contains("length"),
+                "message should name the known-length conflict: " + failure.getMessage());
+        assertEquals(0, server.recorded().size(), "no request should go out at all");
     }
 
     @Test
@@ -340,6 +370,38 @@ class TusClientTest {
                 client.upload(TusUploadRequest.builder(UploadSource.oneShot(data, -1)).chunkSize(4).build())
                         .await().atMost(TIMEOUT));
         assertTrue(cancelled.get());
+    }
+
+    @Test
+    void oneShotSourceWithKnownLengthLargerThanOneChunkCompletes() {
+        // A one-shot (non-replayable) source whose length IS known up front -- unlike the
+        // defer-length one-shot tests above -- must still be chunkable past the first PATCH.
+        // Before the fix this routed through uploadRange/uploadChunks, which re-slices the
+        // source at each new offset; OneShotUploadSource.slice(offset > 0) always throws, so the
+        // upload died after chunk 1. 10 bytes over a 4-byte chunk size is 2.5 chunks.
+        enqueueOptions("creation");
+        server.enqueue(Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "4")));
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "8")));
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "10")));
+
+        var result = client.upload(TusUploadRequest.builder(
+                UploadSource.oneShot(Multi.createFrom().item(Buffer.buffer("0123456789")), 10))
+                .chunkSize(4).build())
+                .await().atMost(TIMEOUT);
+
+        assertEquals(10, result.bytesUploaded());
+        var create = server.recorded().get(1);
+        assertEquals("10", create.headers().get("Upload-Length"),
+                "known-length one-shot sources create with Upload-Length, not defer-length");
+        assertNull(create.headers().get("Upload-Defer-Length"));
+
+        var patches = server.recorded().stream().filter(r -> r.method().equals("PATCH")).toList();
+        assertEquals(3, patches.size(), "3 data chunks (4, 4, 2), no trailing declaring PATCH");
+        for (var patch : patches) {
+            assertTrue(patch.body().length() <= 4,
+                    "every PATCH must stay within the chunk size, got " + patch.body().length());
+        }
     }
 
     @Test
