@@ -49,7 +49,8 @@ subprojects {
 // The Quarkus extension descriptor generated into the runtime jar points at
 // org.sitenetsoft:quarkus-tus-deployment, so the published artifact ids must match exactly
 // or Quarkus cannot resolve the deployment module at augmentation time.
-ext.publishedArtifactIds = [runtime: 'quarkus-tus', deployment: 'quarkus-tus-deployment', tck: 'quarkus-tus-tck']
+ext.publishedArtifactIds = [runtime: 'quarkus-tus', deployment: 'quarkus-tus-deployment', tck: 'quarkus-tus-tck',
+                            'client-runtime': 'quarkus-tus-client', 'client-deployment': 'quarkus-tus-client-deployment']
 
 configure(subprojects.findAll { publishedArtifactIds.containsKey(it.name) }) { proj ->
     apply plugin: 'maven-publish'
@@ -73,9 +74,9 @@ configure(subprojects.findAll { publishedArtifactIds.containsKey(it.name) }) { p
     // Central requires a javadoc jar; doclint would fail the build on inherited Quarkus javadoc.
     tasks.named('javadoc') {
         options.addStringOption('Xdoclint:none', '-quiet')
-        // The deployment module exposes only package-private build steps, so javadoc finds
+        // The deployment modules expose only package-private build steps, so javadoc finds
         // nothing to document and errors. Central still wants the jar, empty is fine.
-        if (proj.name == 'deployment') {
+        if (proj.name == 'deployment' || proj.name == 'client-deployment' || proj.name == 'client-runtime') {
             failOnError = false
         }
     }

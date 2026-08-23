@@ -1,0 +1,18 @@
+plugins {
+    id 'java-library'
+}
+
+base {
+    archivesName = 'quarkus-tus-client-deployment'
+}
+
+dependencies {
+    implementation enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
+    implementation 'io.quarkus:quarkus-core-deployment'
+    implementation 'io.quarkus:quarkus-arc-deployment'
+    implementation 'io.quarkus:quarkus-vertx-deployment'
+    implementation project(':client-runtime')
+
+    annotationProcessor enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
+    annotationProcessor 'io.quarkus:quarkus-extension-processor'
+}
