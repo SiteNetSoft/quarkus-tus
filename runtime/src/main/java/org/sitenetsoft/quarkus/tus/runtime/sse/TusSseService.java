@@ -1,13 +1,16 @@
 package org.sitenetsoft.quarkus.tus.runtime.sse;
 
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.sse.Sse;
 import jakarta.ws.rs.sse.SseEventSink;
+import io.vertx.core.Vertx;
 import org.jboss.logging.Logger;
+import org.sitenetsoft.quarkus.tus.runtime.config.TusRuntimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.model.UploadProgress;
 
 @ApplicationScoped
@@ -18,8 +21,25 @@ public class TusSseService {
     private final Map<String, SseEventSink> sinks = new ConcurrentHashMap<>();
     private final Map<String, SseEventSink> uploadSinks = new ConcurrentHashMap<>();
 
+    /**
+     * Uploads whose events stream should outlive completion. The upload finishing is not the
+     * story finishing: a consumer that keeps working after the last byte (moving the file
+     * onward, scanning it) calls {@link #holdOpen} so its own {@link #sendUploadEvent} calls
+     * still reach the client, and {@link #finish} when its pipeline is done. Completion then
+     * starts the backstop timer in {@code backstopTimers} instead of closing the stream, so an
+     * abandoned pipeline leaks the sink only until the timeout, never forever.
+     */
+    private final Set<String> heldOpen = ConcurrentHashMap.newKeySet();
+    private final Map<String, Long> backstopTimers = new ConcurrentHashMap<>();
+
     @Inject
     Sse sse;
+
+    @Inject
+    Vertx vertx;
+
+    @Inject
+    TusRuntimeConfig config;
 
     public void register(String clientId, SseEventSink sink) {
         if (clientId == null || sink == null) {
@@ -123,8 +143,51 @@ public class TusSseService {
         closeDisplaced(uploadSinks.put(uploadId, sink), sink, uploadId);
     }
 
+    /**
+     * Asks for the upload's events stream to stay open past completion. Call any time before
+     * the upload completes; without it, completion closes the stream as always.
+     */
+    public void holdOpen(String uploadId) {
+        if (uploadId != null) {
+            heldOpen.add(uploadId);
+        }
+    }
+
+    /**
+     * Ends a held-open stream: the consumer's pipeline is done, nothing more will be sent.
+     * Idempotent, and harmless on an upload that was never held open.
+     */
+    public void finish(String uploadId) {
+        unregisterUpload(uploadId);
+    }
+
+    /**
+     * Completion's effect on the stream: close it, unless {@link #holdOpen} asked otherwise —
+     * then only start the backstop timer. Called by the bridge, not by consumers.
+     */
+    public void onUploadCompleted(String uploadId) {
+        if (uploadId == null) return;
+        if (!heldOpen.contains(uploadId)) {
+            unregisterUpload(uploadId);
+            return;
+        }
+        long timer = vertx.setTimer(config.sseHoldOpenTimeoutSeconds() * 1000, id -> {
+            LOG.debugf("Hold-open backstop closing SSE stream for upload %s", uploadId);
+            finish(uploadId);
+        });
+        Long displaced = backstopTimers.put(uploadId, timer);
+        if (displaced != null) {
+            vertx.cancelTimer(displaced);
+        }
+    }
+
     public void unregisterUpload(String uploadId) {
         if (uploadId == null) return;
+        heldOpen.remove(uploadId);
+        Long timer = backstopTimers.remove(uploadId);
+        if (timer != null) {
+            vertx.cancelTimer(timer);
+        }
         SseEventSink removed = uploadSinks.remove(uploadId);
         if (removed != null) {
             try {

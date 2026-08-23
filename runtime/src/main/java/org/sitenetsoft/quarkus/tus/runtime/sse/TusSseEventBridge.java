@@ -33,11 +33,13 @@ public class TusSseEventBridge {
 
     // The resource fires the chunk event before the completion event, so by the time this runs
     // the stream has already reached 100%; a zero-length upload completes with no chunk at all.
+    // Completion normally also ends the stream, but a consumer that holds it open keeps sending
+    // its own events past this point and closes it with TusSseService.finish.
     void onCompleted(@Observes TusUploadCompletedEvent event) {
         sseService.sendUploadEvent(event.uploadId(), "complete", String.format(
                 "{\"bytesUploaded\": %d, \"totalBytes\": %d}",
                 event.totalSize(), event.totalSize()));
-        sseService.unregisterUpload(event.uploadId());
+        sseService.onUploadCompleted(event.uploadId());
     }
 
     void onTerminated(@Observes TusUploadTerminatedEvent event) {
