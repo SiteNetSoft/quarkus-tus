@@ -2,10 +2,6 @@ plugins {
     id 'java-library'
 }
 
-base {
-    archivesName = 'quarkus-tus-client-deployment'
-}
-
 dependencies {
     implementation enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
     implementation 'io.quarkus:quarkus-core-deployment'
