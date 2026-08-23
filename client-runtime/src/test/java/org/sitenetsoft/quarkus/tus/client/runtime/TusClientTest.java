@@ -348,12 +348,39 @@ class TusClientTest {
         var result = client.upload(TusUploadRequest.builder(sourceOf("hello world"))   // 11 bytes / 3
                 .parallelism(3).build()).await().atMost(TIMEOUT);
         assertEquals(11, result.bytesUploaded());
-        var finalCreate = server.recorded().stream()
+
+        // 4 POSTs total (3 partials + 1 final), exactly one PATCH per partial.
+        var posts = server.recorded().stream().filter(r -> r.method().equals("POST")).toList();
+        assertEquals(4, posts.size());
+        var patches = server.recorded().stream().filter(r -> r.method().equals("PATCH")).toList();
+        assertEquals(3, patches.size());
+        assertEquals(3, patches.stream().map(ScriptedTusServer.Recorded::path).distinct().count(),
+                "expected exactly one PATCH per distinct partial path");
+
+        var finalCreate = posts.stream()
                 .filter(r -> r.headers().contains("Upload-Concat") && r.headers().get("Upload-Concat").startsWith("final"))
                 .findFirst().orElseThrow();
-        // ranges in order: p1 gets bytes [0,4), p2 [4,8), p3 [8,11) — final lists them in order
-        assertTrue(finalCreate.headers().get("Upload-Concat").endsWith("/tus/p1 " + server.url() + "/p2 " + server.url() + "/p3")
-                || finalCreate.headers().get("Upload-Concat").matches("final;.*p1 .*p2 .*p3"));
+
+        // Arrival-order independent: don't assume which named route slot (p1/p2/p3) a given range's
+        // POST landed on -- concurrent creates can interleave under CI jitter. Instead, recover the
+        // binding property directly: each partial's own PATCH body tells us which byte range it
+        // carried ("hello world" split 4/4/3 -> "hell", "o wo", "rld"), so map content to URL and
+        // assert the final Upload-Concat lists the URLs in that content (i.e. true range) order.
+        // server.url() is "http://host:port/tus"; each recorded partial path is already
+        // "/tus/pN", and that's exactly what TusProtocolClient.resolveLocation resolves an absolute
+        // Location like "/tus/p1" to against the target URL -- so the partial's real upload URL is
+        // hostRoot + path, not server.url() + path (which would double up the "/tus" segment).
+        String hostRoot = server.url().substring(0, server.url().length() - "/tus".length());
+        Map<String, String> contentByPath = patches.stream()
+                .collect(java.util.stream.Collectors.toMap(ScriptedTusServer.Recorded::path,
+                        r -> r.body().toString(StandardCharsets.UTF_8)));
+        String p1Url = hostRoot + patches.stream().filter(r -> contentByPath.get(r.path()).equals("hell"))
+                .findFirst().orElseThrow().path();
+        String p2Url = hostRoot + patches.stream().filter(r -> contentByPath.get(r.path()).equals("o wo"))
+                .findFirst().orElseThrow().path();
+        String p3Url = hostRoot + patches.stream().filter(r -> contentByPath.get(r.path()).equals("rld"))
+                .findFirst().orElseThrow().path();
+        assertEquals("final;" + p1Url + " " + p2Url + " " + p3Url, finalCreate.headers().get("Upload-Concat"));
     }
 
     @Test
