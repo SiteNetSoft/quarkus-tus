@@ -321,12 +321,32 @@ public class TusClient {
 
                 @Override
                 public void onFailure(Throwable failure) {
+                    // The upstream itself failed -- it has already terminated on its own, so there's
+                    // no live subscription left to cancel here. (Kept symmetrical with sendChunk's
+                    // failure path below rather than assuming that invariant silently.)
+                    cancelUpstream();
                     emitter.fail(failure);
                 }
 
                 @Override
                 public void onCompletion() {
                     flushRemainderThenDeclare();
+                }
+
+                /**
+                 * Releases the source's underlying resource on any path that ends the upload without
+                 * the upstream {@code Multi} having reached its own natural completion. The
+                 * declarative {@code Uni}/{@code Multi} pipelines elsewhere in this class cancel their
+                 * upstream automatically on failure or downstream cancellation; this hand-rolled
+                 * subscriber has to do that itself, or a source like {@link
+                 * org.sitenetsoft.quarkus.tus.client.runtime.source.FileUploadSource} would leak an
+                 * open file handle every time a chunk PATCH failed mid-stream.
+                 */
+                private void cancelUpstream() {
+                    Flow.Subscription subscription = subscriptionRef.get();
+                    if (subscription != null) {
+                        subscription.cancel();
+                    }
                 }
 
                 private void drainFullChunks() {
@@ -357,7 +377,14 @@ public class TusClient {
                                 reportProgress(onProgress, newOffset, -1);
                                 offset.set(newOffset);
                                 onSuccess.run();
-                            }, emitter::fail);
+                            }, failure -> {
+                                // A failed chunk PATCH ends the upload right here (no retry -- the
+                                // source isn't replayable), so the still-open upstream subscription
+                                // needs to be told to release its resource explicitly; nothing else
+                                // will drain or cancel it now.
+                                cancelUpstream();
+                                emitter.fail(failure);
+                            });
                 }
 
                 private void declareFinalLength() {
@@ -366,8 +393,10 @@ public class TusClient {
                     // subscription synchronously, and smallrye-mutiny-vertx's ReadStreamSubscriber
                     // throws IllegalStateException if endHandler(...) is attached after onComplete()
                     // has already fired -- exactly what happens when Vert.x's own send()/pipeTo sets
-                    // that handler a moment later. Passing null skips that pipe entirely; Vert.x sends
-                    // a plain bodyless PATCH (Content-Length: 0), which is what a declaring PATCH is.
+                    // that handler a moment later. Passing null skips that pipe entirely, so the
+                    // .contentLength(0) below never reaches the wire (there's no body to measure) --
+                    // it's kept only for readability, documenting that this PATCH's body is empty.
+                    // Vert.x sends a plain bodyless PATCH (Content-Length: 0) on its own.
                     protocol.patch(upload.url(), finalOffset, null,
                             TusPatchOptions.builder().contentLength(0).declareUploadLength(finalOffset).build())
                             .subscribe().with(emitter::complete, emitter::fail);
