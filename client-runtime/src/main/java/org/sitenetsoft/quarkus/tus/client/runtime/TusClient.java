@@ -4,21 +4,43 @@ import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.buffer.Buffer;
 import org.jboss.logging.Logger;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusChecksumMismatchException;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusOffsetMismatchException;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusServerErrorException;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUpload;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadProgress;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadResult;
 import org.sitenetsoft.quarkus.tus.client.runtime.source.UploadSource;
 
+import java.time.Duration;
 import java.util.function.Consumer;
 
 /**
  * High-level TUS client: capability discovery, creation, and the chunked upload loop, on top of the
  * low-level {@link TusProtocolClient}.
  *
- * <p><strong>Scope (Task 7):</strong> the sequential happy path only — one chunk after another, in
- * order, over a single connection. Retry/resume, checksum digesting, defer-length and parallel upload
- * are later tasks; requesting them here fails fast with {@link UnsupportedOperationException} rather
- * than silently ignoring the option.
+ * <p><strong>Scope (Task 7):</strong> the sequential happy path — one chunk after another, in order,
+ * over a single connection. Checksum digesting, defer-length and parallel upload are later tasks;
+ * requesting them here fails fast with {@link UnsupportedOperationException} rather than silently
+ * ignoring the option.
+ *
+ * <p><strong>Retry/resume (Task 8):</strong> a chunk PATCH that fails with a retryable error — a 5xx
+ * ({@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusServerErrorException}), a 409 offset
+ * conflict ({@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusOffsetMismatchException}), a
+ * 460 checksum mismatch
+ * ({@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusChecksumMismatchException}), or any
+ * failure that isn't a {@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException} at
+ * all (treated as an I/O-level failure, e.g. a reset connection) — is retried, provided the source is
+ * {@link UploadSource#replayable()}: the loop waits {@code min(retryBackoff * 2^attempt,
+ * retryBackoffMax)} (via {@code Uni.onItem().delayIt()}, never a blocking sleep), re-resolves the true
+ * offset with a HEAD ({@link TusProtocolClient#offset(String)}), and resumes the chunk loop from
+ * there. Every other {@code TusClientException} (4xx client errors like 413, protocol errors, etc.)
+ * fails fast with no retry. A retryable failure against a non-replayable source fails immediately with
+ * a message naming that. Attempts are consecutive-failure counters: a successful chunk resets the
+ * counter to zero, so {@code maxRetries} bounds a run of consecutive failures, not the whole upload.
+ * The initial {@code create()} call itself is not retried by this loop — a failure there propagates
+ * as-is.
  */
 public class TusClient {
 
@@ -90,6 +112,16 @@ public class TusClient {
      */
     private Uni<Long> uploadRange(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
             Consumer<TusUploadProgress> onProgress) {
+        return uploadRange(upload, source, from, to, chunkSize, onProgress, 0);
+    }
+
+    /**
+     * @param attempt the number of consecutive chunk failures seen so far in this run (0 on the very
+     *                first try, and reset to 0 again after any chunk that succeeds — see the class
+     *                Javadoc's Task 8 note).
+     */
+    private Uni<Long> uploadRange(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
+            Consumer<TusUploadProgress> onProgress, int attempt) {
         if (from >= to) {
             return Uni.createFrom().item(from);
         }
@@ -100,7 +132,63 @@ public class TusClient {
 
         return protocol.patch(upload.url(), from, chunk, patchOptions)
                 .invoke(newOffset -> reportProgress(onProgress, newOffset, to))
-                .flatMap(newOffset -> uploadRange(upload, source, newOffset, to, chunkSize, onProgress));
+                // A successful chunk resets the attempt counter: only *consecutive* failures count
+                // against maxRetries, so a long upload that hits one transient error every so often
+                // keeps making progress instead of eventually exhausting its retry budget.
+                .flatMap(newOffset -> uploadRange(upload, source, newOffset, to, chunkSize, onProgress, 0))
+                .onFailure(this::isRetryable)
+                .recoverWithUni(failure -> retryChunk(upload, source, to, chunkSize, onProgress, attempt, failure));
+    }
+
+    /**
+     * Handles one retryable chunk failure: gives up (propagating {@code failure}) if the source can't
+     * be replayed or the retry budget is exhausted, otherwise backs off, resyncs the true offset with
+     * a HEAD, and resumes the chunk loop from there.
+     */
+    private Uni<Long> retryChunk(TusUpload upload, UploadSource source, long to, long chunkSize,
+            Consumer<TusUploadProgress> onProgress, int attempt, Throwable failure) {
+        if (!source.replayable()) {
+            return Uni.createFrom().failure(new TusClientException(
+                    "Upload failed and the source is not replayable, so it cannot be resumed: "
+                            + failure.getMessage(),
+                    failure));
+        }
+        int nextAttempt = attempt + 1;
+        if (nextAttempt > options.maxRetries()) {
+            return Uni.createFrom().failure(failure);
+        }
+        LOG.debugf(failure, "TUS chunk upload failed (attempt %d/%d), backing off and resyncing offset",
+                nextAttempt, options.maxRetries());
+        return Uni.createFrom().voidItem()
+                .onItem().delayIt().by(backoffFor(attempt))
+                .flatMap(ignored -> protocol.offset(upload.url()))
+                .flatMap(resyncedOffset -> uploadRange(upload, source, resyncedOffset, to, chunkSize, onProgress,
+                        nextAttempt));
+    }
+
+    /**
+     * {@code min(retryBackoff * 2^attempt, retryBackoffMax)}. {@code attempt} is the number of prior
+     * consecutive failures (0 for the delay before the first retry), so the wait doubles on each
+     * further consecutive failure.
+     */
+    private Duration backoffFor(int attempt) {
+        long multiplier = 1L << Math.min(attempt, 30);
+        Duration backoff = options.retryBackoff().multipliedBy(multiplier);
+        Duration max = options.retryBackoffMax();
+        return backoff.compareTo(max) > 0 ? max : backoff;
+    }
+
+    /**
+     * Retryable: a 5xx, a 409 offset conflict, a 460 checksum mismatch, or anything that isn't even a
+     * {@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException} (treated as an
+     * I/O-level failure). Every other {@code TusClientException} — 4xx client errors, protocol
+     * errors, etc. — fails fast.
+     */
+    private boolean isRetryable(Throwable failure) {
+        return failure instanceof TusServerErrorException
+                || failure instanceof TusOffsetMismatchException
+                || failure instanceof TusChecksumMismatchException
+                || !(failure instanceof TusClientException);
     }
 
     private void reportProgress(Consumer<TusUploadProgress> onProgress, long bytesSent, long total) {
