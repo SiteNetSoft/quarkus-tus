@@ -72,6 +72,35 @@ public class TusProtocolClient {
                 .map(resp -> toUpload(resp, declaredLength));
     }
 
+    public Uni<Long> offset(String uploadUrl) {
+        return request(HttpMethod.HEAD, uploadUrl, MultiMap.caseInsensitiveMultiMap(), null, -1, Set.of(200))
+                .map(this::readUploadOffset);
+    }
+
+    public Uni<Long> patch(String uploadUrl, long offset, Multi<io.vertx.core.buffer.Buffer> data, TusPatchOptions opts) {
+        MultiMap headers = MultiMap.caseInsensitiveMultiMap();
+        headers.set("Content-Type", "application/offset+octet-stream");
+        headers.set("Upload-Offset", Long.toString(offset));
+        if (opts.checksumAlgorithm().isPresent()) {
+            headers.set("Upload-Checksum", opts.checksumAlgorithm().get() + " " + opts.checksumDigest().orElse(""));
+        }
+        if (opts.declaredUploadLength().isPresent()) {
+            headers.set("Upload-Length", Long.toString(opts.declaredUploadLength().getAsLong()));
+        }
+        long bodyLength = opts.contentLength().isPresent() ? opts.contentLength().getAsLong() : -1;
+
+        return request(HttpMethod.PATCH, uploadUrl, headers, data, bodyLength, Set.of(200, 204))
+                .map(this::readUploadOffset);
+    }
+
+    private long readUploadOffset(HttpClientResponse resp) {
+        String offsetHeader = resp.getHeader("Upload-Offset");
+        if (offsetHeader == null) {
+            throw new TusProtocolException("Missing required Upload-Offset header");
+        }
+        return Long.parseLong(offsetHeader);
+    }
+
     /**
      * Closes the underlying HTTP client, releasing pooled connections.
      *
