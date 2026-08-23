@@ -6,6 +6,7 @@ import io.vertx.core.buffer.Buffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusOffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusProtocolException;
 
 import java.time.Duration;
@@ -101,5 +102,48 @@ class TusProtocolClientTest {
                 "Location", "/tus/x", "Upload-Expires", "not-a-valid-date")));
         var uni = client.create(TusCreateOptions.builder().length(1).build());
         assertThrows(TusProtocolException.class, () -> uni.await().atMost(TIMEOUT));
+    }
+
+    @Test
+    void offsetReadsUploadOffsetFromHead() {
+        server.enqueue(ScriptedTusServer.Canned.of(200, Map.of("Tus-Resumable", "1.0.0",
+                "Upload-Offset", "17", "Cache-Control", "no-store")));
+        assertEquals(17L, client.offset(server.url() + "/abc").await().atMost(TIMEOUT));
+        assertEquals("HEAD", server.recorded().getFirst().method());
+    }
+
+    @Test
+    void patchStreamsAtOffsetAndReturnsTheNewOffset() {
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "10")));
+        long newOffset = client.patch(server.url() + "/abc", 5,
+                Multi.createFrom().item(Buffer.buffer("hello")),
+                TusPatchOptions.builder().contentLength(5).build()).await().atMost(TIMEOUT);
+        assertEquals(10L, newOffset);
+        var sent = server.recorded().getFirst();
+        assertEquals("PATCH", sent.method());
+        assertEquals("5", sent.headers().get("Upload-Offset"));
+        assertEquals("application/offset+octet-stream", sent.headers().get("Content-Type"));
+        assertEquals("5", sent.headers().get("Content-Length"));
+        assertEquals("hello", sent.body().toString());
+    }
+
+    @Test
+    void patchCanCarryChecksumAndDeclaredLength() {
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "5")));
+        client.patch(server.url() + "/abc", 0, Multi.createFrom().item(Buffer.buffer("hello")),
+                TusPatchOptions.builder().contentLength(5)
+                        .checksum("sha1", "qvTGHdzF6KLavt4PO0gs2a6pQ00=")
+                        .declareUploadLength(5).build()).await().atMost(TIMEOUT);
+        var sent = server.recorded().getFirst();
+        assertEquals("sha1 qvTGHdzF6KLavt4PO0gs2a6pQ00=", sent.headers().get("Upload-Checksum"));
+        assertEquals("5", sent.headers().get("Upload-Length"));
+    }
+
+    @Test
+    void patchOffsetMismatchIsTyped() {
+        server.enqueue(ScriptedTusServer.Canned.of(409, Map.of("Tus-Resumable", "1.0.0")));
+        assertThrows(TusOffsetMismatchException.class, () ->
+                client.patch(server.url() + "/abc", 3, Multi.createFrom().item(Buffer.buffer("x")),
+                        TusPatchOptions.none()).await().atMost(TIMEOUT));
     }
 }
