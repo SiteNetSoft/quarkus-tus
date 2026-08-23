@@ -25,6 +25,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -496,6 +497,17 @@ public class TusClient {
             AtomicLong offset = new AtomicLong(upload.offset());
             AtomicReference<Buffer> pending = new AtomicReference<>(Buffer.buffer());
             AtomicReference<Flow.Subscription> subscriptionRef = new AtomicReference<>();
+            AtomicBoolean upstreamCompleted = new AtomicBoolean(false);
+            // Reactive Streams lets a publisher signal completion the instant it's exhausted,
+            // independent of whatever the subscriber is doing with the item it just handed over --
+            // in particular, onCompletion() can fire while a chunk PATCH kicked off from the last
+            // onItem() is still in flight (fire-and-forget: sendChunk()'s subscribe() returns before
+            // the PATCH resolves). Without this gate, that race lets tryDrain() run twice
+            // concurrently -- once from that in-flight send's eventual completion, once from
+            // onCompletion() -- both mutating the shared `pending`/`offset` state and firing PATCHes
+            // out of order. `sending` serializes every entry into tryDrain() to at most one in
+            // flight at a time; onItem()/onCompletion() only ever update state and (re)try the gate.
+            AtomicBoolean sending = new AtomicBoolean(false);
 
             source.slice(0).subscribe().withSubscriber(new MultiSubscriber<Buffer>() {
                 @Override
@@ -507,7 +519,7 @@ public class TusClient {
                 @Override
                 public void onItem(Buffer item) {
                     pending.get().appendBuffer(item);
-                    drainFullChunks();
+                    tryDrain();
                 }
 
                 @Override
@@ -521,7 +533,8 @@ public class TusClient {
 
                 @Override
                 public void onCompletion() {
-                    flushRemainderThenDeclare();
+                    upstreamCompleted.set(true);
+                    tryDrain();
                 }
 
                 /**
@@ -540,25 +553,47 @@ public class TusClient {
                     }
                 }
 
-                private void drainFullChunks() {
+                /**
+                 * The single entry point that ever inspects {@code pending} and decides what happens
+                 * next: send a full chunk, send the (necessarily sub-chunk-size, since the full-chunk
+                 * case above already claimed anything bigger) remainder and declare, or ask upstream
+                 * for more. Guarded by {@code sending} so at most one of those actions -- and thus at
+                 * most one mutation of {@code pending}/{@code offset} -- is ever in flight; whichever
+                 * caller loses the {@code compareAndSet} just returns, because the in-flight action's
+                 * own completion calls {@code tryDrain()} again and will pick up whatever that caller
+                 * changed (a longer {@code pending}, or {@code upstreamCompleted} now true).
+                 */
+                private void tryDrain() {
+                    if (!sending.compareAndSet(false, true)) {
+                        return;
+                    }
                     Buffer buffered = pending.get();
-                    if (buffered.length() < chunkSize) {
+                    if (buffered.length() >= chunkSize) {
+                        Buffer chunk = buffered.getBuffer(0, (int) chunkSize);
+                        pending.set(buffered.getBuffer((int) chunkSize, buffered.length()));
+                        sendChunk(chunk, chunkSize, () -> {
+                            sending.set(false);
+                            tryDrain();
+                        });
+                        return;
+                    }
+                    if (!upstreamCompleted.get()) {
+                        sending.set(false);
                         subscriptionRef.get().request(1);
                         return;
                     }
-                    Buffer chunk = buffered.getBuffer(0, (int) chunkSize);
-                    pending.set(buffered.getBuffer((int) chunkSize, buffered.length()));
-                    sendChunk(chunk, chunkSize, this::drainFullChunks);
-                }
-
-                private void flushRemainderThenDeclare() {
-                    Buffer remainder = pending.get();
-                    if (remainder.length() > 0) {
-                        pending.set(Buffer.buffer());
-                        sendChunk(remainder, remainder.length(), this::declareFinalLength);
-                    } else {
+                    // Upstream is exhausted and what's left is under chunkSize (otherwise the branch
+                    // above would have claimed it) -- safe to ship as one final chunk, then declare.
+                    if (buffered.length() == 0) {
+                        sending.set(false);
                         declareFinalLength();
+                        return;
                     }
+                    pending.set(Buffer.buffer());
+                    sendChunk(buffered, buffered.length(), () -> {
+                        sending.set(false);
+                        declareFinalLength();
+                    });
                 }
 
                 private void sendChunk(Buffer chunk, long len, Runnable onSuccess) {
