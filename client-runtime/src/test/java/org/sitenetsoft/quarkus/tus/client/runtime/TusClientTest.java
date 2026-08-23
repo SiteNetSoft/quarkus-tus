@@ -6,6 +6,7 @@ import io.vertx.core.buffer.Buffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadProgress;
 import org.sitenetsoft.quarkus.tus.client.runtime.source.UploadSource;
 
@@ -14,8 +15,11 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TusClientTest {
 
@@ -96,11 +100,35 @@ class TusClientTest {
     }
 
     @Test
-    void bufferLimiterEmitsEverythingWhenTheLimitExceedsTheUpstream() {
+    void bufferLimiterEmitsEverythingWhenTheLimitExactlyMatchesTheUpstream() {
+        // The boundary case: maxBytes == the upstream's true length (what uploadRange always passes,
+        // since it computes len = min(chunkSize, remaining)) must NOT be treated as a short read.
         Multi<Buffer> upstream = Multi.createFrom().items(Buffer.buffer("ab"), Buffer.buffer("cd"));
-        List<Buffer> emitted = BufferLimiter.limit(upstream, 100).collect().asList().await().atMost(TIMEOUT);
+        List<Buffer> emitted = BufferLimiter.limit(upstream, 4).collect().asList().await().atMost(TIMEOUT);
         Buffer joined = Buffer.buffer();
         emitted.forEach(joined::appendBuffer);
         assertEquals("abcd", joined.toString(StandardCharsets.UTF_8.name()));
+    }
+
+    @Test
+    void bufferLimiterCancelsUpstreamEvenWhenTheCapIsHitDuringSynchronousDelivery() {
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        // Multi.createFrom().items(...) delivers every item synchronously, inside the subscribe()
+        // call itself -- so the cap is reached (and cancellation requested) before subscribe() has
+        // even returned the Cancellable to store.
+        Multi<Buffer> upstream = Multi.createFrom().items(
+                        Buffer.buffer("ab"), Buffer.buffer("cd"), Buffer.buffer("ef"))
+                .onCancellation().invoke(() -> cancelled.set(true));
+        BufferLimiter.limit(upstream, 2).collect().asList().await().atMost(TIMEOUT);
+        assertTrue(cancelled.get(), "upstream must be cancelled once the cap is reached, even synchronously");
+    }
+
+    @Test
+    void bufferLimiterFailsWithATypedExceptionNamingBothLengthsOnAShortRead() {
+        Multi<Buffer> upstream = Multi.createFrom().items(Buffer.buffer("ab"), Buffer.buffer("cd"));
+        TusClientException e = assertThrows(TusClientException.class,
+                () -> BufferLimiter.limit(upstream, 10).collect().asList().await().atMost(TIMEOUT));
+        assertTrue(e.getMessage().contains("10"), "message should name the expected length: " + e.getMessage());
+        assertTrue(e.getMessage().contains("4"), "message should name the actual length: " + e.getMessage());
     }
 }

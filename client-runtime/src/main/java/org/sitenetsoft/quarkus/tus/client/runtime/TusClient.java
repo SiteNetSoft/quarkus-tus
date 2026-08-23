@@ -3,6 +3,7 @@ package org.sitenetsoft.quarkus.tus.client.runtime;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.buffer.Buffer;
+import org.jboss.logging.Logger;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUpload;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadProgress;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadResult;
@@ -20,6 +21,8 @@ import java.util.function.Consumer;
  * than silently ignoring the option.
  */
 public class TusClient {
+
+    private static final Logger LOG = Logger.getLogger(TusClient.class);
 
     private final TusClientOptions options;
     private final TusProtocolClient protocol;
@@ -107,7 +110,10 @@ public class TusClient {
         try {
             onProgress.accept(new TusUploadProgress(bytesSent, total));
         } catch (RuntimeException e) {
-            // A misbehaving progress callback must not break the upload itself.
+            // A misbehaving progress callback must not break the upload itself, but it shouldn't
+            // vanish silently either.
+            LOG.debugf(e, "TusUploadRequest onProgress callback threw for bytesSent=%d, totalBytes=%d",
+                    bytesSent, total);
         }
     }
 
