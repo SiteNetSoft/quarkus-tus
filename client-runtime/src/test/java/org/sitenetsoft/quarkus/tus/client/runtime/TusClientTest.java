@@ -87,6 +87,25 @@ class TusClientTest {
     }
 
     @Test
+    void aFailedCapabilitiesFetchDoesNotPoisonEveryLaterUpload() {
+        // options().memoize().indefinitely() replays whatever the FIRST call produced, forever --
+        // including a failure. A transient OPTIONS failure (server hiccup, cold start) must not
+        // wedge the client for its whole lifetime: the next upload should retry the fetch, not
+        // just replay the old failure.
+        server.enqueue(ScriptedTusServer.Canned.of(500, Map.of("Tus-Resumable", "1.0.0")));
+        assertThrows(TusServerErrorException.class, () ->
+                client.upload(TusUploadRequest.builder(sourceOf("hello world")).chunkSize(4).build())
+                        .await().atMost(TIMEOUT));
+
+        enqueueOptions("creation");
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "11")));
+        var result = client.upload(TusUploadRequest.builder(sourceOf("hello world")).chunkSize(11).build())
+                .await().atMost(TIMEOUT);
+        assertEquals(11, result.bytesUploaded());
+    }
+
+    @Test
     void uploadsInChunksAndReportsProgress() {
         // 11 bytes, chunk 4 -> create, then PATCH offsets 0,4,8
         enqueueOptions("creation");

@@ -63,23 +63,41 @@ public class TusClient {
 
     private final TusClientOptions options;
     private final TusProtocolClient protocol;
-    private final Uni<org.sitenetsoft.quarkus.tus.client.runtime.model.TusServerCapabilities> capabilities;
+    private final AtomicReference<Uni<org.sitenetsoft.quarkus.tus.client.runtime.model.TusServerCapabilities>> capabilitiesCache;
     private final String unavailableReason;
 
     private TusClient(TusClientOptions options, TusProtocolClient protocol) {
         this.options = options;
         this.protocol = protocol;
-        // Cached per client instance: the first upload's options() call primes it, every later
-        // upload on this client reuses the result instead of re-fetching capabilities.
-        this.capabilities = protocol.options().memoize().indefinitely();
+        this.capabilitiesCache = new AtomicReference<>();
         this.unavailableReason = null;
     }
 
     private TusClient(String unavailableReason) {
         this.options = null;
         this.protocol = null;
-        this.capabilities = null;
+        this.capabilitiesCache = null;
         this.unavailableReason = unavailableReason;
+    }
+
+    /**
+     * Cached per client instance, but success-only: the first upload's call primes it, and every
+     * later upload on this client reuses that result instead of re-fetching capabilities. A
+     * failed fetch (a transient server hiccup, a cold start) is NOT cached that way -- {@code
+     * memoize().indefinitely()} replays whichever outcome came first forever, so caching a
+     * failure would wedge every later upload on this client for its whole lifetime. Instead the
+     * failing memoized {@code Uni} is discarded from the cache as soon as it fails, so the next
+     * call builds and caches a fresh attempt.
+     */
+    private Uni<org.sitenetsoft.quarkus.tus.client.runtime.model.TusServerCapabilities> capabilities() {
+        Uni<org.sitenetsoft.quarkus.tus.client.runtime.model.TusServerCapabilities> existing = capabilitiesCache.get();
+        if (existing != null) {
+            return existing;
+        }
+        Uni<org.sitenetsoft.quarkus.tus.client.runtime.model.TusServerCapabilities> fresh = protocol.options()
+                .onFailure().invoke(() -> capabilitiesCache.set(null))
+                .memoize().indefinitely();
+        return capabilitiesCache.compareAndSet(null, fresh) ? fresh : capabilitiesCache.get();
     }
 
     public static TusClient create(io.vertx.core.Vertx vertx, TusClientOptions options) {
@@ -168,7 +186,7 @@ public class TusClient {
         Consumer<TusUploadProgress> onProgress = request.onProgress().orElse(null);
 
         if (parallelism > 1) {
-            return capabilities.flatMap(caps -> {
+            return capabilities().flatMap(caps -> {
                 requireChecksumCapability(caps, checksumAlgorithm);
                 requireConcatenationCapability(caps);
                 return uploadParallel(source, length, parallelism, chunkSize, request.metadata(), onProgress,
@@ -190,7 +208,7 @@ public class TusClient {
                 ? TusCreateOptions.builder().deferLength().metadata(request.metadata()).build()
                 : TusCreateOptions.builder().length(length).metadata(request.metadata()).build();
 
-        return capabilities
+        return capabilities()
                 .flatMap(caps -> {
                     requireChecksumCapability(caps, checksumAlgorithm);
                     if (deferLength) {
