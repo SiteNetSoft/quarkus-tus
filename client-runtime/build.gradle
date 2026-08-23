@@ -2,13 +2,9 @@ plugins {
     id 'io.quarkus.extension'
 }
 
-base {
-    archivesName = 'quarkus-tus-client'
-}
-
 quarkusExtension {
     deploymentModule = 'client-deployment'
-    deploymentArtifact = 'org.sitenetsoft:quarkus-tus-client-deployment:1.0.0'
+    deploymentArtifact = "${project.group}:${rootProject.ext.publishedArtifactIds['client-deployment']}:${project.version}"
 }
 
 dependencies {
