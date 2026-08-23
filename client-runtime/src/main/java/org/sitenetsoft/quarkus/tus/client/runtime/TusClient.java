@@ -135,6 +135,7 @@ public class TusClient {
             }
         }
 
+        long length = source.length();
         String checksumAlgorithm = request.checksumAlgorithm().orElse(options.checksumAlgorithm().orElse(null));
         if (checksumAlgorithm != null) {
             if (!source.replayable()) {
@@ -146,13 +147,23 @@ public class TusClient {
                         "checksumAlgorithm requires a replayable source, but this source is not "
                                 + "replayable (one-shot sources cannot be re-read to be digested or retried)");
             }
+            if (length < 0) {
+                // A source can be replayable() yet still report an unknown length (defer-length).
+                // uploadDeferLength's paced-drain loop never attaches Upload-Checksum, so letting
+                // this through would silently drop the checksum instead of computing or rejecting
+                // it -- the spec's rule is no silent fallback. Fail fast, synchronously, same as
+                // the replayable() guard above, rather than discovering it mid-upload.
+                throw new TusClientException(
+                        "checksumAlgorithm requires a known-length source, but this source's length "
+                                + "is not known up front (defer-length uploads cannot carry an "
+                                + "Upload-Checksum)");
+            }
             // Validated eagerly (not deferred into the capability-check flatMap below) so an unknown
             // algorithm name fails at request time with a clear, typed error instead of surfacing
             // later as an opaque NoSuchAlgorithmException from inside the chunk loop.
             javaDigestName(checksumAlgorithm);
         }
 
-        long length = source.length();
         long chunkSize = request.chunkSize().orElse(options.chunkSize());
         Consumer<TusUploadProgress> onProgress = request.onProgress().orElse(null);
 
@@ -166,6 +177,15 @@ public class TusClient {
         }
 
         boolean deferLength = length < 0;
+        // A known length but a non-replayable (one-shot) source: uploadChunks/uploadRange re-slice
+        // the source at each new offset to support retry and range-limited reads, but a one-shot
+        // source can only ever be sliced once, from offset zero -- the second chunk's slice(offset
+        // > 0) always throws. The paced-drain loop below (uploadOneShot, shared with the
+        // defer-length path) reads the source's single Multi exactly once regardless of how many
+        // chunks it's cut into, so it's what a known-length one-shot source needs too; the only
+        // difference from the defer-length case is that the length is already known, so creation
+        // declares it normally and there's no trailing empty declaring PATCH.
+        boolean oneShotKnownLength = !deferLength && !source.replayable();
         TusCreateOptions createOptions = deferLength
                 ? TusCreateOptions.builder().deferLength().metadata(request.metadata()).build()
                 : TusCreateOptions.builder().length(length).metadata(request.metadata()).build();
@@ -178,12 +198,19 @@ public class TusClient {
                     }
                     return protocol.create(createOptions);
                 })
-                .flatMap(created -> deferLength
-                        ? uploadDeferLength(created, source, chunkSize, onProgress)
-                                .map(finalOffset -> new TusUploadResult(created.url(), finalOffset))
-                        : uploadRange(created, source, created.offset(), length, chunkSize, onProgress,
-                                checksumAlgorithm)
-                                .map(finalOffset -> new TusUploadResult(created.url(), finalOffset)));
+                .flatMap(created -> {
+                    if (deferLength) {
+                        return uploadOneShot(created, source, chunkSize, onProgress, -1)
+                                .map(finalOffset -> new TusUploadResult(created.url(), finalOffset));
+                    }
+                    if (oneShotKnownLength) {
+                        return uploadOneShot(created, source, chunkSize, onProgress, length)
+                                .map(finalOffset -> new TusUploadResult(created.url(), finalOffset));
+                    }
+                    return uploadRange(created, source, created.offset(), length, chunkSize, onProgress,
+                            checksumAlgorithm)
+                            .map(finalOffset -> new TusUploadResult(created.url(), finalOffset));
+                });
     }
 
     /**
@@ -475,9 +502,15 @@ public class TusClient {
     }
 
     /**
-     * Uploads a one-shot, unknown-length source under the {@code creation-defer-length} extension:
-     * the upload was created with {@code Upload-Defer-Length: 1} and no {@code Upload-Length}, and the
-     * true length is announced only once the source itself runs out of bytes.
+     * Uploads a one-shot source -- one whose {@link UploadSource#slice(long)} can only ever be
+     * called once, from offset zero -- one {@code chunkSize} slice at a time, over a single PATCH
+     * loop paced by the source's own demand rather than the recursive slice-per-chunk loop
+     * ({@link #uploadChunks}) the replayable path uses. Two callers share this: an unknown-length
+     * source under the {@code creation-defer-length} extension ({@code knownLength == -1}, upload
+     * created with {@code Upload-Defer-Length: 1}), and a known-length source that just happens not
+     * to be replayable ({@code knownLength >= 0}, upload created with an ordinary
+     * {@code Upload-Length}) -- {@link #uploadChunks} would re-slice such a source at each new
+     * chunk's offset, which a one-shot source rejects past the first slice.
      *
      * <p>The source's single {@code slice(0)} {@code Multi} is pulled with manual, PATCH-paced demand
      * (one upstream {@code request(1)} at a time) rather than eagerly drained: bytes are accumulated
@@ -487,12 +520,14 @@ public class TusClient {
      * retry here (a one-shot source cannot be replayed) and no capability check for checksums, since
      * a checksum requires a replayable source and that guard already fired earlier in {@link #upload}.
      *
-     * <p>Once the source completes, any leftover partial chunk is flushed as an ordinary data PATCH,
-     * and then — always, even for a completely empty source — one final, empty-bodied PATCH declares
-     * {@code Upload-Length} as the confirmed final offset, per the extension's contract.
+     * <p>Once the source completes, any leftover partial chunk is flushed as an ordinary data PATCH.
+     * Then: if {@code knownLength < 0} (defer-length), one final, empty-bodied PATCH declares
+     * {@code Upload-Length} as the confirmed final offset, per the extension's contract, even for a
+     * completely empty source. If {@code knownLength >= 0}, the length was already declared at
+     * creation, so there is nothing left to declare -- the upload is simply done.
      */
-    private Uni<Long> uploadDeferLength(TusUpload upload, UploadSource source, long chunkSize,
-            Consumer<TusUploadProgress> onProgress) {
+    private Uni<Long> uploadOneShot(TusUpload upload, UploadSource source, long chunkSize,
+            Consumer<TusUploadProgress> onProgress, long knownLength) {
         return Uni.createFrom().emitter(emitter -> {
             AtomicLong offset = new AtomicLong(upload.offset());
             AtomicReference<Buffer> pending = new AtomicReference<>(Buffer.buffer());
@@ -556,7 +591,7 @@ public class TusClient {
                 /**
                  * The single entry point that ever inspects {@code pending} and decides what happens
                  * next: send a full chunk, send the (necessarily sub-chunk-size, since the full-chunk
-                 * case above already claimed anything bigger) remainder and declare, or ask upstream
+                 * case above already claimed anything bigger) remainder and finish, or ask upstream
                  * for more. Guarded by {@code sending} so at most one of those actions -- and thus at
                  * most one mutation of {@code pending}/{@code offset} -- is ever in flight; whichever
                  * caller loses the {@code compareAndSet} just returns, because the in-flight action's
@@ -583,24 +618,38 @@ public class TusClient {
                         return;
                     }
                     // Upstream is exhausted and what's left is under chunkSize (otherwise the branch
-                    // above would have claimed it) -- safe to ship as one final chunk, then declare.
+                    // above would have claimed it) -- safe to ship as one final chunk, then finish.
                     if (buffered.length() == 0) {
                         sending.set(false);
-                        declareFinalLength();
+                        finish();
                         return;
                     }
                     pending.set(Buffer.buffer());
                     sendChunk(buffered, buffered.length(), () -> {
                         sending.set(false);
-                        declareFinalLength();
+                        finish();
                     });
+                }
+
+                /**
+                 * Ends the upload once every byte has been PATCHed. A defer-length upload
+                 * ({@code knownLength < 0}) still owes the server a declaration of the now-known
+                 * final length, per the extension's contract; a known-length one-shot source
+                 * already declared its length at creation, so there is nothing left to send.
+                 */
+                private void finish() {
+                    if (knownLength < 0) {
+                        declareFinalLength();
+                    } else {
+                        emitter.complete(offset.get());
+                    }
                 }
 
                 private void sendChunk(Buffer chunk, long len, Runnable onSuccess) {
                     protocol.patch(upload.url(), offset.get(), Multi.createFrom().item(chunk),
                             TusPatchOptions.builder().contentLength(len).build())
                             .subscribe().with(newOffset -> {
-                                reportProgress(onProgress, newOffset, -1);
+                                reportProgress(onProgress, newOffset, knownLength);
                                 offset.set(newOffset);
                                 onSuccess.run();
                             }, failure -> {
