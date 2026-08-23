@@ -591,7 +591,13 @@ public class TusUploadResource {
                         .invoke(() -> {
                             events.lengthKnown(uploadID, uploadLength);
                             LOG.infof("Set deferred length for upload %s to %d", uploadID, uploadLength);
-                            if (uploadLength == 0) {
+                            // The declaring PATCH itself may carry no data (data-first,
+                            // declare-last): all the bytes already landed while the length was
+                            // still deferred, so the offset already equals the length being
+                            // declared here and nothing downstream will ever see the write that
+                            // "reaches" it. Fire completion now instead. Covers uploadLength==0
+                            // too, since offset is then also 0.
+                            if (info.getOffset() == uploadLength) {
                                 events.uploadCompleted(uploadID, info);
                             }
                         })
