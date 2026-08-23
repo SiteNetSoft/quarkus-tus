@@ -6,6 +6,7 @@ import io.vertx.core.buffer.Buffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusProtocolException;
 
 import java.time.Duration;
 import java.util.Map;
@@ -13,6 +14,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TusProtocolClientTest {
@@ -91,5 +93,13 @@ class TusProtocolClientTest {
         server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/p1")));
         client.create(TusCreateOptions.builder().length(5).partial().build()).await().atMost(TIMEOUT);
         assertEquals("partial", server.recorded().getFirst().headers().get("Upload-Concat"));
+    }
+
+    @Test
+    void malformedUploadExpiresFailsAsTusProtocolException() {
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0",
+                "Location", "/tus/x", "Upload-Expires", "not-a-valid-date")));
+        var uni = client.create(TusCreateOptions.builder().length(1).build());
+        assertThrows(TusProtocolException.class, () -> uni.await().atMost(TIMEOUT));
     }
 }

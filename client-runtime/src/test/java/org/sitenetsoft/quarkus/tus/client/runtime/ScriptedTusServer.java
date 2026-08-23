@@ -5,11 +5,9 @@ import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
 
-import java.util.ArrayDeque;
-import java.util.Collections;
-import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -30,7 +28,7 @@ final class ScriptedTusServer implements AutoCloseable {
     }
 
     private final Vertx vertx;
-    private final Deque<Canned> responses = new ArrayDeque<>();
+    private final ConcurrentLinkedDeque<Canned> responses = new ConcurrentLinkedDeque<>();
     private final List<Recorded> recorded = new CopyOnWriteArrayList<>();
     private HttpServer server;
     private int port;

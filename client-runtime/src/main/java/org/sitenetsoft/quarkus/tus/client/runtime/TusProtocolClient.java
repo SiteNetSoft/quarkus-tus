@@ -16,6 +16,7 @@ import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUpload;
 import java.net.URI;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
@@ -71,6 +72,15 @@ public class TusProtocolClient {
                 .map(resp -> toUpload(resp, declaredLength));
     }
 
+    /**
+     * Closes the underlying HTTP client, releasing pooled connections.
+     *
+     * <p><strong>Must not be called from a Vert.x event-loop context</strong> (e.g. from inside a
+     * handler running on the Vert.x context this client's {@code Vertx} belongs to): it blocks the
+     * calling thread waiting for the close to complete, and blocking the event loop that the close
+     * itself depends on deadlocks. Call it from a worker thread, a shutdown hook, or after leaving
+     * the Vert.x context.
+     */
     public void close() {
         httpClient.close().await().indefinitely();
     }
@@ -145,7 +155,11 @@ public class TusProtocolClient {
         if (header == null) {
             return Optional.empty();
         }
-        return Optional.of(Instant.from(DateTimeFormatter.RFC_1123_DATE_TIME.parse(header)));
+        try {
+            return Optional.of(Instant.from(DateTimeFormatter.RFC_1123_DATE_TIME.parse(header)));
+        } catch (DateTimeParseException e) {
+            throw new TusProtocolException("Malformed Upload-Expires header: " + header);
+        }
     }
 
     private static List<String> splitCsv(String header) {
