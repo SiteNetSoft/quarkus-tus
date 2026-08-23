@@ -7,6 +7,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusPayloadTooLargeException;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusServerErrorException;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadProgress;
 import org.sitenetsoft.quarkus.tus.client.runtime.source.UploadSource;
 
@@ -130,5 +132,66 @@ class TusClientTest {
                 () -> BufferLimiter.limit(upstream, 10).collect().asList().await().atMost(TIMEOUT));
         assertTrue(e.getMessage().contains("10"), "message should name the expected length: " + e.getMessage());
         assertTrue(e.getMessage().contains("4"), "message should name the actual length: " + e.getMessage());
+    }
+
+    @Test
+    void transientServerErrorResyncsWithHeadAndResumes() {
+        client.close();
+        client = TusClient.create(vertx,
+                TusClientOptions.builder(server.url()).retryBackoff(Duration.ofMillis(10)).build());
+        enqueueOptions("creation");
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "4")));
+        server.enqueue(ScriptedTusServer.Canned.of(500, Map.of("Tus-Resumable", "1.0.0")));                       // PATCH @4 dies
+        server.enqueue(ScriptedTusServer.Canned.of(200, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "4"))); // HEAD resync
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "8")));
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "11")));
+        var result = client.upload(TusUploadRequest.builder(sourceOf("hello world"))
+                .chunkSize(4).build()).await().atMost(TIMEOUT);
+        assertEquals(11, result.bytesUploaded());
+        // Real sequence: OPTIONS(0), POST(1), PATCH-succeeds(2), PATCH-500(3), HEAD-resync(4), PATCH(5), PATCH(6).
+        assertEquals("HEAD", server.recorded().get(4).method());   // the resync
+    }
+
+    @Test
+    void nonRetryableClientErrorFailsFast() {
+        enqueueOptions("creation");
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(ScriptedTusServer.Canned.of(413, Map.of("Tus-Resumable", "1.0.0")));
+        assertThrows(TusPayloadTooLargeException.class, () ->
+                client.upload(TusUploadRequest.builder(sourceOf("hello world")).chunkSize(4).build())
+                        .await().atMost(TIMEOUT));
+        assertEquals(3, server.recorded().size());                 // no retry happened
+    }
+
+    @Test
+    void retriesAreBoundedByMaxRetries() {
+        client.close();
+        client = TusClient.create(vertx,
+                TusClientOptions.builder(server.url()).retryBackoff(Duration.ofMillis(10)).build());
+        enqueueOptions("creation");
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        for (int i = 0; i < 4; i++) {                              // 1 try + 3 retries, all 500
+            server.enqueue(ScriptedTusServer.Canned.of(500, Map.of("Tus-Resumable", "1.0.0")));
+            server.enqueue(ScriptedTusServer.Canned.of(200, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "0")));
+        }
+        assertThrows(TusServerErrorException.class, () ->
+                client.upload(TusUploadRequest.builder(sourceOf("hello world")).chunkSize(4).build())
+                        .await().atMost(TIMEOUT));
+    }
+
+    @Test
+    void oneShotSourceCannotResume() {
+        client.close();
+        client = TusClient.create(vertx,
+                TusClientOptions.builder(server.url()).retryBackoff(Duration.ofMillis(10)).build());
+        enqueueOptions("creation");
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(ScriptedTusServer.Canned.of(500, Map.of("Tus-Resumable", "1.0.0")));
+        var failure = assertThrows(TusClientException.class, () ->
+                client.upload(TusUploadRequest.builder(
+                        UploadSource.oneShot(Multi.createFrom().item(Buffer.buffer("hello world")), 11))
+                        .chunkSize(4).build()).await().atMost(TIMEOUT));
+        assertTrue(failure.getMessage().contains("not replayable"));
     }
 }
