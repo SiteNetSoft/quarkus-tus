@@ -290,4 +290,23 @@ class TusClientTest {
         assertEquals("11", last.headers().get("Upload-Length"));
         assertEquals(0, last.body().length());
     }
+
+    @Test
+    void oneShotDeferLengthFailureCancelsTheUpstreamSource() {
+        // Two items, chunkSize == the first item's length: the first item alone satisfies a full
+        // chunk, so per uploadDeferLength's own pacing the second item is never requested until that
+        // chunk's PATCH succeeds -- the subscription is still genuinely open (not naturally
+        // completed) when the scripted 500 arrives, so this actually exercises the cancel path
+        // rather than racing a source that would complete on its own regardless.
+        enqueueOptions("creation,creation-defer-length");
+        server.enqueue(Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(Canned.of(500, Map.of("Tus-Resumable", "1.0.0")));           // the data PATCH dies
+        var cancelled = new AtomicBoolean(false);
+        var data = Multi.createFrom().items(Buffer.buffer("abcd"), Buffer.buffer("efgh"))
+                .onCancellation().invoke(() -> cancelled.set(true));
+        assertThrows(TusServerErrorException.class, () ->
+                client.upload(TusUploadRequest.builder(UploadSource.oneShot(data, -1)).chunkSize(4).build())
+                        .await().atMost(TIMEOUT));
+        assertTrue(cancelled.get());
+    }
 }
