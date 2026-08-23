@@ -2,6 +2,7 @@ package org.sitenetsoft.quarkus.tus.client.runtime;
 
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
+import io.smallrye.mutiny.subscription.MultiSubscriber;
 import io.vertx.core.buffer.Buffer;
 import org.jboss.logging.Logger;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusCapabilityException;
@@ -20,8 +21,10 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.Map;
+import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -105,27 +108,41 @@ public class TusClient {
         }
 
         long length = source.length();
-        if (length < 0) {
-            throw new UnsupportedOperationException(
-                    "Defer-length uploads are not implemented yet; that's Task 8. The source length must be known.");
-        }
-
         long chunkSize = request.chunkSize().orElse(options.chunkSize());
         Consumer<TusUploadProgress> onProgress = request.onProgress().orElse(null);
 
-        TusCreateOptions createOptions = TusCreateOptions.builder()
-                .length(length)
-                .metadata(request.metadata())
-                .build();
+        boolean deferLength = length < 0;
+        TusCreateOptions createOptions = deferLength
+                ? TusCreateOptions.builder().deferLength().metadata(request.metadata()).build()
+                : TusCreateOptions.builder().length(length).metadata(request.metadata()).build();
 
         return capabilities
                 .flatMap(caps -> {
                     requireChecksumCapability(caps, checksumAlgorithm);
+                    if (deferLength) {
+                        requireDeferLengthCapability(caps);
+                    }
                     return protocol.create(createOptions);
                 })
-                .flatMap(created -> uploadRange(created, source, created.offset(), length, chunkSize, onProgress,
-                        checksumAlgorithm)
-                        .map(finalOffset -> new TusUploadResult(created.url(), finalOffset)));
+                .flatMap(created -> deferLength
+                        ? uploadDeferLength(created, source, chunkSize, onProgress)
+                                .map(finalOffset -> new TusUploadResult(created.url(), finalOffset))
+                        : uploadRange(created, source, created.offset(), length, chunkSize, onProgress,
+                                checksumAlgorithm)
+                                .map(finalOffset -> new TusUploadResult(created.url(), finalOffset)));
+    }
+
+    /**
+     * Requires the server to advertise {@code creation-defer-length}, needed whenever the source's
+     * length isn't known up front.
+     */
+    private void requireDeferLengthCapability(TusServerCapabilities caps) {
+        if (!caps.supports("creation-defer-length")) {
+            throw new TusCapabilityException(
+                    "Server does not advertise the creation-defer-length extension, required for "
+                            + "uploads whose length is not known up front",
+                    "creation-defer-length");
+        }
     }
 
     /**
@@ -263,6 +280,100 @@ public class TusClient {
             // force an unchecked wrapper at every call site.
             throw new TusCapabilityException("Unsupported checksum algorithm: " + checksumAlgorithm, "checksum");
         }
+    }
+
+    /**
+     * Uploads a one-shot, unknown-length source under the {@code creation-defer-length} extension:
+     * the upload was created with {@code Upload-Defer-Length: 1} and no {@code Upload-Length}, and the
+     * true length is announced only once the source itself runs out of bytes.
+     *
+     * <p>The source's single {@code slice(0)} {@code Multi} is pulled with manual, PATCH-paced demand
+     * (one upstream {@code request(1)} at a time) rather than eagerly drained: bytes are accumulated
+     * into a buffer bounded at {@code chunkSize}, and as soon as that buffer holds a full chunk it is
+     * PATCHed before any more upstream data is requested, so memory use never exceeds one chunk no
+     * matter how fast the source produces data or how slow the server is to accept it. There is no
+     * retry here (a one-shot source cannot be replayed) and no capability check for checksums, since
+     * a checksum requires a replayable source and that guard already fired earlier in {@link #upload}.
+     *
+     * <p>Once the source completes, any leftover partial chunk is flushed as an ordinary data PATCH,
+     * and then — always, even for a completely empty source — one final, empty-bodied PATCH declares
+     * {@code Upload-Length} as the confirmed final offset, per the extension's contract.
+     */
+    private Uni<Long> uploadDeferLength(TusUpload upload, UploadSource source, long chunkSize,
+            Consumer<TusUploadProgress> onProgress) {
+        return Uni.createFrom().emitter(emitter -> {
+            AtomicLong offset = new AtomicLong(upload.offset());
+            AtomicReference<Buffer> pending = new AtomicReference<>(Buffer.buffer());
+            AtomicReference<Flow.Subscription> subscriptionRef = new AtomicReference<>();
+
+            source.slice(0).subscribe().withSubscriber(new MultiSubscriber<Buffer>() {
+                @Override
+                public void onSubscribe(Flow.Subscription subscription) {
+                    subscriptionRef.set(subscription);
+                    subscription.request(1);
+                }
+
+                @Override
+                public void onItem(Buffer item) {
+                    pending.get().appendBuffer(item);
+                    drainFullChunks();
+                }
+
+                @Override
+                public void onFailure(Throwable failure) {
+                    emitter.fail(failure);
+                }
+
+                @Override
+                public void onCompletion() {
+                    flushRemainderThenDeclare();
+                }
+
+                private void drainFullChunks() {
+                    Buffer buffered = pending.get();
+                    if (buffered.length() < chunkSize) {
+                        subscriptionRef.get().request(1);
+                        return;
+                    }
+                    Buffer chunk = buffered.getBuffer(0, (int) chunkSize);
+                    pending.set(buffered.getBuffer((int) chunkSize, buffered.length()));
+                    sendChunk(chunk, chunkSize, this::drainFullChunks);
+                }
+
+                private void flushRemainderThenDeclare() {
+                    Buffer remainder = pending.get();
+                    if (remainder.length() > 0) {
+                        pending.set(Buffer.buffer());
+                        sendChunk(remainder, remainder.length(), this::declareFinalLength);
+                    } else {
+                        declareFinalLength();
+                    }
+                }
+
+                private void sendChunk(Buffer chunk, long len, Runnable onSuccess) {
+                    protocol.patch(upload.url(), offset.get(), Multi.createFrom().item(chunk),
+                            TusPatchOptions.builder().contentLength(len).build())
+                            .subscribe().with(newOffset -> {
+                                reportProgress(onProgress, newOffset, -1);
+                                offset.set(newOffset);
+                                onSuccess.run();
+                            }, emitter::fail);
+                }
+
+                private void declareFinalLength() {
+                    long finalOffset = offset.get();
+                    // No body Multi at all (not even an empty one): an empty Multi completes its
+                    // subscription synchronously, and smallrye-mutiny-vertx's ReadStreamSubscriber
+                    // throws IllegalStateException if endHandler(...) is attached after onComplete()
+                    // has already fired -- exactly what happens when Vert.x's own send()/pipeTo sets
+                    // that handler a moment later. Passing null skips that pipe entirely; Vert.x sends
+                    // a plain bodyless PATCH (Content-Length: 0), which is what a declaring PATCH is.
+                    protocol.patch(upload.url(), finalOffset, null,
+                            TusPatchOptions.builder().contentLength(0).declareUploadLength(finalOffset).build())
+                            .subscribe().with(emitter::complete, emitter::fail);
+                }
+            });
+        });
     }
 
     /**
