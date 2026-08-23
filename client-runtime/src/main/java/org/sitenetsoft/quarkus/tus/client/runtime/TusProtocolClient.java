@@ -95,6 +95,22 @@ public class TusProtocolClient {
                 .map(this::readUploadOffset);
     }
 
+    public Uni<Void> terminate(String uploadUrl) {
+        return request(HttpMethod.DELETE, uploadUrl, MultiMap.caseInsensitiveMultiMap(), null, -1, Set.of(204))
+                .replaceWithVoid();
+    }
+
+    public Uni<TusUpload> concatenate(List<String> partialUrls, TusCreateOptions opts) {
+        MultiMap headers = MultiMap.caseInsensitiveMultiMap();
+        headers.set("Upload-Concat", "final;" + String.join(" ", partialUrls));
+        if (!opts.metadata().isEmpty()) {
+            headers.set("Upload-Metadata", TusClientUtils.encodeMetadata(opts.metadata()));
+        }
+        // Spec: the final creation request carries no Upload-Length, even if opts carries one.
+        return request(HttpMethod.POST, target.url(), headers, null, -1, Set.of(201))
+                .map(resp -> toUpload(resp, -1L));
+    }
+
     private long readUploadOffset(HttpClientResponse resp) {
         String offsetHeader = resp.getHeader("Upload-Offset");
         if (offsetHeader == null) {

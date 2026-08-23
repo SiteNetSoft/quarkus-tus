@@ -6,15 +6,20 @@ import io.vertx.core.buffer.Buffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusOffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusProtocolException;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -145,5 +150,36 @@ class TusProtocolClientTest {
         assertThrows(TusOffsetMismatchException.class, () ->
                 client.patch(server.url() + "/abc", 3, Multi.createFrom().item(Buffer.buffer("x")),
                         TusPatchOptions.none()).await().atMost(TIMEOUT));
+    }
+
+    @Test
+    void terminateSendsDelete() {
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0")));
+        client.terminate(server.url() + "/abc").await().atMost(TIMEOUT);
+        assertEquals("DELETE", server.recorded().getFirst().method());
+    }
+
+    @Test
+    void concatenateJoinsPartialUrlsSpaceSeparated() {
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/final1")));
+        var fin = client.concatenate(List.of(server.url() + "/p1", server.url() + "/p2"),
+                TusCreateOptions.builder().build()).await().atMost(TIMEOUT);
+        var sent = server.recorded().getFirst();
+        assertEquals("final;" + server.url() + "/p1 " + server.url() + "/p2",
+                sent.headers().get("Upload-Concat"));
+        assertNull(sent.headers().get("Upload-Length")); // spec: final creation has no Upload-Length
+    }
+
+    /** Every row of the mapping table, exercised through a real HTTP exchange. */
+    @ParameterizedTest
+    @CsvSource({"404,TusUploadNotFoundException", "410,TusUploadNotFoundException",
+            "412,TusVersionMismatchException", "413,TusPayloadTooLargeException",
+            "460,TusChecksumMismatchException", "500,TusServerErrorException",
+            "503,TusServerErrorException"})
+    void errorStatusesAreTyped(int status, String exceptionSimpleName) {
+        server.enqueue(ScriptedTusServer.Canned.of(status, Map.of("Tus-Resumable", "1.0.0")));
+        var failure = assertThrows(TusClientException.class, () ->
+                client.offset(server.url() + "/abc").await().atMost(TIMEOUT));
+        assertEquals(exceptionSimpleName, failure.getClass().getSimpleName());
     }
 }
