@@ -63,6 +63,7 @@ public class TusClient {
     private final TusClientOptions options;
     private final TusProtocolClient protocol;
     private final Uni<org.sitenetsoft.quarkus.tus.client.runtime.model.TusServerCapabilities> capabilities;
+    private final String unavailableReason;
 
     private TusClient(TusClientOptions options, TusProtocolClient protocol) {
         this.options = options;
@@ -70,6 +71,14 @@ public class TusClient {
         // Cached per client instance: the first upload's options() call primes it, every later
         // upload on this client reuses the result instead of re-fetching capabilities.
         this.capabilities = protocol.options().memoize().indefinitely();
+        this.unavailableReason = null;
+    }
+
+    private TusClient(String unavailableReason) {
+        this.options = null;
+        this.protocol = null;
+        this.capabilities = null;
+        this.unavailableReason = unavailableReason;
     }
 
     public static TusClient create(io.vertx.core.Vertx vertx, TusClientOptions options) {
@@ -81,11 +90,28 @@ public class TusClient {
         return new TusClient(options, protocol);
     }
 
+    /**
+     * A client that boots cleanly but fails every use with {@code reason}. Used by CDI producers
+     * that cannot fail at boot (e.g. config not yet set, or an ambiguous dependency) but must not
+     * silently produce a working-looking client either.
+     */
+    public static TusClient unavailable(String reason) {
+        return new TusClient(reason);
+    }
+
+    private void requireAvailable() {
+        if (unavailableReason != null) {
+            throw new TusClientException(unavailableReason);
+        }
+    }
+
     public TusProtocolClient protocol() {
+        requireAvailable();
         return protocol;
     }
 
     public Uni<TusUploadResult> upload(TusUploadRequest request) {
+        requireAvailable();
         int parallelism = request.parallelism().orElse(options.parallelism());
         UploadSource source = request.source();
 
@@ -642,6 +668,8 @@ public class TusClient {
      * Closes the underlying HTTP client. Same event-loop caveat as {@link TusProtocolClient#close()}.
      */
     public void close() {
-        protocol.close();
+        if (protocol != null) {
+            protocol.close();
+        }
     }
 }

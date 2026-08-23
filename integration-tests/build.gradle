@@ -5,6 +5,7 @@ plugins {
 dependencies {
     implementation enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
     implementation project(':runtime')
+    implementation project(':client-runtime')
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-scheduler'
     implementation 'io.quarkus:quarkus-vertx'
