@@ -292,6 +292,38 @@ class TusClientTest {
     }
 
     @Test
+    void oneShotRemainderLargerThanChunkSizeIsReChunkedBeforeDeclaring() {
+        // The whole body arrives as a SINGLE Buffer -- the natural shape for a one-shot source
+        // that already has all its bytes in hand -- sized at 2.5x the chunk size (10 bytes over
+        // a chunk size of 4). flushRemainderThenDeclare must not ship that remainder as one
+        // oversized PATCH just because it all arrived in a single upstream item; it has to drain
+        // it in chunkSize-bounded pieces like every other chunk, only then declare the length.
+        enqueueOptions("creation,creation-defer-length");
+        server.enqueue(Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "4")));
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "8")));
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "10")));
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "10")));
+
+        var result = client.upload(TusUploadRequest.builder(
+                UploadSource.oneShot(Multi.createFrom().item(Buffer.buffer("0123456789")), -1))
+                .chunkSize(4).build())
+                .await().atMost(TIMEOUT);
+
+        assertEquals(10, result.bytesUploaded());
+
+        var patches = server.recorded().stream().filter(r -> r.method().equals("PATCH")).toList();
+        assertEquals(4, patches.size(), "three data chunks (4, 4, 2) plus the declaring PATCH");
+        for (var patch : patches.subList(0, patches.size() - 1)) {
+            assertTrue(patch.body().length() <= 4,
+                    "every data PATCH must stay within the chunk size, got " + patch.body().length());
+        }
+        var declaring = patches.getLast();
+        assertEquals("10", declaring.headers().get("Upload-Length"));
+        assertEquals(0, declaring.body().length());
+    }
+
+    @Test
     void oneShotDeferLengthFailureCancelsTheUpstreamSource() {
         // Two items, chunkSize == the first item's length: the first item alone satisfies a full
         // chunk, so per uploadDeferLength's own pacing the second item is never requested until that

@@ -200,19 +200,12 @@ class TusClientConformanceTest {
 
     @Test
     void deferLengthEndsWithTheDeclaringEmptyPatch() throws IOException {
-        // >1024 bytes over a 1024 chunk size forces multiple data PATCHes before the source runs
-        // dry. Delivered as three items sized so the *last* one never itself fills a full chunk
-        // (1024 + 1024 + 452 == 2500, chunk size 1024): uploadDeferLength only asks its upstream
-        // for another item once its own pending buffer is below the chunk size, so the final item
-        // landing under that threshold guarantees no chunk PATCH is still in flight when the
-        // source's own completion signal (which Reactive Streams lets a publisher send the moment
-        // it's exhausted, independent of any further demand) reaches the declaring-PATCH logic.
+        // The natural shape for a one-shot source that already has all its bytes in hand: the
+        // whole body arrives as a SINGLE Buffer, more than twice the 1024 chunk limit, so the
+        // client has to both split it into multiple data PATCHes and, once its upstream is
+        // exhausted, re-chunk whatever's left over before the declaring empty PATCH.
         byte[] data = randomBytes(2500);
-        Buffer wholeBody = Buffer.buffer(data);
-        Multi<Buffer> body = Multi.createFrom().items(
-                wholeBody.getBuffer(0, 1024),
-                wholeBody.getBuffer(1024, 2048),
-                wholeBody.getBuffer(2048, 2500));
+        Multi<Buffer> body = Multi.createFrom().item(Buffer.buffer(data));
 
         TusClient client = newClient(TusClientOptions.builder(baseUrl()).chunkSize(1024));
         TusUploadResult result = client.upload(TusUploadRequest.builder(UploadSource.oneShot(body, -1)).build())
