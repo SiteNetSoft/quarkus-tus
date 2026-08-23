@@ -621,6 +621,17 @@ public class TusUploadResource {
                             tus(CONFLICT).entity("Chunk exceeds declared upload size").build());
                 }
 
+                // While the length stays deferred, fitsWithin() above is skipped (there is no
+                // entity length yet to check against) -- so nothing else stops a client from
+                // PATCHing data forever without ever declaring it. Enforce the server-wide cap
+                // directly against the running offset instead, the same limit and same 413 the
+                // declared-length paths already use.
+                if (deferred && contentLength != null
+                        && !fitsWithin(contentLength, uploadOffset, tusRuntimeConfig.maxSize())) {
+                    return releasingLock(uploadID,
+                            tus(REQUEST_ENTITY_TOO_LARGE).entity("Upload exceeds maximum allowed size").build());
+                }
+
                 return patchUnderLock(uploadID, info, uploadOffset, routingContext,
                         checksumInfo, digest, contentLength, stream);
             });
