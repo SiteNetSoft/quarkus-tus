@@ -103,20 +103,25 @@ Outside CDI, build one directly with `TusClient.create(vertx, TusClientOptions.b
 
 [source,java]
 ----
+import io.smallrye.mutiny.Multi;
+import io.vertx.core.buffer.Buffer;
 import org.sitenetsoft.quarkus.tus.client.runtime.TusCreateOptions;
 import org.sitenetsoft.quarkus.tus.client.runtime.TusPatchOptions;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUpload;
+
+Buffer chunk1 = ...; // e.g. the next frame off an upstream stream being relayed
+Buffer chunk2 = ...;
 
 TusUpload upload = tusClient.protocol()
         .create(TusCreateOptions.builder().length(chunk1.length() + chunk2.length()).build())
         .await().indefinitely();
 
 long offsetAfterFirst = tusClient.protocol()
-        .patch(upload.url(), 0, chunk1, TusPatchOptions.none())
+        .patch(upload.url(), 0, Multi.createFrom().item(chunk1), TusPatchOptions.none())
         .await().indefinitely();
 
 long finalOffset = tusClient.protocol()
-        .patch(upload.url(), offsetAfterFirst, chunk2, TusPatchOptions.none())
+        .patch(upload.url(), offsetAfterFirst, Multi.createFrom().item(chunk2), TusPatchOptions.none())
         .await().indefinitely();
 
 // Confirm what the server actually has, independent of what was sent
@@ -126,7 +131,7 @@ long confirmed = tusClient.protocol().offset(upload.url()).await().indefinitely(
 tusClient.protocol().terminate(upload.url()).await().indefinitely();
 ----
 
-This is the same client the high-level layer is built on -- `offset()`/`patch()`/`terminate()` map straight onto HEAD/PATCH/DELETE, with `create()` for POST and `concatenate()` for the final `Upload-Concat` merge. None of it retries, resumes, or digests on its own; that's what the high-level layer adds.
+`patch()` takes a `Multi<Buffer>`, not a bare `Buffer` -- each chunk here is wrapped with `Multi.createFrom().item(...)` at the call site, which is exactly what a relay does with each frame it reads off the upstream connection instead of a single in-memory buffer. This is the same client the high-level layer is built on -- `offset()`/`patch()`/`terminate()` map straight onto HEAD/PATCH/DELETE, with `create()` for POST and `concatenate()` for the final `Upload-Concat` merge. None of it retries, resumes, or digests on its own; that's what the high-level layer adds.
 
 == `UploadSource`
 

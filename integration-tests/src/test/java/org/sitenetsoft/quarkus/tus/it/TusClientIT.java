@@ -34,7 +34,9 @@ class TusClientIT extends TusClientTestBase {
             tusClient.close();
         }
         if (vertx != null) {
-            vertx.close();
+            // Awaited so a future second test in this class can't start against a Vertx that's
+            // still mid-close from the previous one.
+            vertx.close().toCompletionStage().toCompletableFuture().join();
         }
     }
 
