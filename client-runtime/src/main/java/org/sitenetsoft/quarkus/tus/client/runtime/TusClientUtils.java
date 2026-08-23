@@ -16,9 +16,11 @@ public final class TusClientUtils {
     /**
      * Encodes metadata as per TUS spec: comma-separated key base64value pairs.
      * Keys are never encoded, empty values are represented as key alone.
+     * Keys must not contain spaces, commas, or newlines (they are delimiters).
      *
      * @param metadata map of metadata key-value pairs
      * @return encoded metadata string, empty string for empty map
+     * @throws IllegalArgumentException if any key is null, empty, or contains forbidden characters
      */
     public static String encodeMetadata(Map<String, String> metadata) {
         if (metadata.isEmpty()) {
@@ -28,6 +30,7 @@ public final class TusClientUtils {
         return metadata.entrySet().stream()
             .map(entry -> {
                 String key = entry.getKey();
+                validateKey(key);
                 String value = entry.getValue();
                 if (value == null || value.isEmpty()) {
                     return key;
@@ -37,6 +40,30 @@ public final class TusClientUtils {
                 return key + " " + encoded;
             })
             .collect(Collectors.joining(","));
+    }
+
+    /**
+     * Validates that a metadata key is not null, empty, or contains forbidden characters.
+     *
+     * @param key the key to validate
+     * @throws IllegalArgumentException if key is invalid
+     */
+    private static void validateKey(String key) {
+        if (key == null) {
+            throw new IllegalArgumentException("Metadata key cannot be null");
+        }
+        if (key.isEmpty()) {
+            throw new IllegalArgumentException("Metadata key cannot be empty");
+        }
+        if (key.contains(" ")) {
+            throw new IllegalArgumentException("Metadata key cannot contain spaces: " + key);
+        }
+        if (key.contains(",")) {
+            throw new IllegalArgumentException("Metadata key cannot contain commas: " + key);
+        }
+        if (key.contains("\n") || key.contains("\r")) {
+            throw new IllegalArgumentException("Metadata key cannot contain newlines: " + key);
+        }
     }
 
     /**

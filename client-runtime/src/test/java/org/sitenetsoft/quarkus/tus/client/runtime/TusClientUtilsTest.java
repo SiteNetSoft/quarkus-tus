@@ -32,4 +32,40 @@ class TusClientUtilsTest {
         assertEquals(503, ((TusServerErrorException) TusClientUtils.fromStatus(503, false)).status());
         assertInstanceOf(TusProtocolException.class, TusClientUtils.fromStatus(302, false));
     }
+
+    @Test
+    void rejectsMetadataKeyWithSpace() {
+        var ex = assertThrows(IllegalArgumentException.class,
+            () -> TusClientUtils.encodeMetadata(Map.of("file name", "test.txt")));
+        assertTrue(ex.getMessage().contains("file name"));
+    }
+
+    @Test
+    void rejectsMetadataKeyWithComma() {
+        var ex = assertThrows(IllegalArgumentException.class,
+            () -> TusClientUtils.encodeMetadata(Map.of("a,b", "value")));
+        assertTrue(ex.getMessage().contains("a,b"));
+    }
+
+    @Test
+    void rejectsMetadataKeyWithNewline() {
+        var ex = assertThrows(IllegalArgumentException.class,
+            () -> TusClientUtils.encodeMetadata(Map.of("key\nvalue", "test")));
+        assertTrue(ex.getMessage().contains("key\nvalue"));
+    }
+
+    @Test
+    void rejectsNullMetadataKey() {
+        var map = new java.util.HashMap<String, String>();
+        map.put(null, "value");
+        assertThrows(IllegalArgumentException.class,
+            () -> TusClientUtils.encodeMetadata(map));
+    }
+
+    @Test
+    void rejectsEmptyMetadataKey() {
+        var ex = assertThrows(IllegalArgumentException.class,
+            () -> TusClientUtils.encodeMetadata(Map.of("", "value")));
+        assertTrue(ex.getMessage().contains("empty"));
+    }
 }
