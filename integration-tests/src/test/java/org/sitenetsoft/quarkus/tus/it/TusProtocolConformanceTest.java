@@ -1129,6 +1129,65 @@ class TusProtocolConformanceTest {
             assertTrue(status == 400 || status == 413,
                     "Deferred length exceeding max should be rejected: got " + status);
         }
+
+        @Test
+        void dataChunksFlowWhileLengthStaysDeferredThenAnEmptyPatchDeclaresIt() {
+            // The spec allows Upload-Length to be announced on ANY later PATCH, not necessarily
+            // the first one -- a client streaming an unknown-length source has to send data
+            // chunks with the length still deferred, and only learns (and declares) the final
+            // length once its source runs dry. Two data-carrying chunks here, neither carrying
+            // Upload-Length, followed by a zero-byte PATCH that declares it.
+            byte[] chunk1 = "first-chunk".getBytes();
+            byte[] chunk2 = "second-chunk".getBytes();
+            long totalLength = chunk1.length + chunk2.length;
+
+            String location = given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Defer-Length", "1")
+                    .when().post("/tus")
+                    .then()
+                    .statusCode(201)
+                    .extract().header("Location");
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", "0")
+                    .contentType("application/offset+octet-stream")
+                    .body(chunk1)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204)
+                    .header("Upload-Offset", String.valueOf(chunk1.length));
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", String.valueOf(chunk1.length))
+                    .contentType("application/offset+octet-stream")
+                    .body(chunk2)
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204)
+                    .header("Upload-Offset", String.valueOf(totalLength));
+
+            // Trailing, empty-bodied PATCH declares the now-known final length.
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", String.valueOf(totalLength))
+                    .header("Upload-Length", String.valueOf(totalLength))
+                    .contentType("application/offset+octet-stream")
+                    .when().patch(location)
+                    .then()
+                    .statusCode(204)
+                    .header("Upload-Offset", String.valueOf(totalLength));
+
+            given()
+                    .header("Tus-Resumable", "1.0.0")
+                    .when().head(location)
+                    .then()
+                    .statusCode(200)
+                    .header("Upload-Offset", String.valueOf(totalLength))
+                    .header("Upload-Length", String.valueOf(totalLength));
+        }
     }
 
     // ========== X-HTTP-Method-Override (core protocol) ==========
