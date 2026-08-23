@@ -82,7 +82,9 @@ public class TusProtocolClient {
         headers.set("Content-Type", "application/offset+octet-stream");
         headers.set("Upload-Offset", Long.toString(offset));
         if (opts.checksumAlgorithm().isPresent()) {
-            headers.set("Upload-Checksum", opts.checksumAlgorithm().get() + " " + opts.checksumDigest().orElse(""));
+            // TusPatchOptions.checksum(algorithm, digest) always sets both together, so the digest
+            // is guaranteed present here; fail fast instead of silently sending a blank digest.
+            headers.set("Upload-Checksum", opts.checksumAlgorithm().get() + " " + opts.checksumDigest().orElseThrow());
         }
         if (opts.declaredUploadLength().isPresent()) {
             headers.set("Upload-Length", Long.toString(opts.declaredUploadLength().getAsLong()));
