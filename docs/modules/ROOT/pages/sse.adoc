@@ -4,6 +4,8 @@ include::./includes/attributes.adoc[]
 
 The extension provides optional Server-Sent Events (SSE) endpoints for streaming real-time upload progress to clients. This is useful for building progress bars and upload status indicators in web applications.
 
+SSE is a convenience, not the integration contract. The extension's contract is its xref:cdi-events.adoc[CDI lifecycle events], which fire whether or not SSE is enabled; the bundled SSE endpoints are one consumer of them. An application that wants a different transport -- its own SSE, a WebSocket, a webhook, a message queue -- observes the CDI events directly and needs nothing from this page.
+
 == Enabling SSE
 
 SSE is enabled by default. To disable it:
@@ -34,7 +36,7 @@ Opens a persistent SSE connection for the given upload, carrying its lifecycle:
 * `complete` — the upload finished; a final `progress` at 100% precedes it
 * `terminated` — the upload was deleted
 
-The server closes the stream after `complete` or `terminated`, which also releases the subscription.
+The server closes the stream after `complete` or `terminated`, which also releases the subscription -- unless the upload was held open (see <<held-open-streams>>).
 For a progress bar alone, prefer the progress stream below.
 
 .Client-side JavaScript
@@ -116,7 +118,7 @@ The `TusSseService` bean exposes a method for sending custom events to connected
 TusSseService sseService;
 
 void notifyScanComplete(String uploadId) {
-    sseService.sendCustomEvent(uploadId, "scan-complete",
+    sseService.sendUploadEvent(uploadId, "scan-complete",
             "{\"clean\": true, \"scanner\": \"clamav\"}");
 }
 ----
@@ -130,3 +132,42 @@ eventSource.addEventListener("scan-complete", (e) => {
     console.log(`Scan result: ${result.clean ? "clean" : "infected"}`);
 });
 ----
+
+[#held-open-streams]
+== Held-Open Streams
+
+The upload finishing is not always the story finishing. A server that keeps working after the last byte -- moving the file to its real destination, scanning it, transcoding it -- may want to report that work on the same stream, but by default the server closes the stream the moment the upload completes, so events sent afterwards are lost.
+
+Holding the stream open changes that. Call `holdOpen` any time before the upload completes -- typically from a `TusUploadCreatedEvent` observer -- and completion starts a timeout instead of closing the stream. Send whatever custom events the pipeline produces, then call `finish` when it is done:
+
+[source,java]
+----
+@Inject
+TusSseService sseService;
+
+void onCreated(@Observes TusUploadCreatedEvent event) {
+    sseService.holdOpen(event.uploadId());
+}
+
+void onCompleted(@Observes TusUploadCompletedEvent event) {
+    sseService.sendUploadEvent(event.uploadId(), "relocating",
+            "{\"target\": \"cold-storage\"}");
+    archiveService.move(event.uploadId())
+            .subscribe().with(done -> {
+                sseService.sendUploadEvent(event.uploadId(), "archived", "{}");
+                sseService.finish(event.uploadId());
+            });
+}
+----
+
+If `finish` never comes, the server closes the stream anyway after `quarkus.tus.sse-hold-open-timeout-seconds` (default 300), counted from the completion event, so an abandoned pipeline cannot leak the connection. `finish` is idempotent and harmless on an upload that was never held open. A client should therefore treat the stream's closure -- not the `complete` event -- as the end of the story:
+
+[source,javascript]
+----
+eventSource.addEventListener("archived", (e) => {
+    console.log("File archived");
+    eventSource.close();
+});
+----
+
+Termination is unaffected: a deleted upload always closes its stream.

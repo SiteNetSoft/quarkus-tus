@@ -88,6 +88,11 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `30`
 | Seconds of inactivity after which an upload's lock is considered abandoned and may be reclaimed. The lock is held for the whole of a chunk transfer and refreshed as bytes arrive, so this only bounds a holder that died or stalled; set it above the longest pause a healthy client may make mid-chunk. Applies to the bundled local file store.
 
+| `quarkus.tus.sse-hold-open-timeout-seconds`
+| `long`
+| `300`
+| Seconds a held-open SSE events stream may outlive its upload's completion before the server closes it anyway. Only affects uploads for which `TusSseService.holdOpen` was called; see xref:sse.adoc[SSE]. The backstop for a post-upload pipeline that never calls `finish`.
+
 | `quarkus.tus.max-concat-parts`
 | `int`
 | `1000`

@@ -83,6 +83,15 @@ public interface TusRuntimeConfig {
     long lockTimeoutSeconds();
 
     /**
+     * Seconds a held-open SSE events stream may outlive its upload's completion before the
+     * framework closes it anyway. The backstop for a consumer that called
+     * {@code TusSseService.holdOpen} but whose {@code finish} never comes — without it an
+     * abandoned pipeline would leak the sink forever. Counted from the completion event.
+     */
+    @WithDefault("300")
+    long sseHoldOpenTimeoutSeconds();
+
+    /**
      * Maximum number of partial uploads a single {@code Upload-Concat: final} request may
      * reference. Bounds how much copying one request can schedule; without it the only ceiling
      * is the HTTP header size limit, which is not a deliberate bound.
