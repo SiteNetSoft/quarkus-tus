@@ -696,9 +696,14 @@ public class TusUploadResource {
                 })
                 .onFailure(ChunkLimitExceededException.class).recoverWithItem(e -> {
                     ChunkLimitExceededException limit = (ChunkLimitExceededException) e;
-                    return limit.kind() == ChunkLimitExceededException.Kind.CHUNK_SIZE
-                            ? tus(REQUEST_ENTITY_TOO_LARGE).entity("Chunk size exceeds maximum allowed size").build()
-                            : tus(CONFLICT).entity("Chunk exceeds declared upload size").build();
+                    return switch (limit.kind()) {
+                        case CHUNK_SIZE ->
+                            tus(REQUEST_ENTITY_TOO_LARGE).entity("Chunk size exceeds maximum allowed size").build();
+                        case MAX_SIZE ->
+                            tus(REQUEST_ENTITY_TOO_LARGE).entity("Upload exceeds maximum allowed size").build();
+                        case ENTITY_LENGTH ->
+                            tus(CONFLICT).entity("Chunk exceeds declared upload size").build();
+                    };
                 })
                 .onFailure(UploadNotFoundException.class).recoverWithItem(e -> tus(NOT_FOUND).build())
                 .onFailure().recoverWithItem(e -> {

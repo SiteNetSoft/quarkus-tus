@@ -50,8 +50,19 @@ public class UploadWriter {
                            ChecksumInfo checksumInfo, MessageDigest digest, Long contentLength,
                            AtomicReference<ChunkStream> streamRef) {
         final long entityLength = info.getEntityLength();
-        long remaining = entityLength >= 0 ? entityLength - offset : Long.MAX_VALUE;
-        ChunkStream stream = new ChunkStream(routingContext, digest, tusRuntimeConfig.maxChunkSize(), remaining);
+        // While the length is deferred there is no Upload-Length to bound the stream against, but
+        // the byte stream itself still has to be cut off somewhere -- quarkus.tus.max-size is that
+        // bound. Without this, a deferred-length client PATCHing a chunked (no Content-Length)
+        // body bypasses the header-based fast rejection in TusUploadResource entirely, since that
+        // check only runs when a Content-Length is present. Kind.MAX_SIZE (413) rather than
+        // Kind.ENTITY_LENGTH (409): this is the server's own cap, not the client breaking a length
+        // it already agreed to.
+        long remaining = entityLength >= 0 ? entityLength - offset : tusRuntimeConfig.maxSize() - offset;
+        ChunkLimitExceededException.Kind remainingKind = entityLength >= 0
+                ? ChunkLimitExceededException.Kind.ENTITY_LENGTH
+                : ChunkLimitExceededException.Kind.MAX_SIZE;
+        ChunkStream stream = new ChunkStream(routingContext, digest, tusRuntimeConfig.maxChunkSize(), remaining,
+                remainingKind);
         streamRef.set(stream);
         // Completion is a transition, decided once: only the commit that reaches the declared
         // length fires it, and the record it reports is re-read after that commit.
