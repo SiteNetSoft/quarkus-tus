@@ -309,4 +309,59 @@ class TusClientTest {
                         .await().atMost(TIMEOUT));
         assertTrue(cancelled.get());
     }
+
+    @Test
+    void routedResponsesTakePriorityOverTheGlobalQueueAndStayPerPathFifo() {
+        // Fixture self-test: route()'d responses are consumed before the global queue, keyed
+        // per-(method, path), and stay FIFO within that key.
+        server.route("PATCH", "/tus/a", Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "1")));
+        server.route("PATCH", "/tus/b", Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "2")));
+        server.enqueue(Canned.of(599, Map.of()));   // would answer first if route() didn't take priority
+
+        var httpClient = io.vertx.mutiny.core.Vertx.newInstance(vertx).createHttpClient();
+        var respB = httpClient.request(new io.vertx.core.http.RequestOptions()
+                        .setMethod(io.vertx.core.http.HttpMethod.PATCH).setAbsoluteURI(server.url() + "/b"))
+                .flatMap(req -> req.send()).await().atMost(TIMEOUT);
+        assertEquals(204, respB.statusCode());
+        assertEquals("2", respB.getHeader("Upload-Offset"));
+
+        var respA = httpClient.request(new io.vertx.core.http.RequestOptions()
+                        .setMethod(io.vertx.core.http.HttpMethod.PATCH).setAbsoluteURI(server.url() + "/a"))
+                .flatMap(req -> req.send()).await().atMost(TIMEOUT);
+        assertEquals(204, respA.statusCode());
+        assertEquals("1", respA.getHeader("Upload-Offset"));
+        httpClient.close().await().atMost(TIMEOUT);
+    }
+
+    @Test
+    void parallelismSplitsIntoPartialsAndConcatenates() {
+        enqueueOptions("creation,concatenation");
+        // 3 partial creates, 3 partial PATCHes, 1 final concat — order of PATCHes may interleave,
+        // so the fixture routes by path: enqueue keyed responses
+        server.route("POST", "/tus", Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/p1")),
+                                     Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/p2")),
+                                     Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/p3")),
+                                     Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/fin")));
+        server.route("PATCH", "/tus/p1", Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "4")));
+        server.route("PATCH", "/tus/p2", Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "4")));
+        server.route("PATCH", "/tus/p3", Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "3")));
+        var result = client.upload(TusUploadRequest.builder(sourceOf("hello world"))   // 11 bytes / 3
+                .parallelism(3).build()).await().atMost(TIMEOUT);
+        assertEquals(11, result.bytesUploaded());
+        var finalCreate = server.recorded().stream()
+                .filter(r -> r.headers().contains("Upload-Concat") && r.headers().get("Upload-Concat").startsWith("final"))
+                .findFirst().orElseThrow();
+        // ranges in order: p1 gets bytes [0,4), p2 [4,8), p3 [8,11) — final lists them in order
+        assertTrue(finalCreate.headers().get("Upload-Concat").endsWith("/tus/p1 " + server.url() + "/p2 " + server.url() + "/p3")
+                || finalCreate.headers().get("Upload-Concat").matches("final;.*p1 .*p2 .*p3"));
+    }
+
+    @Test
+    void parallelismRequiresConcatenationAndAReplayableKnownLengthSource() {
+        enqueueOptions("creation");                                // no concatenation
+        var failure = assertThrows(TusCapabilityException.class, () ->
+                client.upload(TusUploadRequest.builder(sourceOf("hello world"))
+                        .parallelism(2).build()).await().atMost(TIMEOUT));
+        assertEquals("concatenation", failure.missingExtension());
+    }
 }
