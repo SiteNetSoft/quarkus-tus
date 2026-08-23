@@ -6,6 +6,7 @@ import io.vertx.core.buffer.Buffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusCapabilityException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusPayloadTooLargeException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusServerErrorException;
@@ -13,8 +14,10 @@ import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadProgress;
 import org.sitenetsoft.quarkus.tus.client.runtime.source.UploadSource;
 
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -47,10 +50,18 @@ class TusClientTest {
     }
 
     private void enqueueOptions(String... extensions) {
-        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of(
-                "Tus-Resumable", "1.0.0",
-                "Tus-Version", "1.0.0",
-                "Tus-Extension", String.join(",", extensions))));
+        var headers = new java.util.LinkedHashMap<String, String>();
+        headers.put("Tus-Resumable", "1.0.0");
+        headers.put("Tus-Version", "1.0.0");
+        headers.put("Tus-Extension", String.join(",", extensions));
+        boolean advertisesChecksum = List.of(extensions).stream()
+                .anyMatch(ext -> List.of(ext.split(",")).contains("checksum"));
+        if (advertisesChecksum) {
+            // Only sha1 is advertised: the tests that need checksum support only ever request sha1,
+            // so this stays minimal rather than pre-emptively listing sha256/md5 too.
+            headers.put("Tus-Checksum-Algorithm", "sha1");
+        }
+        server.enqueue(ScriptedTusServer.Canned.of(204, headers));
     }
 
     /**
@@ -224,5 +235,38 @@ class TusClientTest {
                         UploadSource.oneShot(Multi.createFrom().item(Buffer.buffer("hello world")), 11))
                         .chunkSize(4).build()).await().atMost(TIMEOUT));
         assertTrue(failure.getMessage().contains("not replayable"));
+    }
+
+    @Test
+    void checksumHeaderCarriesTheChunkDigest() throws Exception {
+        enqueueOptions("creation,checksum");                       // helper also sets Tus-Checksum-Algorithm: sha1
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "11")));
+        client.upload(TusUploadRequest.builder(sourceOf("hello world"))
+                .checksumAlgorithm("sha1").build()).await().atMost(TIMEOUT);
+        String expected = "sha1 " + Base64.getEncoder().encodeToString(
+                MessageDigest.getInstance("SHA-1").digest("hello world".getBytes()));
+        assertEquals(expected, server.recorded().get(2).headers().get("Upload-Checksum"));
+    }
+
+    @Test
+    void checksumAgainstServerWithoutTheExtensionIsRefused() {
+        enqueueOptions("creation");                                // no checksum advertised
+        var failure = assertThrows(TusCapabilityException.class, () ->
+                client.upload(TusUploadRequest.builder(sourceOf("hello world"))
+                        .checksumAlgorithm("sha1").build()).await().atMost(TIMEOUT));
+        assertEquals("checksum", failure.missingExtension());
+    }
+
+    @Test
+    void mismatch460RetriesTheChunk() {
+        enqueueOptions("creation,checksum");
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(ScriptedTusServer.Canned.of(460, Map.of("Tus-Resumable", "1.0.0")));
+        server.enqueue(ScriptedTusServer.Canned.of(200, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "0")));
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "11")));
+        var result = client.upload(TusUploadRequest.builder(sourceOf("hello world"))
+                .checksumAlgorithm("sha1").build()).await().atMost(TIMEOUT);
+        assertEquals(11, result.bytesUploaded());
     }
 }

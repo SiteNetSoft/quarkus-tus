@@ -4,16 +4,22 @@ import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.buffer.Buffer;
 import org.jboss.logging.Logger;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusCapabilityException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusChecksumMismatchException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusOffsetMismatchException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusServerErrorException;
+import org.sitenetsoft.quarkus.tus.client.runtime.model.TusServerCapabilities;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUpload;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadProgress;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadResult;
 import org.sitenetsoft.quarkus.tus.client.runtime.source.UploadSource;
 
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.util.Base64;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -79,13 +85,25 @@ public class TusClient {
             throw new UnsupportedOperationException(
                     "Parallel uploads (parallelism > 1) are not implemented yet; that's Task 10/11.");
         }
-        String checksumAlgorithm = request.checksumAlgorithm().orElse(options.checksumAlgorithm().orElse(null));
-        if (checksumAlgorithm != null) {
-            throw new UnsupportedOperationException(
-                    "Checksum digesting is not implemented yet; that's Task 9. Leave checksumAlgorithm unset.");
-        }
 
         UploadSource source = request.source();
+        String checksumAlgorithm = request.checksumAlgorithm().orElse(options.checksumAlgorithm().orElse(null));
+        if (checksumAlgorithm != null) {
+            if (!source.replayable()) {
+                // Checksumming re-reads the chunk to digest it before sending, and a mismatch is
+                // retried by re-sending the same chunk (Task 8) -- neither is possible against a
+                // source that can only be consumed once. Fail fast, synchronously, before any request
+                // goes out, rather than discovering this mid-upload.
+                throw new TusClientException(
+                        "checksumAlgorithm requires a replayable source, but this source is not "
+                                + "replayable (one-shot sources cannot be re-read to be digested or retried)");
+            }
+            // Validated eagerly (not deferred into the capability-check flatMap below) so an unknown
+            // algorithm name fails at request time with a clear, typed error instead of surfacing
+            // later as an opaque NoSuchAlgorithmException from inside the chunk loop.
+            javaDigestName(checksumAlgorithm);
+        }
+
         long length = source.length();
         if (length < 0) {
             throw new UnsupportedOperationException(
@@ -101,9 +119,43 @@ public class TusClient {
                 .build();
 
         return capabilities
-                .flatMap(caps -> protocol.create(createOptions))
-                .flatMap(created -> uploadRange(created, source, created.offset(), length, chunkSize, onProgress)
+                .flatMap(caps -> {
+                    requireChecksumCapability(caps, checksumAlgorithm);
+                    return protocol.create(createOptions);
+                })
+                .flatMap(created -> uploadRange(created, source, created.offset(), length, chunkSize, onProgress,
+                        checksumAlgorithm)
                         .map(finalOffset -> new TusUploadResult(created.url(), finalOffset)));
+    }
+
+    /**
+     * Requires the server to advertise both the {@code checksum} extension and the requested
+     * algorithm, if a checksum algorithm was requested. A no-op when {@code checksumAlgorithm} is
+     * {@code null}.
+     */
+    private void requireChecksumCapability(TusServerCapabilities caps, String checksumAlgorithm) {
+        if (checksumAlgorithm == null) {
+            return;
+        }
+        if (!caps.supports("checksum") || !caps.checksumAlgorithms().contains(checksumAlgorithm)) {
+            throw new TusCapabilityException(
+                    "Server does not support checksum algorithm '" + checksumAlgorithm
+                            + "' (checksum extension and/or that algorithm not advertised)",
+                    "checksum");
+        }
+    }
+
+    /**
+     * Maps a TUS wire algorithm name to the {@link MessageDigest} algorithm name Java understands.
+     * An unrecognized name is treated the same as a server that doesn't support it: a
+     * {@link TusCapabilityException} naming {@code checksum}.
+     */
+    private static String javaDigestName(String tusAlgorithm) {
+        String javaName = Map.of("sha1", "SHA-1", "sha256", "SHA-256", "md5", "MD5").get(tusAlgorithm);
+        if (javaName == null) {
+            throw new TusCapabilityException("Unsupported checksum algorithm: " + tusAlgorithm, "checksum");
+        }
+        return javaName;
     }
 
     /**
@@ -120,9 +172,9 @@ public class TusClient {
      * recovery point, undecorated, no matter how many chunks preceded it.
      */
     private Uni<Long> uploadRange(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
-            Consumer<TusUploadProgress> onProgress) {
+            Consumer<TusUploadProgress> onProgress, String checksumAlgorithm) {
         return attemptFromOffset(upload, source, from, to, chunkSize, onProgress,
-                new AtomicLong(from), new AtomicInteger(0));
+                new AtomicLong(from), new AtomicInteger(0), checksumAlgorithm);
     }
 
     /**
@@ -134,11 +186,11 @@ public class TusClient {
      */
     private Uni<Long> attemptFromOffset(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
             Consumer<TusUploadProgress> onProgress, AtomicLong confirmedOffset,
-            AtomicInteger attempt) {
-        return uploadChunks(upload, source, from, to, chunkSize, onProgress, confirmedOffset, attempt)
+            AtomicInteger attempt, String checksumAlgorithm) {
+        return uploadChunks(upload, source, from, to, chunkSize, onProgress, confirmedOffset, attempt, checksumAlgorithm)
                 .onFailure(this::isRetryable)
                 .recoverWithUni(failure -> retryFromOffset(upload, source, to, chunkSize, onProgress,
-                        confirmedOffset, attempt, failure));
+                        confirmedOffset, attempt, failure, checksumAlgorithm));
     }
 
     /**
@@ -151,16 +203,19 @@ public class TusClient {
      */
     private Uni<Long> uploadChunks(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
             Consumer<TusUploadProgress> onProgress, AtomicLong confirmedOffset,
-            AtomicInteger attempt) {
+            AtomicInteger attempt, String checksumAlgorithm) {
         if (from >= to) {
             return Uni.createFrom().item(from);
         }
         long end = Math.min(from + chunkSize, to);
         long len = end - from;
-        Multi<Buffer> chunk = BufferLimiter.limit(source.slice(from), len);
-        TusPatchOptions patchOptions = TusPatchOptions.builder().contentLength(len).build();
+        Multi<Buffer> limited = BufferLimiter.limit(source.slice(from), len);
 
-        return protocol.patch(upload.url(), from, chunk, patchOptions)
+        Uni<Long> patchCall = checksumAlgorithm == null
+                ? protocol.patch(upload.url(), from, limited, TusPatchOptions.builder().contentLength(len).build())
+                : digestAndPatch(upload, from, len, limited, checksumAlgorithm);
+
+        return patchCall
                 .invoke(newOffset -> {
                     reportProgress(onProgress, newOffset, to);
                     confirmedOffset.set(newOffset);
@@ -171,7 +226,43 @@ public class TusClient {
                     attempt.set(0);
                 })
                 .flatMap(newOffset -> uploadChunks(upload, source, newOffset, to, chunkSize, onProgress,
-                        confirmedOffset, attempt));
+                        confirmedOffset, attempt, checksumAlgorithm));
+    }
+
+    /**
+     * The checksum path: unlike the pure-streaming path above, this collects the whole chunk into one
+     * {@link Buffer} before sending it. That's a deliberate, bounded buffer — bounded because
+     * {@code limited} is already capped at {@code len} (at most one {@code chunkSize}) by
+     * {@link BufferLimiter} — not an accidental whole-upload buffering: it's the only way to compute a
+     * digest of the chunk before the PATCH that carries it, since the TUS checksum extension puts the
+     * digest in a request header rather than a trailer. The collected buffer is then sent as a
+     * single-item {@code Multi}.
+     */
+    private Uni<Long> digestAndPatch(TusUpload upload, long from, long len, Multi<Buffer> limited,
+            String checksumAlgorithm) {
+        return limited.collect().in(Buffer::buffer, Buffer::appendBuffer)
+                .flatMap(collected -> {
+                    String digest = digestBase64(checksumAlgorithm, collected);
+                    TusPatchOptions patchOptions = TusPatchOptions.builder()
+                            .contentLength(len)
+                            .checksum(checksumAlgorithm, digest)
+                            .build();
+                    Multi<Buffer> singleItem = Multi.createFrom().item(collected);
+                    return protocol.patch(upload.url(), from, singleItem, patchOptions);
+                });
+    }
+
+    private static String digestBase64(String checksumAlgorithm, Buffer data) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance(javaDigestName(checksumAlgorithm));
+            return Base64.getEncoder().encodeToString(digest.digest(data.getBytes()));
+        } catch (NoSuchAlgorithmException e) {
+            // javaDigestName() already validated the name maps to one of three algorithm names Java
+            // is guaranteed to provide (SHA-1, SHA-256, MD5 are all in every standard JDK), so this
+            // can't actually happen; kept as a typed failure rather than letting a checked exception
+            // force an unchecked wrapper at every call site.
+            throw new TusCapabilityException("Unsupported checksum algorithm: " + checksumAlgorithm, "checksum");
+        }
     }
 
     /**
@@ -181,7 +272,7 @@ public class TusClient {
      */
     private Uni<Long> retryFromOffset(TusUpload upload, UploadSource source, long to, long chunkSize,
             Consumer<TusUploadProgress> onProgress, AtomicLong confirmedOffset,
-            AtomicInteger attempt, Throwable failure) {
+            AtomicInteger attempt, Throwable failure, String checksumAlgorithm) {
         if (!source.replayable()) {
             return Uni.createFrom().failure(new TusClientException(
                     "Upload failed and the source is not replayable, so it cannot be resumed: "
@@ -200,7 +291,7 @@ public class TusClient {
                 .flatMap(ignored -> protocol.offset(upload.url()))
                 .invoke(confirmedOffset::set)
                 .flatMap(resyncedOffset -> attemptFromOffset(upload, source, resyncedOffset, to, chunkSize,
-                        onProgress, confirmedOffset, attempt));
+                        onProgress, confirmedOffset, attempt, checksumAlgorithm));
     }
 
     /**
