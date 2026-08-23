@@ -601,10 +601,13 @@ public class TusUploadResource {
             }
 
             return stillDeferred.chain(deferred -> {
-                if (deferred) {
-                    return releasingLock(uploadID, tus(BAD_REQUEST)
-                            .entity("Upload-Length must be set before uploading data").build());
-                }
+                // Per the creation-defer-length extension, Upload-Length may be announced on ANY
+                // PATCH, not necessarily the first one carrying data -- a client streaming a
+                // source of unknown length has to send chunks while the length is still
+                // deferred, and only learns (and declares) it once its source runs dry. So a
+                // PATCH that leaves the length still deferred is not itself an error; the chunk
+                // boundary check just below is skipped instead (it needs the entity length, and
+                // there isn't one yet).
 
                 if (uploadOffset != info.getOffset()) {
                     return releasingLock(uploadID, tus(CONFLICT)
@@ -612,7 +615,8 @@ public class TusUploadResource {
                             .entity("Upload offset mismatch").build());
                 }
 
-                if (contentLength != null && !fitsWithin(contentLength, uploadOffset, info.getEntityLength())) {
+                if (!deferred && contentLength != null
+                        && !fitsWithin(contentLength, uploadOffset, info.getEntityLength())) {
                     return releasingLock(uploadID,
                             tus(CONFLICT).entity("Chunk exceeds declared upload size").build());
                 }
