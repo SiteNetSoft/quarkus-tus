@@ -14,6 +14,8 @@ import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadResult;
 import org.sitenetsoft.quarkus.tus.client.runtime.source.UploadSource;
 
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
@@ -105,23 +107,51 @@ public class TusClient {
     }
 
     /**
-     * Uploads {@code [from, to)} of {@code source} to {@code upload}'s URL, one {@code chunkSize}
-     * slice at a time, as a recursive {@code Uni} chain. Kept range-capable (rather than always
-     * starting at 0 and always running to the source's full length) so Task 11's partial-upload
-     * concatenation can reuse it for an arbitrary sub-range.
+     * Uploads {@code [from, to)} of {@code source} to {@code upload}'s URL.
+     *
+     * <p>This is the single retry-budget entry point: it wraps one "attempt" — a run of
+     * {@link #uploadChunks} over the whole remaining range — in exactly one failure handler per
+     * attempt, sharing a single mutable {@code attempt} counter across every retry. That single
+     * shared counter is the fix for the bug where a per-chunk-recursion-frame retry handler let a
+     * failure from a later chunk re-enter every earlier chunk's already-succeeded frame, each with
+     * its own fresh budget — multiplying the effective retry count by the number of chunks that had
+     * already succeeded. {@code uploadChunks} itself carries no failure handler of its own: a chunk
+     * failure propagates straight up through every earlier chunk's {@code flatMap} to this one
+     * recovery point, undecorated, no matter how many chunks preceded it.
      */
     private Uni<Long> uploadRange(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
             Consumer<TusUploadProgress> onProgress) {
-        return uploadRange(upload, source, from, to, chunkSize, onProgress, 0);
+        return attemptFromOffset(upload, source, from, to, chunkSize, onProgress,
+                new AtomicLong(from), new AtomicInteger(0));
     }
 
     /**
-     * @param attempt the number of consecutive chunk failures seen so far in this run (0 on the very
-     *                first try, and reset to 0 again after any chunk that succeeds — see the class
-     *                Javadoc's Task 8 note).
+     * One attempt: upload the remaining range starting at {@code from}, and if it fails
+     * retryably, hand off to {@link #retryFromOffset}. {@code confirmedOffset} and {@code attempt}
+     * are shared, mutable, and updated in place by {@link #uploadChunks} as chunks succeed — they are
+     * NOT re-created per attempt, which is what keeps the retry budget scoped to the whole upload
+     * rather than to whichever recursion frame happens to catch the failure.
      */
-    private Uni<Long> uploadRange(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
-            Consumer<TusUploadProgress> onProgress, int attempt) {
+    private Uni<Long> attemptFromOffset(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
+            Consumer<TusUploadProgress> onProgress, AtomicLong confirmedOffset,
+            AtomicInteger attempt) {
+        return uploadChunks(upload, source, from, to, chunkSize, onProgress, confirmedOffset, attempt)
+                .onFailure(this::isRetryable)
+                .recoverWithUni(failure -> retryFromOffset(upload, source, to, chunkSize, onProgress,
+                        confirmedOffset, attempt, failure));
+    }
+
+    /**
+     * Uploads {@code [from, to)} one {@code chunkSize} slice at a time, as a recursive {@code Uni}
+     * chain with NO failure handler attached anywhere in the recursion — a failure on any chunk
+     * propagates, undecorated, straight up to whichever single caller attached a handler (that's
+     * {@link #attemptFromOffset}, exactly once per attempt). Kept range-capable (rather than always
+     * starting at 0 and always running to the source's full length) so Task 11's partial-upload
+     * concatenation can reuse it for an arbitrary sub-range.
+     */
+    private Uni<Long> uploadChunks(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
+            Consumer<TusUploadProgress> onProgress, AtomicLong confirmedOffset,
+            AtomicInteger attempt) {
         if (from >= to) {
             return Uni.createFrom().item(from);
         }
@@ -131,39 +161,46 @@ public class TusClient {
         TusPatchOptions patchOptions = TusPatchOptions.builder().contentLength(len).build();
 
         return protocol.patch(upload.url(), from, chunk, patchOptions)
-                .invoke(newOffset -> reportProgress(onProgress, newOffset, to))
-                // A successful chunk resets the attempt counter: only *consecutive* failures count
-                // against maxRetries, so a long upload that hits one transient error every so often
-                // keeps making progress instead of eventually exhausting its retry budget.
-                .flatMap(newOffset -> uploadRange(upload, source, newOffset, to, chunkSize, onProgress, 0))
-                .onFailure(this::isRetryable)
-                .recoverWithUni(failure -> retryChunk(upload, source, to, chunkSize, onProgress, attempt, failure));
+                .invoke(newOffset -> {
+                    reportProgress(onProgress, newOffset, to);
+                    confirmedOffset.set(newOffset);
+                    // A successful chunk resets the attempt counter: only *consecutive* failures
+                    // count against maxRetries, so a long upload that hits one transient error every
+                    // so often keeps making progress instead of eventually exhausting its retry
+                    // budget on unrelated, already-recovered-from failures.
+                    attempt.set(0);
+                })
+                .flatMap(newOffset -> uploadChunks(upload, source, newOffset, to, chunkSize, onProgress,
+                        confirmedOffset, attempt));
     }
 
     /**
-     * Handles one retryable chunk failure: gives up (propagating {@code failure}) if the source can't
-     * be replayed or the retry budget is exhausted, otherwise backs off, resyncs the true offset with
-     * a HEAD, and resumes the chunk loop from there.
+     * Handles one retryable failure of the current attempt: gives up (propagating {@code failure})
+     * if the source can't be replayed or the retry budget is exhausted, otherwise backs off, resyncs
+     * the true offset with a HEAD, and starts a fresh attempt from there.
      */
-    private Uni<Long> retryChunk(TusUpload upload, UploadSource source, long to, long chunkSize,
-            Consumer<TusUploadProgress> onProgress, int attempt, Throwable failure) {
+    private Uni<Long> retryFromOffset(TusUpload upload, UploadSource source, long to, long chunkSize,
+            Consumer<TusUploadProgress> onProgress, AtomicLong confirmedOffset,
+            AtomicInteger attempt, Throwable failure) {
         if (!source.replayable()) {
             return Uni.createFrom().failure(new TusClientException(
                     "Upload failed and the source is not replayable, so it cannot be resumed: "
                             + failure.getMessage(),
                     failure));
         }
-        int nextAttempt = attempt + 1;
+        int priorAttempt = attempt.get();
+        int nextAttempt = attempt.incrementAndGet();
         if (nextAttempt > options.maxRetries()) {
             return Uni.createFrom().failure(failure);
         }
         LOG.debugf(failure, "TUS chunk upload failed (attempt %d/%d), backing off and resyncing offset",
                 nextAttempt, options.maxRetries());
         return Uni.createFrom().voidItem()
-                .onItem().delayIt().by(backoffFor(attempt))
+                .onItem().delayIt().by(backoffFor(priorAttempt))
                 .flatMap(ignored -> protocol.offset(upload.url()))
-                .flatMap(resyncedOffset -> uploadRange(upload, source, resyncedOffset, to, chunkSize, onProgress,
-                        nextAttempt));
+                .invoke(confirmedOffset::set)
+                .flatMap(resyncedOffset -> attemptFromOffset(upload, source, resyncedOffset, to, chunkSize,
+                        onProgress, confirmedOffset, attempt));
     }
 
     /**

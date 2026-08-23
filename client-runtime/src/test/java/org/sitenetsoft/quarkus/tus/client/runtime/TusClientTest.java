@@ -181,6 +181,37 @@ class TusClientTest {
     }
 
     @Test
+    void retryBudgetIsPerUploadNotPerChunk() {
+        // Two chunks succeed, then the last chunk (offset 8 -> 11) fails persistently. The retry
+        // budget is a single counter for the whole upload, not one counter per already-succeeded
+        // chunk's recursion frame -- so this must total exactly 1 initial + 3 retries = 4 failing
+        // PATCHes on the last chunk (6 PATCHes overall), not 4 retries multiplied by every frame that
+        // chunk's failure bubbles through (which is what a per-frame retry budget produces).
+        client.close();
+        client = TusClient.create(vertx,
+                TusClientOptions.builder(server.url()).retryBackoff(Duration.ofMillis(10)).build());
+        enqueueOptions("creation");
+        server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "4")));
+        server.enqueue(ScriptedTusServer.Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "8")));
+        for (int i = 0; i < 4; i++) {                              // last chunk: 1 try + 3 retries, all 500
+            server.enqueue(ScriptedTusServer.Canned.of(500, Map.of("Tus-Resumable", "1.0.0")));
+            server.enqueue(ScriptedTusServer.Canned.of(200, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "8")));
+        }
+        assertThrows(TusServerErrorException.class, () ->
+                client.upload(TusUploadRequest.builder(sourceOf("hello world")).chunkSize(4).build())
+                        .await().atMost(TIMEOUT));
+        long patchCount = server.recorded().stream().filter(r -> r.method().equals("PATCH")).count();
+        assertEquals(6, patchCount,
+                "2 successful chunks + (1 initial + 3 retries) on the persistently failing last chunk");
+        long headCount = server.recorded().stream().filter(r -> r.method().equals("HEAD")).count();
+        assertEquals(3, headCount, "a resync after each of the first 3 failures, none after the exhausting 4th");
+        // OPTIONS + POST + 6 PATCH + 3 HEAD = 11: the 8th (surplus) canned response for the 4th HEAD
+        // resync must be left unconsumed, proving the loop stopped instead of retrying past the bound.
+        assertEquals(11, server.recorded().size());
+    }
+
+    @Test
     void oneShotSourceCannotResume() {
         client.close();
         client = TusClient.create(vertx,
