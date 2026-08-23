@@ -11,15 +11,25 @@ final class ChunkLimitExceededException extends RuntimeException {
         /** More bytes than {@code quarkus.tus.max-chunk-size}. */
         CHUNK_SIZE,
         /** More bytes than remain before {@code Upload-Length}. */
-        ENTITY_LENGTH
+        ENTITY_LENGTH,
+        /**
+         * More bytes than remain before {@code quarkus.tus.max-size}, while the upload's length
+         * is still deferred (no {@code Upload-Length} to check {@code ENTITY_LENGTH} against
+         * yet). Unlike {@code ENTITY_LENGTH} -- which means the client is violating a length it
+         * already agreed to, a conflict -- this is the server's own cap and maps to 413, same as
+         * {@code CHUNK_SIZE}.
+         */
+        MAX_SIZE
     }
 
     private final Kind kind;
 
     ChunkLimitExceededException(Kind kind, long limit) {
-        super(kind == Kind.CHUNK_SIZE
-                ? "Chunk exceeds maximum allowed size of " + limit + " bytes"
-                : "Chunk exceeds declared upload size by more than " + limit + " remaining bytes");
+        super(switch (kind) {
+            case CHUNK_SIZE -> "Chunk exceeds maximum allowed size of " + limit + " bytes";
+            case ENTITY_LENGTH -> "Chunk exceeds declared upload size by more than " + limit + " remaining bytes";
+            case MAX_SIZE -> "Chunk exceeds maximum allowed upload size by more than " + limit + " remaining bytes";
+        });
         this.kind = kind;
     }
 
