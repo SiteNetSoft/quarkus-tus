@@ -6,6 +6,7 @@ import io.vertx.core.buffer.Buffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.sitenetsoft.quarkus.tus.client.runtime.ScriptedTusServer.Canned;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusCapabilityException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusPayloadTooLargeException;
@@ -23,6 +24,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -268,5 +270,24 @@ class TusClientTest {
         var result = client.upload(TusUploadRequest.builder(sourceOf("hello world"))
                 .checksumAlgorithm("sha1").build()).await().atMost(TIMEOUT);
         assertEquals(11, result.bytesUploaded());
+    }
+
+    @Test
+    void oneShotWithUnknownLengthDeclaresItInAFinalEmptyPatch() {
+        enqueueOptions("creation,creation-defer-length");
+        server.enqueue(Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "11")));
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "11")));
+        var result = client.upload(TusUploadRequest.builder(
+                UploadSource.oneShot(Multi.createFrom().item(Buffer.buffer("hello world")), -1)).build())
+                .await().atMost(TIMEOUT);
+        assertEquals(11, result.bytesUploaded());
+        var create = server.recorded().get(1);
+        assertEquals("1", create.headers().get("Upload-Defer-Length"));
+        assertNull(create.headers().get("Upload-Length"));
+        var last = server.recorded().getLast();                    // the declaring PATCH
+        assertEquals("PATCH", last.method());
+        assertEquals("11", last.headers().get("Upload-Length"));
+        assertEquals(0, last.body().length());
     }
 }
