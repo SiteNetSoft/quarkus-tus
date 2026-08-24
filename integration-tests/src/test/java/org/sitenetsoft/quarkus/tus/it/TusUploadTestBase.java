@@ -300,7 +300,10 @@ abstract class TusUploadTestBase {
     }
 
     @Test
-    void testDeferredLengthPatchWithoutLengthReturns400() {
+    void testDeferredLengthPatchWithoutLengthAcceptsDataAndStaysDeferred() {
+        // Per the creation-defer-length extension, Upload-Length may be announced on ANY PATCH,
+        // not necessarily the first one carrying data: a client streaming a source of unknown
+        // length has to be able to send chunks while the length is still deferred.
         byte[] data = "some data".getBytes();
 
         String location = given()
@@ -318,7 +321,16 @@ abstract class TusUploadTestBase {
                 .body(data)
                 .when().patch(location)
                 .then()
-                .statusCode(400);
+                .statusCode(204)
+                .header("Upload-Offset", String.valueOf(data.length));
+
+        given()
+                .header("Tus-Resumable", "1.0.0")
+                .when().head(location)
+                .then()
+                .statusCode(200)
+                .header("Upload-Offset", String.valueOf(data.length))
+                .header("Upload-Defer-Length", "1");
     }
 
     @Test

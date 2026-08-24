@@ -36,9 +36,13 @@ final class ChunkStream {
     /**
      * @param digest        the digest to feed, or null when no checksum was requested
      * @param maxChunkSize  fail past this many bytes with {@code Kind.CHUNK_SIZE}
-     * @param maxRemaining  fail past this many bytes with {@code Kind.ENTITY_LENGTH}
+     * @param maxRemaining  fail past this many bytes with {@code remainingKind}
+     * @param remainingKind the kind to raise for {@code maxRemaining} -- {@code ENTITY_LENGTH}
+     *                      while the upload's declared length bounds it, {@code MAX_SIZE} while
+     *                      the length is still deferred and the server-wide cap bounds it instead
      */
-    ChunkStream(RoutingContext routingContext, MessageDigest digest, long maxChunkSize, long maxRemaining) {
+    ChunkStream(RoutingContext routingContext, MessageDigest digest, long maxChunkSize, long maxRemaining,
+                ChunkLimitExceededException.Kind remainingKind) {
         this.digest = digest;
         io.vertx.core.http.HttpServerRequest request = routingContext.request();
         this.multi = HttpServerRequest.newInstance(request).toMulti()
@@ -56,8 +60,7 @@ final class ChunkStream {
                                 ChunkLimitExceededException.Kind.CHUNK_SIZE, maxChunkSize));
                     }
                     if (total > maxRemaining) {
-                        throw limit(new ChunkLimitExceededException(
-                                ChunkLimitExceededException.Kind.ENTITY_LENGTH, maxRemaining));
+                        throw limit(new ChunkLimitExceededException(remainingKind, maxRemaining));
                     }
                     if (digest != null) {
                         digest.update(buffer.getByteBuf().nioBuffer());

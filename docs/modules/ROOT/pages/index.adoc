@@ -168,3 +168,4 @@ See xref:cdi-events.adoc[CDI Lifecycle Events] for the full event reference.
 * xref:sse.adoc[SSE Upload Progress] -- real-time progress streaming to clients
 * xref:authentication.adoc[Authentication] -- protect upload endpoints
 * xref:parallel-uploads.adoc[Parallel Uploads] -- speed up large uploads with concatenation
+* xref:client.adoc[TUS Client] -- drive uploads to a TUS server programmatically, with resume, checksum and parallelism

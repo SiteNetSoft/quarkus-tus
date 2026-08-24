@@ -1,0 +1,25 @@
+plugins {
+    id 'io.quarkus.extension'
+}
+
+quarkusExtension {
+    deploymentModule = 'client-deployment'
+    deploymentArtifact = "${project.group}:${rootProject.ext.publishedArtifactIds['client-deployment']}:${project.version}"
+}
+
+dependencies {
+    implementation enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
+    implementation 'io.quarkus:quarkus-arc'
+    implementation 'io.quarkus:quarkus-vertx'
+    implementation 'io.smallrye.reactive:smallrye-mutiny-vertx-core'
+
+    annotationProcessor enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
+    annotationProcessor 'io.quarkus:quarkus-extension-processor'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+}

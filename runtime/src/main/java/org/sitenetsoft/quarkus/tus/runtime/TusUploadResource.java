@@ -591,7 +591,13 @@ public class TusUploadResource {
                         .invoke(() -> {
                             events.lengthKnown(uploadID, uploadLength);
                             LOG.infof("Set deferred length for upload %s to %d", uploadID, uploadLength);
-                            if (uploadLength == 0) {
+                            // The declaring PATCH itself may carry no data (data-first,
+                            // declare-last): all the bytes already landed while the length was
+                            // still deferred, so the offset already equals the length being
+                            // declared here and nothing downstream will ever see the write that
+                            // "reaches" it. Fire completion now instead. Covers uploadLength==0
+                            // too, since offset is then also 0.
+                            if (info.getOffset() == uploadLength) {
                                 events.uploadCompleted(uploadID, info);
                             }
                         })
@@ -601,10 +607,13 @@ public class TusUploadResource {
             }
 
             return stillDeferred.chain(deferred -> {
-                if (deferred) {
-                    return releasingLock(uploadID, tus(BAD_REQUEST)
-                            .entity("Upload-Length must be set before uploading data").build());
-                }
+                // Per the creation-defer-length extension, Upload-Length may be announced on ANY
+                // PATCH, not necessarily the first one carrying data -- a client streaming a
+                // source of unknown length has to send chunks while the length is still
+                // deferred, and only learns (and declares) it once its source runs dry. So a
+                // PATCH that leaves the length still deferred is not itself an error; the chunk
+                // boundary check just below is skipped instead (it needs the entity length, and
+                // there isn't one yet).
 
                 if (uploadOffset != info.getOffset()) {
                     return releasingLock(uploadID, tus(CONFLICT)
@@ -612,9 +621,21 @@ public class TusUploadResource {
                             .entity("Upload offset mismatch").build());
                 }
 
-                if (contentLength != null && !fitsWithin(contentLength, uploadOffset, info.getEntityLength())) {
+                if (!deferred && contentLength != null
+                        && !fitsWithin(contentLength, uploadOffset, info.getEntityLength())) {
                     return releasingLock(uploadID,
                             tus(CONFLICT).entity("Chunk exceeds declared upload size").build());
+                }
+
+                // While the length stays deferred, fitsWithin() above is skipped (there is no
+                // entity length yet to check against) -- so nothing else stops a client from
+                // PATCHing data forever without ever declaring it. Enforce the server-wide cap
+                // directly against the running offset instead, the same limit and same 413 the
+                // declared-length paths already use.
+                if (deferred && contentLength != null
+                        && !fitsWithin(contentLength, uploadOffset, tusRuntimeConfig.maxSize())) {
+                    return releasingLock(uploadID,
+                            tus(REQUEST_ENTITY_TOO_LARGE).entity("Upload exceeds maximum allowed size").build());
                 }
 
                 return patchUnderLock(uploadID, info, uploadOffset, routingContext,
@@ -681,9 +702,14 @@ public class TusUploadResource {
                 })
                 .onFailure(ChunkLimitExceededException.class).recoverWithItem(e -> {
                     ChunkLimitExceededException limit = (ChunkLimitExceededException) e;
-                    return limit.kind() == ChunkLimitExceededException.Kind.CHUNK_SIZE
-                            ? tus(REQUEST_ENTITY_TOO_LARGE).entity("Chunk size exceeds maximum allowed size").build()
-                            : tus(CONFLICT).entity("Chunk exceeds declared upload size").build();
+                    return switch (limit.kind()) {
+                        case CHUNK_SIZE ->
+                            tus(REQUEST_ENTITY_TOO_LARGE).entity("Chunk size exceeds maximum allowed size").build();
+                        case MAX_SIZE ->
+                            tus(REQUEST_ENTITY_TOO_LARGE).entity("Upload exceeds maximum allowed size").build();
+                        case ENTITY_LENGTH ->
+                            tus(CONFLICT).entity("Chunk exceeds declared upload size").build();
+                    };
                 })
                 .onFailure(UploadNotFoundException.class).recoverWithItem(e -> tus(NOT_FOUND).build())
                 .onFailure().recoverWithItem(e -> {

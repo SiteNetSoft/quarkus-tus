@@ -1,0 +1,270 @@
+= TUS Client
+
+include::./includes/attributes.adoc[]
+
+A programmatic TUS client for talking to a TUS server -- this one or any other spec-compliant implementation -- from Quarkus code. It handles chunking, resume, checksum digesting, defer-length, and parallel upload via concatenation, and reports failures as typed exceptions rather than generic HTTP errors.
+
+The client ships as a separate extension from the server. An application can depend on either one alone, or both together (for example, a service that both accepts uploads and relays them onward to another TUS server).
+
+== Artifact Coordinates
+
+=== Gradle
+
+[source,kotlin]
+----
+// Server only
+implementation("org.sitenetsoft:quarkus-tus:1.0.0")
+
+// Client only
+implementation("org.sitenetsoft:quarkus-tus-client:1.0.0")
+
+// Both
+implementation("org.sitenetsoft:quarkus-tus:1.0.0")
+implementation("org.sitenetsoft:quarkus-tus-client:1.0.0")
+----
+
+=== Maven
+
+[source,xml]
+----
+<!-- Server only -->
+<dependency>
+    <groupId>org.sitenetsoft</groupId>
+    <artifactId>quarkus-tus</artifactId>
+    <version>1.0.0</version>
+</dependency>
+
+<!-- Client only -->
+<dependency>
+    <groupId>org.sitenetsoft</groupId>
+    <artifactId>quarkus-tus-client</artifactId>
+    <version>1.0.0</version>
+</dependency>
+----
+
+[cols="1,3"]
+|===
+| Consumption | Use case
+
+| Server only (`quarkus-tus`)
+| The application receives TUS uploads from external clients.
+
+| Client only (`quarkus-tus-client`)
+| The application drives uploads *to* another TUS server -- its own, or a third party's.
+
+| Both
+| The application relays: it accepts an upload on its own `/tus` endpoint and re-uploads the data onward via the client, e.g. to a downstream service or a different storage tier.
+|===
+
+The two extensions are independent build items; neither requires the other on the classpath.
+
+== Two Layers
+
+=== High-level: `TusClient`
+
+The everyday entry point. Inject it, hand it an `UploadSource`, and it drives the whole protocol conversation -- creation, chunked PATCHes, retries, checksum, resume -- to completion.
+
+[source,properties]
+----
+quarkus.tus.client.url=http://localhost:8080/tus
+----
+
+[source,java]
+----
+import jakarta.inject.Inject;
+import io.smallrye.mutiny.Uni;
+import org.sitenetsoft.quarkus.tus.client.runtime.TusClient;
+import org.sitenetsoft.quarkus.tus.client.runtime.TusUploadRequest;
+import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadResult;
+import org.sitenetsoft.quarkus.tus.client.runtime.source.UploadSource;
+
+import java.nio.file.Path;
+
+@Inject
+TusClient tusClient;
+
+@Inject
+io.vertx.core.Vertx vertx;
+
+Uni<TusUploadResult> upload(Path file) {
+    return tusClient.upload(TusUploadRequest.builder(UploadSource.ofFile(vertx, file))
+            .metadata(java.util.Map.of("filename", file.getFileName().toString()))
+            .build());
+}
+----
+
+`TusUploadResult` carries the final `url()` and `bytesUploaded()`. If nothing configures `quarkus.tus.client.url`, or more than one `TusRequestCustomizer` bean is present, the injected `TusClient` is a shim that boots cleanly but fails on first use with a `TusClientException` naming the problem -- there's no silent no-op.
+
+Outside CDI, build one directly with `TusClient.create(vertx, TusClientOptions.builder(url)...build())`; `TusClientOptions` mirrors every `quarkus.tus.client.*` property for programmatic construction and can override any of them per-request on `TusUploadRequest`.
+
+=== Low-level: `TusProtocolClient`
+
+`tusClient.protocol()` exposes the individual protocol operations for callers that want to drive the conversation themselves -- relaying a stream chunk by chunk as it arrives, for instance, rather than buffering it into an `UploadSource` first.
+
+[source,java]
+----
+import io.smallrye.mutiny.Multi;
+import io.vertx.core.buffer.Buffer;
+import org.sitenetsoft.quarkus.tus.client.runtime.TusCreateOptions;
+import org.sitenetsoft.quarkus.tus.client.runtime.TusPatchOptions;
+import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUpload;
+
+Buffer chunk1 = ...; // e.g. the next frame off an upstream stream being relayed
+Buffer chunk2 = ...;
+
+TusUpload upload = tusClient.protocol()
+        .create(TusCreateOptions.builder().length(chunk1.length() + chunk2.length()).build())
+        .await().indefinitely();
+
+long offsetAfterFirst = tusClient.protocol()
+        .patch(upload.url(), 0, Multi.createFrom().item(chunk1), TusPatchOptions.none())
+        .await().indefinitely();
+
+long finalOffset = tusClient.protocol()
+        .patch(upload.url(), offsetAfterFirst, Multi.createFrom().item(chunk2), TusPatchOptions.none())
+        .await().indefinitely();
+
+// Confirm what the server actually has, independent of what was sent
+long confirmed = tusClient.protocol().offset(upload.url()).await().indefinitely();
+
+// Later, once the relay no longer needs the upstream copy
+tusClient.protocol().terminate(upload.url()).await().indefinitely();
+----
+
+`patch()` takes a `Multi<Buffer>`, not a bare `Buffer` -- each chunk here is wrapped with `Multi.createFrom().item(...)` at the call site, which is exactly what a relay does with each frame it reads off the upstream connection instead of a single in-memory buffer. This is the same client the high-level layer is built on -- `offset()`/`patch()`/`terminate()` map straight onto HEAD/PATCH/DELETE, with `create()` for POST and `concatenate()` for the final `Upload-Concat` merge. None of it retries, resumes, or digests on its own; that's what the high-level layer adds.
+
+== `UploadSource`
+
+`UploadSource` abstracts where upload bytes come from. Two are built in:
+
+* `UploadSource.ofFile(vertx, path)` -- reads from a file on disk. Every `slice(offset)` call reopens the file, so it's fully re-readable from any offset: `replayable()` is `true`.
+* `UploadSource.oneShot(multi, declaredLength)` -- wraps a single already-in-flight `Multi<Buffer>`, e.g. bytes streaming in from an HTTP request body. It can be read exactly once, from offset zero: `replayable()` is `false`.
+
+A custom `UploadSource` (database blob, another network stream, etc.) is free to report `replayable() == true` if `slice(offset)` genuinely produces correct, independent data on every call and from any offset -- that's what unlocks the features below.
+
+=== One-shot Degradation
+
+A one-shot source can't be re-read, so anything that depends on re-reading fails fast, synchronously, before any request goes out -- not silently and not mid-upload:
+
+[cols="1,3"]
+|===
+| Feature | Behavior with a one-shot source
+
+| Resume after a failure
+| Unavailable. A mid-upload failure fails the whole upload with a `TusClientException` explaining the source can't be replayed, instead of retrying.
+
+| Checksum (`checksumAlgorithm`)
+| Rejected eagerly at `upload()` time with a `TusClientException`: digesting a chunk means re-reading it, which a one-shot source cannot do.
+
+| Parallel upload (`parallelism > 1`)
+| Rejected eagerly at `upload()` time with a `TusClientException`: splitting into concurrently uploaded ranges requires slicing the same source from multiple offsets.
+|===
+
+These are typed, synchronous failures -- never a silent fallback to a slower or degraded mode. An application that wants resume, checksum, or parallelism back needs a replayable source, e.g. staging the stream to a temp file first and using `UploadSource.ofFile`.
+
+== Checksum
+
+Setting `checksumAlgorithm` (per-request or via `quarkus.tus.client.checksum-algorithm`) makes the client digest each chunk and send it as `Upload-Checksum` on the PATCH that carries it, so the server can reject a corrupted chunk before it's persisted.
+
+Because the TUS checksum extension puts the digest in a request header rather than a trailer, the digest has to be known before the PATCH is sent. The client collects each chunk into one `Buffer` bounded at `chunkSize` before digesting and sending it -- a deliberate, bounded buffer (one chunk's worth, never the whole upload), not accidental whole-upload buffering. Keep `chunkSize` sized accordingly if checksum is enabled for very large uploads.
+
+== Defer-Length
+
+When the total size isn't known up front (e.g. streaming from a process whose output length is unknown until it ends), leave the source's `length()` at `-1`. The client issues a `creation-defer-length` POST, uploads chunks without a declared total, and once the upstream source signals completion sends one final, empty-bodied PATCH that declares the confirmed `Upload-Length`.
+
+Defer-length and `parallelism > 1` are mutually exclusive: parallel upload needs a known length up front to split into ranges, so requesting both fails eagerly with a `TusClientException`.
+
+== Parallel Upload via Concatenation
+
+Setting `parallelism > 1` (per-request or via `quarkus.tus.client.parallelism`) splits a replayable, known-length source into that many byte ranges, uploads each as its own `partial` upload concurrently, and merges them with a final concatenation POST once every partial has arrived -- transparent to the caller, who still just gets back one `TusUploadResult`.
+
+[source,java]
+----
+TusUploadResult result = tusClient.upload(TusUploadRequest.builder(UploadSource.ofFile(vertx, largeFile))
+        .parallelism(4)
+        .build())
+        .await().indefinitely();
+----
+
+This requires the target server to advertise the `concatenation` extension; if it doesn't, the client fails with a `TusCapabilityException` naming `concatenation` as the missing extension rather than attempting partial uploads the server can't merge. See xref:parallel-uploads.adoc[Parallel Uploads] for how the protocol itself works.
+
+== Authentication: `TusRequestCustomizer`
+
+`TusRequestCustomizer` is a hook to add or override headers on every outgoing request -- the usual use is attaching an `Authorization` header.
+
+[source,java]
+----
+import io.vertx.core.MultiMap;
+import jakarta.enterprise.context.ApplicationScoped;
+import org.sitenetsoft.quarkus.tus.client.runtime.TusRequestCustomizer;
+
+@ApplicationScoped
+public class BearerTokenCustomizer implements TusRequestCustomizer {
+
+    @Override
+    public void customize(String method, String url, MultiMap headers) {
+        headers.set("Authorization", "Bearer " + currentAccessToken());
+    }
+
+    private String currentAccessToken() {
+        // fetch or refresh the token
+        return "...";
+    }
+}
+----
+
+Only one `TusRequestCustomizer` bean may be present when using CDI injection; a second one makes the injected `TusClient` an unavailable shim (see above) rather than picking one arbitrarily. Building `TusClientOptions` programmatically sidesteps that ambiguity entirely, since the customizer is passed explicitly.
+
+== Configuration
+
+All client configuration is under the `quarkus.tus.client` prefix, and every property is a runtime property (overridable via `application.properties`, environment variables, or system properties) and can also be overridden per-request via `TusUploadRequest` or programmatically via `TusClientOptions`.
+
+[cols="3,1,1,3"]
+|===
+| Property | Type | Default | Description
+
+| `quarkus.tus.client.url`
+| `String`
+| _(none)_
+| Base URL of the target TUS server. Required for the CDI-injected `TusClient` to be usable; if unset, injection still succeeds but the client fails on first use.
+
+| `quarkus.tus.client.chunk-size`
+| `long`
+| `10485760` (10 MB)
+| Size, in bytes, of each PATCH the client sends.
+
+| `quarkus.tus.client.checksum-algorithm`
+| `String`
+| _(none)_
+| Checksum algorithm to digest and send as `Upload-Checksum` on every chunk (e.g. `sha1`, `md5`, `sha256`). Requires a replayable `UploadSource`.
+
+| `quarkus.tus.client.max-retries`
+| `int`
+| `3`
+| Maximum number of retry attempts for a failed chunk before giving up, per upload.
+
+| `quarkus.tus.client.retry-backoff`
+| `Duration`
+| `1S`
+| Initial backoff delay before the first retry.
+
+| `quarkus.tus.client.retry-backoff-max`
+| `Duration`
+| `30S`
+| Ceiling on the exponential backoff delay between retries.
+
+| `quarkus.tus.client.parallelism`
+| `int`
+| `1`
+| Number of concurrent partial-upload streams. Values greater than 1 require a replayable, known-length source and a server advertising `concatenation`.
+
+| `quarkus.tus.client.connect-timeout`
+| `Duration`
+| _(none)_
+| Connection timeout for outgoing requests. Unset means the underlying HTTP client's default.
+
+| `quarkus.tus.client.request-timeout`
+| `Duration`
+| _(none)_
+| Per-request timeout. Unset means no explicit timeout beyond the underlying HTTP client's default.
+|===
