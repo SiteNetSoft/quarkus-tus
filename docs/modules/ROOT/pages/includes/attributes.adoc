@@ -1,2 +1,2 @@
-:project-version: 0.1.0
-:quarkus-version: 3.31.4
+:project-version: 1.0.0
+:quarkus-version: 3.39.2

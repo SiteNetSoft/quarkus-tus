@@ -133,6 +133,8 @@ tusClient.protocol().terminate(upload.url()).await().indefinitely();
 
 `patch()` takes a `Multi<Buffer>`, not a bare `Buffer` -- each chunk here is wrapped with `Multi.createFrom().item(...)` at the call site, which is exactly what a relay does with each frame it reads off the upstream connection instead of a single in-memory buffer. This is the same client the high-level layer is built on -- `offset()`/`patch()`/`terminate()` map straight onto HEAD/PATCH/DELETE, with `create()` for POST and `concatenate()` for the final `Upload-Concat` merge. None of it retries, resumes, or digests on its own; that's what the high-level layer adds.
 
+If the relay is an `UploadStore` -- your server accepting uploads and this client forwarding them -- read xref:storage-spi.adoc#relaying-to-another-tus-server[Relaying to another TUS server] first: a downstream offset never moves backwards, which decides how the store must handle `abortChunk`.
+
 == `UploadSource`
 
 `UploadSource` abstracts where upload bytes come from. Two are built in:

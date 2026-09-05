@@ -109,6 +109,28 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | Number of requests a client may make back-to-back before the sustained rate applies.
 |===
 
+[#extensions-and-your-store]
+== Extensions and Your Store
+
+`quarkus.tus.extensions` is a promise made to clients on behalf of whatever `UploadStore` is installed, and the extension does not check the two against each other at boot. With the bundled local file store every extension works. With a custom store, drop any extension the store cannot honour, because a client that reads it from `Tus-Extension` will rely on it:
+
+[cols="1,3"]
+|===
+| Extension | What it needs from the store
+
+| `checksum`, `checksum-trailer`
+| `abortChunk` must genuinely discard staged bytes and leave the offset unchanged -- a `460` is only correct if the rejected bytes never count. A store that forwards bytes somewhere it cannot take them back from (see xref:storage-spi.adoc#relaying-to-another-tus-server[Relaying to another TUS server]) should not advertise these.
+
+| `concatenation`, `concatenation-unfinished`
+| A working `concatenate(finalId, sourceIds)`. The method is abstract, so every store has one, but a store whose backend cannot join objects (an implementation that just fails) must not advertise it, or every final `Upload-Concat` request fails after the partials have already been uploaded. The bundled contract test exercises it.
+
+| `expiration`
+| `cleanupExpiredUploads` must actually remove expired uploads, or the `Upload-Expires` header advertises a deadline nothing enforces.
+
+| `creation-with-upload`, `creation-defer-length`, `termination`, `creation`
+| Nothing beyond the base contract; every store gets these from the framework.
+|===
+
 == Checksum Trailers
 
 The `checksum-trailer` extension lets a client send `Upload-Checksum` as an HTTP trailer, after the

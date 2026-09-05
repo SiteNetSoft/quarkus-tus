@@ -65,6 +65,16 @@ The framework holds the upload's lock around the whole sequence, computes the di
 | `UploadPart` (needs `expectedLength`)
 | record the part's ETag
 | drop the part
+
+| Another TUS server, buffered
+| collect the chunk in memory
+| `PATCH` it downstream
+| drop the buffer
+
+| Another TUS server, pass-through
+| `PATCH` the bytes downstream as they arrive
+| record the new remote offset
+| cannot un-send: `DELETE` the remote upload and re-create it (see below)
 |===
 
 `expectedLength` is the declared chunk length, or `-1` when there is none (chunked transfer encoding, or a length-less HTTP/2 body). The framework never stages a chunk it knows to be empty; a length-less body that turns out to be empty is staged as zero bytes and then aborted, not committed.
@@ -169,6 +179,23 @@ public class S3UploadStore implements UploadStore {
 ----
 
 For a clustered deployment, back `acquireLock`/`releaseLock` with something shared (a database row, Redis). The lock is what serialises concurrent PATCHes to one upload; the bundled store's is per process.
+
+[#relaying-to-another-tus-server]
+=== Relaying to another TUS server
+
+A store can forward what it receives to a second TUS server -- a downstream service, a different storage tier -- using the xref:client.adoc[client extension]. The extension ships no such store on purpose; it ships the primitives, and this section is about the one place where the two protocols do not line up.
+
+A TUS server's offset only moves forward. Once bytes have been `PATCH`ed downstream they are part of that upload, and there is no request that takes them back. `abortChunk`, however, must leave the upload *exactly as it was*: the framework calls it whenever a chunk fails its `Upload-Checksum`, and also when the client disconnects mid-chunk. So a store that forwards bytes while they stream has nothing cheap to do on abort. There are two honest designs:
+
+Buffered::
+Extend `BufferingUploadStore` and forward the whole chunk from `appendBytes`. Staging is the buffer; commit is the downstream `PATCH`; abort drops the buffer and the downstream server never saw the bytes. Simple and exact, at the cost of holding one chunk per in-flight upload in memory -- bound it with `quarkus.tus.max-chunk-size`.
+
+Pass-through::
+Stream into the downstream `PATCH` from `stageChunk` (`TusProtocolClient.patch` takes the same `Multi<Buffer>`), record the offset the downstream server returns in `commitChunk`, and in `abortChunk` `terminate()` the downstream upload, `create()` a fresh one and replay any already-committed bytes into it -- which means keeping a copy of them, or accepting that an abort restarts the upload from zero on the client's next `HEAD`. Nothing is materialised on the relay while things go well; the price is paid on abort. Note that a downstream server's own checksum check does not help here: the framework has already streamed the bytes before it knows the digest, and it is the *upstream* client's checksum the framework verifies.
+
+Either way, `findUploadInfo` is yours to answer. Keep a local record and reconcile it against `TusProtocolClient.offset()` when they disagree, rather than round-tripping to the downstream server on every `HEAD`; the lock rules above still apply, so a reconciliation that moves the offset must happen under the upload's lock.
+
+If neither design suits, do not advertise `checksum`: a store that cannot honour `abortChunk` cannot honour a `460` either. See xref:configuration.adoc#extensions-and-your-store[the note on extensions] for what each one asks of the store.
 
 == Verifying your store: the contract test
 
