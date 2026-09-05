@@ -1,0 +1,64 @@
+@startuml seq-patch
+title Code level — create, then one PATCH through the staged write
+skinparam sequenceMessageAlign center
+actor "Upload client" as C
+participant "Request filters" as F
+participant "TusUploadResource" as R
+participant "TusUploadAuthorizer" as A
+participant "UploadWriter" as W
+participant "UploadStore" as S
+participant "UploadEvents" as E
+participant "Your observers /\nTusSseEventBridge" as O
+
+== Creation ==
+C -> F : POST /tus\nUpload-Length, Upload-Metadata
+F -> R : (method override, auth, rate limit applied)
+R -> S : createUpload(info)
+S --> R : id
+R -> E : uploadCreated(id, ...)
+E -> O : TusUploadCreatedEvent
+R --> C : 201 Created\nLocation: /tus/{id}
+
+== One chunk ==
+C -> F : PATCH /tus/{id}\nUpload-Offset: n, Upload-Checksum (optional)\nbody streams
+F -> R
+R -> S : acquireLock(id)
+alt lock held elsewhere
+  S --> R : false
+  R --> C : 423 Locked
+end
+R -> S : findUploadInfo(id)
+R -> A : isDenied(info, user)
+alt not owner
+  R --> C : 404 Not Found
+end
+alt Upload-Offset != info.offset
+  R --> C : 409 Conflict
+end
+R -> W : write(id, info, offset, body, digests)
+W -> S : stageChunk(id, offset, Multi<Buffer>, expectedLength)
+note right of W
+  Bytes stream straight through a ChunkStream
+  that digests them and enforces max-chunk-size.
+  The offset does not move yet.
+end note
+S --> W : bytes staged
+alt checksum matches (or none sent)
+  W -> S : commitChunk(id, offset, staged)
+  S --> W : offset advanced, record persisted
+  W -> E : chunkReceived(id, size, newOffset)
+  E -> O : TusChunkReceivedEvent → SSE progress
+  W --> R : newOffset
+  opt newOffset == Upload-Length
+    R -> E : uploadCompleted(id, info)
+    E -> O : TusUploadCompletedEvent
+  end
+  R -> S : releaseLock(id)
+  R --> C : 204 No Content\nUpload-Offset: newOffset
+else checksum mismatch, or the client disconnected mid-chunk
+  W -> S : abortChunk(id, offset)
+  S --> W : staged bytes discarded, upload as it was
+  R -> S : releaseLock(id)
+  R --> C : 460 Checksum Mismatch\n(or the connection is simply gone)
+end
+@enduml

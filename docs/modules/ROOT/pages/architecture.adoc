@@ -1,0 +1,42 @@
+= Architecture
+:description: C4 model of the quarkus-tus extensions, from system context down to sequence diagrams of the key flows.
+
+This page describes the extensions with the https://c4model.com/[C4 model]: context, containers and components as diagrams, then the code level as sequence diagrams of the three flows that matter most. Sources are in `docs/diagrams/` and render with `scripts/render-diagrams.sh`.
+
+== Level 1: System context
+
+An application built with quarkus-tus sits between upload clients and wherever the bytes end up. The extension owns the protocol; your application owns the destination.
+
+image::c4-context.svg[System context,align="center"]
+
+== Level 2: Containers
+
+Inside the application there are two independent extensions, the server and the client, plus your own code: observers of the lifecycle events and, if the bundled local file store does not suit, an `UploadStore` alternative. See xref:storage-spi.adoc[Custom Storage Backends] and xref:client.adoc[TUS Client].
+
+image::c4-container.svg[Containers,align="center"]
+
+== Level 3: Components of the server runtime
+
+The server runtime is split by responsibility. `TusUploadResource` does HTTP only. `UploadWriter` owns one chunk's staged write. `UploadConcatenator` owns the merge and its lock dance. `UploadEvents` is the only component that fires CDI events, and it also feeds the SSE stream. Everything about bytes goes through the `UploadStore` SPI.
+
+image::c4-component.svg[Components,align="center"]
+
+== Level 4: Code, as sequence diagrams
+
+=== Create, then one PATCH through the staged write
+
+The path a chunk takes from the request through the lock, the stream, the digest, and the commit-or-abort decision, to the events and the response. This is the sequence the xref:storage-spi.adoc#_why_writes_are_staged[staged write] exists for.
+
+image::seq-patch.svg[PATCH sequence,align="center"]
+
+=== Parallel upload via concatenation
+
+Partials upload concurrently, then a final request names them. The merge happens under the final's lock and every partial's lock, and it is reached from both the final POST and a later HEAD, so an unfinished final completes on its own once the partials do. See xref:parallel-uploads.adoc[Parallel Uploads].
+
+image::seq-concatenation.svg[Concatenation sequence,align="center"]
+
+=== Client: resumable upload with a HEAD resync
+
+The high-level `TusClient.upload()` loop: capabilities, create, chunk PATCHes with progress, and what happens on a retryable failure. The server's offset from a HEAD is the truth the loop resumes from, with one retry budget shared across the whole upload.
+
+image::seq-client-resume.svg[Client resume sequence,align="center"]

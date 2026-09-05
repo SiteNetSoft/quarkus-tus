@@ -1,0 +1,28 @@
+@startuml c4-container
+!include <C4/C4_Container>
+title Containers — inside the Quarkus application
+
+Person(uploader, "Upload client", "Speaks TUS 1.0.0")
+Person(watcher, "Progress consumer")
+
+System_Boundary(app, "Your Quarkus application") {
+  Container(server, "quarkus-tus (server runtime)", "Quarkus REST, Vert.x, Mutiny", "Implements the TUS protocol at /tus: core, creation, termination, checksum, expiration, concatenation, defer-length. Streams request bodies to the store without buffering.")
+  Container(client, "quarkus-tus-client", "Vert.x HttpClient, Mutiny", "Optional. TusProtocolClient (one call per TUS operation) and TusClient.upload() (chunk loop, HEAD resync, retry, checksum, parallel via concatenation).")
+  Container(yourcode, "Your code", "CDI beans", "Observers of the TUS lifecycle events; optionally an UploadStore alternative that decides where bytes live.")
+  ContainerDb(local, "Local file store", "Bundled UploadStore", "Upload data files plus JSON sidecar metadata under quarkus.tus.upload-dir.")
+}
+
+System_Ext(storage, "External storage", "Your UploadStore implementation's backend, e.g. S3 multipart")
+System_Ext(downstream, "Downstream TUS server")
+
+Rel(uploader, server, "POST / HEAD / PATCH / DELETE / OPTIONS", "HTTP / TUS")
+Rel(watcher, server, "GET /tus/events/{id}, /tus/progress/{id}", "SSE / JSON")
+Rel(server, yourcode, "Fires TusUploadCreated / ChunkReceived / UploadCompleted / Terminated / ConcatenationCompleted", "CDI events")
+Rel(server, local, "stageChunk / commitChunk / abortChunk", "UploadStore SPI (default)")
+Rel(server, yourcode, "stageChunk / commitChunk / abortChunk", "UploadStore SPI (your alternative)")
+Rel(yourcode, storage, "Writes bytes", "vendor SDK, your choice")
+Rel(yourcode, client, "upload() or protocol().patch()", "Java")
+Rel(client, downstream, "Creates and PATCHes uploads", "HTTP / TUS")
+
+SHOW_LEGEND()
+@enduml

@@ -1,0 +1,57 @@
+@startuml seq-concatenation
+title Code level — parallel upload via concatenation
+skinparam sequenceMessageAlign center
+actor "Upload client" as C
+participant "TusUploadResource" as R
+participant "UploadConcatenator" as K
+participant "UploadStore" as S
+participant "UploadEvents" as E
+
+== Partials, uploaded concurrently ==
+loop for each part, in parallel
+  C -> R : POST /tus\nUpload-Concat: partial\nUpload-Length: partLength
+  R -> S : createUpload(partial)
+  R --> C : 201 Location: /tus/{p_i}
+  C -> R : PATCH /tus/{p_i} (one or more chunks)
+  R --> C : 204 Upload-Offset
+end
+
+== Final ==
+C -> R : POST /tus\nUpload-Concat: final;/tus/{p_1} /tus/{p_2} ...
+R -> S : findUploadInfo(p_i) for each
+note right of R
+  Every referenced upload must exist and be partial.
+  The final's length is the sum of the partials.
+  If a partial is still incomplete the final is
+  created "unfinished" (concatenation-unfinished).
+end note
+R -> S : createUpload(final: isFinalConcat=true, partialIds)
+S --> R : finalId
+R -> K : finalizeIfReady(finalId, finalInfo)
+K -> S : acquireLock(finalId)
+loop each partial, in order
+  K -> S : acquireLock(p_i)
+  K -> S : findUploadInfo(p_i)
+  note right of K : stop at the first partial that is\nlocked elsewhere, missing or incomplete
+end
+alt every partial locked and complete
+  K -> S : findUploadInfo(finalId)
+  note right of K : re-read under the lock: a concurrent\nHEAD may already have finalized it
+  K -> S : concatenate(finalId, partialIds)
+  S --> K : final offset == length
+  K -> S : discardUpload(p_i) for each, under the locks still held
+  K -> E : concatenationCompleted(finalId, partialIds)
+  K -> E : uploadCompleted(finalId)
+  K --> R : true
+else not ready
+  K --> R : false (nothing changed)
+end
+K -> S : releaseLock(p_i) for each, then releaseLock(finalId)
+R --> C : 201 Created\nLocation: /tus/{finalId}
+
+== Later, if the final was created unfinished ==
+C -> R : HEAD /tus/{finalId}
+R -> K : finalizeIfReady(finalId, info)
+note right of R : the same lock dance; merges now\nif the partials have since completed
+R --> C : 200 Upload-Offset, Upload-Length,\nUpload-Concat: final;...
+@enduml

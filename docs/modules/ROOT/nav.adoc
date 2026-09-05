@@ -1,4 +1,5 @@
 * xref:index.adoc[Getting Started]
+* xref:architecture.adoc[Architecture]
 * xref:configuration.adoc[Configuration Reference]
 * xref:cdi-events.adoc[CDI Lifecycle Events]
 * xref:storage-spi.adoc[Custom Storage Backends]

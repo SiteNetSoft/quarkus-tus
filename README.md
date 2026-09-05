@@ -99,10 +99,19 @@ JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 ./gradlew :integration-tests:test
 JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 ./gradlew :integration-tests:integrationTest
 ```
 
+## Architecture
+
+The extension is documented as a [C4 model](https://c4model.com/): system context, containers, the components of the server runtime, and sequence diagrams for the three flows that matter most (a PATCH through the staged write, parallel upload via concatenation, and the client's resume loop). All of it is on the [Architecture](docs/modules/ROOT/pages/architecture.adoc) page; the sources are in `docs/diagrams/` and render with `scripts/render-diagrams.sh`.
+
+![System context](docs/modules/ROOT/images/c4-context.svg)
+
+![One PATCH through the staged write](docs/modules/ROOT/images/seq-patch.svg)
+
 ## Documentation
 
 Read the [full documentation](docs/modules/ROOT/pages/index.adoc) for detailed guides on:
 
+- [Architecture](docs/modules/ROOT/pages/architecture.adoc)
 - [Configuration Reference](docs/modules/ROOT/pages/configuration.adoc)
 - [CDI Lifecycle Events](docs/modules/ROOT/pages/cdi-events.adoc)
 - [Custom Storage Backends](docs/modules/ROOT/pages/storage-spi.adoc)

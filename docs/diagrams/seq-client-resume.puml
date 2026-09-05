@@ -1,0 +1,55 @@
+@startuml seq-client-resume
+title Code level — quarkus-tus-client: resumable upload with a HEAD resync
+skinparam sequenceMessageAlign center
+participant "Your code" as U
+participant "TusClient" as H
+participant "TusProtocolClient" as P
+participant "UploadSource" as F
+participant "TUS server" as T
+
+U -> H : upload(TusUploadRequest)
+H -> P : capabilities()
+note right of H : OPTIONS result cached per client;\nrefetched after a failure
+P -> T : OPTIONS
+T --> P : Tus-Extension, Tus-Max-Size
+alt a requested feature is not advertised
+  H --> U : TusCapabilityException
+end
+H -> P : create(options)
+P -> T : POST Upload-Length, Upload-Metadata
+T --> P : 201 Location
+P --> H : TusUpload(url, offset=0)
+
+loop chunk by chunk from the current offset
+  H -> F : slice(offset)
+  F --> H : Multi<Buffer>, bounded to chunkSize
+  H -> P : patch(url, offset, chunk)
+  note right of H : one bounded buffer per chunk;\nUpload-Checksum computed over it when configured
+  P -> T : PATCH Upload-Offset, body
+  T --> P : 204 Upload-Offset
+  P --> H : new offset
+  H -> U : onProgress(bytesSent)
+end
+
+== A retryable failure (5xx, connection reset, 423) ==
+H -> P : patch(url, offset, chunk)
+P -> T : PATCH
+T --> P : 503 / connection lost
+P --> H : failure
+alt source.replayable() and attempts remain
+  H -> H : wait min(backoff·2^attempt, backoffMax)
+  H -> P : offset(url)
+  P -> T : HEAD
+  T --> P : 200 Upload-Offset: k
+  P --> H : k
+  note right of H : k is the truth; the loop resumes\nfrom k with a single shared retry budget
+  H -> F : slice(k)
+  H -> P : patch(url, k, chunk)
+else one-shot source, or budget exhausted
+  H --> U : TusClientException
+end
+
+== Completion ==
+T --> P : 204 Upload-Offset == Upload-Length
+H --> U : TusUploadResult(url, length)
+@enduml

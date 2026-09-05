@@ -1,0 +1,41 @@
+@startuml c4-component
+!include <C4/C4_Component>
+title Components — the quarkus-tus server runtime
+
+Person(uploader, "Upload client")
+Person(watcher, "Progress consumer")
+
+Container_Boundary(server, "quarkus-tus (server runtime)") {
+  Component(filters, "Request filters", "JAX-RS providers", "TusMethodOverrideFilter (X-HTTP-Method-Override), TusAuthFilter, TusRateLimitFilter (token bucket on POST/PATCH), TusResumableResponseFilter (Tus-Resumable on every response).")
+  Component(resource, "TusUploadResource", "JAX-RS resource at /tus", "HTTP only: parses and validates TUS headers, takes the upload lock, maps outcomes to status codes.")
+  Component(authorizer, "TusUploadAuthorizer", "CDI bean", "Owner check on HEAD/PATCH/DELETE and the SSE streams. Denied is 404, never 403.")
+  Component(writer, "UploadWriter", "CDI bean", "One chunk's staged write: builds the ChunkStream, digests as bytes pass, decides commit or abort.")
+  Component(concat, "UploadConcatenator", "CDI bean", "Joins partial uploads when all are complete, holding the final and every partial lock; reached from POST and HEAD.")
+  Component(events, "UploadEvents", "CDI bean", "The only place that fires lifecycle events. Also updates progress bookkeeping and the SSE stream.")
+  Component(spi, "UploadStore SPI", "Interface + BufferingUploadStore", "Records, locks, staged writes, concatenate, discard, cleanup hooks. LocalFileUploadStore is the bundled implementation.")
+  Component(sse, "SSE", "TusSseResource, TusProgressResource, TusSseService, TusSseEventBridge", "Per-upload event stream with optional hold-open; JSON progress snapshot.")
+  Component(progress, "UploadProgressService", "CDI bean", "In-memory progress entries with TTL.")
+  Component(scheduler, "UploadExpirationScheduler", "quarkus-scheduler", "Expired uploads, stale locks, stale uploads, orphan files, idle rate-limit buckets.")
+  Component(ops, "Health, metrics, Dev UI", "TusHealthCheck, TusMetricsService, TusDevUIJsonRpcService", "Optional: activated when the matching Quarkus capability is present.")
+}
+
+Rel(uploader, filters, "TUS requests", "HTTP")
+Rel(filters, resource, "")
+Rel(resource, authorizer, "isDenied(info, user)")
+Rel(resource, writer, "write(...)")
+Rel(resource, concat, "finalizeIfReady(finalId)")
+Rel(resource, events, "uploadCreated / lengthKnown / uploadCompleted / uploadTerminated")
+Rel(writer, events, "chunkReceived")
+Rel(concat, events, "concatenationCompleted")
+Rel(resource, spi, "records, acquireLock / releaseLock")
+Rel(writer, spi, "stageChunk / commitChunk / abortChunk")
+Rel(concat, spi, "concatenate, discardUpload")
+Rel(events, progress, "updates")
+Rel(events, sse, "sendProgress")
+Rel(sse, authorizer, "isDenied")
+Rel(watcher, sse, "GET events / progress", "SSE / JSON")
+Rel(scheduler, spi, "cleanup hooks")
+Rel_R(events, ops, "counters", "CDI events observed by metrics")
+
+SHOW_LEGEND()
+@enduml

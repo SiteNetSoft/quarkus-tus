@@ -1,0 +1,19 @@
+@startuml c4-context
+!include <C4/C4_Context>
+title System Context — an application built with quarkus-tus
+
+Person(uploader, "Upload client", "A browser or service speaking TUS 1.0.0 (tus-js-client, tusd-compatible tools, or the quarkus-tus client).")
+Person(watcher, "Progress consumer", "Anything watching an upload: the same browser, a dashboard.")
+
+System(app, "Your Quarkus application", "Hosts the quarkus-tus server extension at /tus and, optionally, the quarkus-tus client extension. Your code reacts to CDI lifecycle events and decides where bytes go.")
+
+System_Ext(storage, "Storage backend", "Behind the UploadStore SPI: the bundled local file store, or your own (S3, database, ...).")
+System_Ext(downstream, "Downstream TUS server", "Optional: another TUS server your application forwards uploads to through the client extension.")
+
+Rel(uploader, app, "Creates, resumes and completes uploads", "HTTP / TUS")
+Rel(watcher, app, "Follows upload progress", "SSE")
+Rel(app, storage, "Stages, commits and reads bytes", "UploadStore SPI")
+Rel(app, downstream, "Relays or re-uploads", "HTTP / TUS")
+
+SHOW_LEGEND()
+@enduml
