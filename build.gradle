@@ -49,8 +49,11 @@ subprojects {
 // The Quarkus extension descriptor generated into the runtime jar points at
 // org.sitenetsoft:quarkus-tus-deployment, so the published artifact ids must match exactly
 // or Quarkus cannot resolve the deployment module at augmentation time.
-ext.publishedArtifactIds = [runtime: 'quarkus-tus', deployment: 'quarkus-tus-deployment', tck: 'quarkus-tus-tck',
+// Bound to a script-local variable as well: closures below run in the subprojects' scope, and
+// Gradle 10 drops the implicit lookup of a parent project's extra properties.
+def publishedArtifactIds = [runtime: 'quarkus-tus', deployment: 'quarkus-tus-deployment', tck: 'quarkus-tus-tck',
                             'client-runtime': 'quarkus-tus-client', 'client-deployment': 'quarkus-tus-client-deployment']
+ext.publishedArtifactIds = publishedArtifactIds
 
 configure(subprojects.findAll { publishedArtifactIds.containsKey(it.name) }) { proj ->
     apply plugin: 'maven-publish'
