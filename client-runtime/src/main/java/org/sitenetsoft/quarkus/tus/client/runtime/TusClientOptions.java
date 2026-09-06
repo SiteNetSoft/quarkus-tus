@@ -5,8 +5,9 @@ import java.util.Optional;
 
 /**
  * Client-wide defaults for a {@link TusClient}, mirroring {@code TusClientRuntimeConfig} for
- * programmatic (non-CDI) construction. Any of these can be overridden per upload on
- * {@link TusUploadRequest}.
+ * programmatic (non-CDI) construction. Chunk size, checksum algorithm, parallelism and the progress
+ * callback can be overridden per upload on {@link TusUploadRequest}; the URL, retry policy, timeouts
+ * and customizer are per client.
  */
 public final class TusClientOptions {
 
@@ -20,10 +21,11 @@ public final class TusClientOptions {
     private final Duration connectTimeout;
     private final Duration requestTimeout;
     private final TusRequestCustomizer customizer;
+    private final TusHttpClientCustomizer httpClientOptions;
 
     private TusClientOptions(Builder builder) {
         this.url = builder.url;
-        this.chunkSize = builder.chunkSize;
+        this.chunkSize = validateChunkSize(builder.chunkSize, "chunkSize");
         this.checksumAlgorithm = builder.checksumAlgorithm;
         this.maxRetries = builder.maxRetries;
         this.retryBackoff = builder.retryBackoff;
@@ -32,10 +34,28 @@ public final class TusClientOptions {
         this.connectTimeout = builder.connectTimeout;
         this.requestTimeout = builder.requestTimeout;
         this.customizer = builder.customizer;
+        this.httpClientOptions = builder.httpClientOptions;
     }
 
     public static Builder builder(String url) {
         return new Builder(url);
+    }
+
+    /**
+     * A chunk size must be at least 1 byte (0 would never advance the chunk loop) and at most
+     * {@link Integer#MAX_VALUE} (the checksum and one-shot paths collect one chunk into a single
+     * Vert.x {@code Buffer}, which is {@code int}-indexed). {@code what} names the offending setting
+     * in the message -- the builder property or the config key.
+     */
+    static long validateChunkSize(long chunkSize, String what) {
+        if (chunkSize <= 0) {
+            throw new IllegalArgumentException(what + " must be greater than 0, was " + chunkSize);
+        }
+        if (chunkSize > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(what + " must not exceed " + Integer.MAX_VALUE
+                    + " bytes (one chunk must fit in a single buffer), was " + chunkSize);
+        }
+        return chunkSize;
     }
 
     public String url() {
@@ -78,6 +98,10 @@ public final class TusClientOptions {
         return Optional.ofNullable(customizer);
     }
 
+    public Optional<TusHttpClientCustomizer> httpClientOptions() {
+        return Optional.ofNullable(httpClientOptions);
+    }
+
     public static final class Builder {
         private final String url;
         private long chunkSize = 10485760L;
@@ -89,6 +113,7 @@ public final class TusClientOptions {
         private Duration connectTimeout;
         private Duration requestTimeout;
         private TusRequestCustomizer customizer;
+        private TusHttpClientCustomizer httpClientOptions;
 
         private Builder(String url) {
             this.url = url;
@@ -136,6 +161,15 @@ public final class TusClientOptions {
 
         public Builder customizer(TusRequestCustomizer customizer) {
             this.customizer = customizer;
+            return this;
+        }
+
+        /**
+         * Configures the Vert.x {@link io.vertx.core.http.HttpClientOptions} the client's HTTP
+         * client is built from (TLS trust, proxy, pool size, ...). See {@link TusHttpClientCustomizer}.
+         */
+        public Builder httpClientOptions(TusHttpClientCustomizer httpClientOptions) {
+            this.httpClientOptions = httpClientOptions;
             return this;
         }
 

@@ -2,64 +2,75 @@
 
 include::./includes/attributes.adoc[]
 
-Two artifacts are published; `integration-tests` is not:
+Five artifacts are published under `org.sitenetsoft`; `integration-tests` is not:
 
 [cols="2,3"]
 |===
 | Coordinates | Contents
 
-| `org.sitenetsoft:quarkus-tus`
-| Extension runtime. Consumers declare this one.
+| `quarkus-tus`
+| Server runtime. Applications that accept uploads declare this one.
 
-| `org.sitenetsoft:quarkus-tus-deployment`
-| Build-time augmentation. Resolved by Quarkus from the runtime jar's `META-INF/quarkus-extension.properties`.
+| `quarkus-tus-deployment`
+| Build-time augmentation for the server. Resolved by Quarkus from the runtime jar's `META-INF/quarkus-extension.properties`; never declared directly.
+
+| `quarkus-tus-client`
+| Client runtime (`TusProtocolClient`, `TusClient`). Independent of the server; see xref:client.adoc[TUS Client].
+
+| `quarkus-tus-client-deployment`
+| Build-time augmentation for the client. Resolved the same way; never declared directly.
+
+| `quarkus-tus-tck`
+| `AbstractUploadStoreContractTest` for authors of a custom `UploadStore`; test scope only. See xref:storage-spi.adoc#_verifying_your_store_the_contract_test[the contract test].
 |===
 
-IMPORTANT: The artifact ids must stay exactly as above. The extension descriptor generated into the
-runtime jar names `org.sitenetsoft:quarkus-tus-deployment`, and Quarkus resolves the deployment
-module from it at augmentation time. Renaming a module without updating the other breaks every
-consumer at build time, not at runtime.
+IMPORTANT: The artifact ids must stay exactly as above. Each runtime jar's descriptor names its deployment artifact, and Quarkus resolves the deployment module from it at augmentation time. Renaming a module without updating the other breaks every consumer at build time, not at runtime. The ids live in one place, the `publishedArtifactIds` map in the root `build.gradle`; the descriptors and the deployment coordinates are derived from it.
 
-== Signing
+== The release workflow
 
-Releases must be signed. The key is read from `signingKey` / `signingPassword` Gradle properties, or
-the `SIGNING_KEY` / `SIGNING_PASSWORD` environment variables — never from a file in the repository.
-Signing is skipped for `-SNAPSHOT` versions so local builds need no key.
+`.github/workflows/release.yml` publishes to the https://central.sonatype.com[Central Portal]. It runs when a `v*` tag is pushed, and can also be dispatched by hand from `master` only.
 
-[source,bash]
-----
-export SIGNING_KEY="$(gpg --armor --export-secret-keys KEY_ID)"
-export SIGNING_PASSWORD='...'
-----
+. It refuses a `-SNAPSHOT` version, and on a tag push refuses a tag that does not match the `version` in `build.gradle`. Set the version first, commit, then tag: `git tag v{project-version} && git push origin v{project-version}`.
+. It runs the full build and the integration tests, with MinIO so the S3 store suites run rather than skip.
+. It signs every jar and POM and lays the five artifacts out as a Portal bundle (`build/staging-deploy`, zipped to `build/central-bundle.zip`, also kept as a workflow artifact for 30 days).
+. It uploads the bundle and polls the Portal until the deployment is validated or fails.
+. On a tag it creates the GitHub release with generated notes.
 
-== Staging a release
+=== Secrets it needs
 
-[source,bash]
-----
-# set a release version in build.gradle first (no -SNAPSHOT)
-./gradlew :runtime:publish :deployment:publish
-----
+[cols="1,2"]
+|===
+| Secret | Purpose
 
-This writes a complete Maven layout — jar, sources, javadoc, POM and signatures — to
-`build/staging-deploy`.
+| `SIGNING_KEY`
+| ASCII-armoured private PGP key: `gpg --armor --export-secret-keys KEY_ID`. Its public half must be on a key server (`keyserver.ubuntu.com` or `keys.openpgp.org`), or Central rejects the signatures.
 
-== Uploading to Maven Central
+| `SIGNING_PASSWORD`
+| The key's passphrase.
 
-OSSRH reached end of life in June 2025 and Sonatype has no first-party Gradle plugin yet, so the
-upload is a separate step. Take the contents of `build/staging-deploy` and either:
+| `CENTRAL_USERNAME`, `CENTRAL_PASSWORD`
+| A Central Portal user token (Portal → View Account → Generate User Token), not the account password. The `org.sitenetsoft` namespace must be verified on the Portal for the token's account.
+|===
 
-* upload it as a bundle through the https://central.sonatype.com[Central Portal] UI, or
-* point https://jreleaser.org[JReleaser] at the directory, which Sonatype currently recommends for
-  Gradle projects.
+Nothing in the build stores credentials; local builds need none, since signing is skipped when no key is present and for `-SNAPSHOT` versions.
 
-Both need a Central Portal token; nothing in this build stores credentials.
+=== Publishing type
+
+A tag push uploads with `publishingType=USER_MANAGED`: the deployment stops at *validated* and nothing reaches Central until someone presses *Publish* at https://central.sonatype.com/publishing/deployments. The workflow marks this with a warning and creates the GitHub release as a **draft**, so the tag never advertises artifacts that are not downloadable; publish the draft after releasing the deployment. A manual dispatch can choose `AUTOMATIC`, which releases immediately and cannot be undone.
 
 == Checking before you publish
 
 [source,bash]
 ----
-./gradlew :runtime:publishToMavenLocal :deployment:publishToMavenLocal
+./gradlew publishToMavenLocal
 ----
 
-Then build a sample application against the local repository to confirm the extension resolves and
-augments correctly.
+This writes all five artifacts to `~/.m2/repository/org/sitenetsoft/`. Then build a sample application against the local repository, declaring only `org.sitenetsoft:quarkus-tus:{project-version}` (and the client if you use it), to confirm the extension resolves, augments, and that your code compiles against the SPI. That is the check that catches an artifact id or descriptor mistake before a consumer does.
+
+To inspect the exact bundle the workflow would upload, without credentials:
+
+[source,bash]
+----
+./gradlew publishAllPublicationsToStagingRepository
+find build/staging-deploy -type f | sort
+----

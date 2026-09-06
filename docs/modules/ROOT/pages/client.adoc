@@ -95,7 +95,7 @@ Uni<TusUploadResult> upload(Path file) {
 
 `TusUploadResult` carries the final `url()` and `bytesUploaded()`. If nothing configures `quarkus.tus.client.url`, or more than one `TusRequestCustomizer` bean is present, the injected `TusClient` is a shim that boots cleanly but fails on first use with a `TusClientException` naming the problem -- there's no silent no-op.
 
-Outside CDI, build one directly with `TusClient.create(vertx, TusClientOptions.builder(url)...build())`; `TusClientOptions` mirrors every `quarkus.tus.client.*` property for programmatic construction and can override any of them per-request on `TusUploadRequest`.
+Outside CDI, build one directly with `TusClient.create(vertx, TusClientOptions.builder(url)...build())`; `TusClientOptions` mirrors every `quarkus.tus.client.*` property for programmatic construction. Of those, only the chunk size, checksum algorithm and parallelism can be overridden per request on `TusUploadRequest` (which also takes the per-upload metadata and an `onProgress` callback); the URL, retry policy, timeouts and customizers are fixed per client.
 
 === Low-level: `TusProtocolClient`
 
@@ -217,9 +217,83 @@ public class BearerTokenCustomizer implements TusRequestCustomizer {
 
 Only one `TusRequestCustomizer` bean may be present when using CDI injection; a second one makes the injected `TusClient` an unavailable shim (see above) rather than picking one arbitrarily. Building `TusClientOptions` programmatically sidesteps that ambiguity entirely, since the customizer is passed explicitly.
 
+== TLS, Proxies and the HTTP Client: `TusHttpClientCustomizer`
+
+`TusRequestCustomizer` only touches headers. Anything that lives on the underlying Vert.x `HttpClient` -- trusting a private CA, going through an egress proxy, sizing the connection pool -- goes through `TusHttpClientCustomizer`, which is handed the `HttpClientOptions` the client is built from, once, at client creation.
+
+[source,java]
+----
+import io.vertx.core.http.HttpClientOptions;
+import io.vertx.core.net.PemTrustOptions;
+import io.vertx.core.net.ProxyOptions;
+import jakarta.enterprise.context.ApplicationScoped;
+import org.sitenetsoft.quarkus.tus.client.runtime.TusHttpClientCustomizer;
+
+@ApplicationScoped
+public class PrivateCaAndProxy implements TusHttpClientCustomizer {
+
+    @Override
+    public void customize(HttpClientOptions options) {
+        options.setTrustOptions(new PemTrustOptions().addCertPath("/etc/ssl/private-ca.pem"));
+        options.setProxyOptions(new ProxyOptions().setHost("egress.internal").setPort(3128));
+    }
+}
+----
+
+Programmatically: `TusClientOptions.builder(url).httpClientOptions(options -> ...)`. The configured `connect-timeout` is applied before the hook runs, so the hook can override it. As with `TusRequestCustomizer`, exactly one bean may be present under CDI.
+
+== Errors and Retries
+
+Failures surface as subclasses of `TusClientException`, mapped from the server's status:
+
+[cols="1,2,1"]
+|===
+| Status | Exception | Retried?
+
+| 404 / 410
+| `TusUploadNotFoundException` (`knownExpired()` is true for a 410)
+| No
+
+| 409
+| `TusOffsetMismatchException`
+| Yes
+
+| 412
+| `TusVersionMismatchException`
+| No
+
+| 413
+| `TusPayloadTooLargeException`
+| No
+
+| 423
+| `TusUploadLockedException` -- the server still holds the upload's lock, typically from a PATCH whose connection dropped
+| Yes
+
+| 460
+| `TusChecksumMismatchException`
+| Yes
+
+| 5xx
+| `TusServerErrorException` (`status()` carries the code)
+| Yes
+
+| anything else
+| `TusProtocolException`
+| No
+|===
+
+A failure that isn't a `TusClientException` at all (a reset connection, a timeout) is treated as I/O-level and retried too. A missing capability is a `TusCapabilityException` naming the extension, thrown before any upload request goes out.
+
+A retry waits `min(retry-backoff × 2^n, retry-backoff-max)`, re-reads the server's offset with a HEAD, and resumes from there. The HEAD is under the same budget: if it fails retryably as well, that counts as one more consecutive failure and is backed off and re-issued. `max-retries` bounds *consecutive* failures -- a successful chunk resets the count -- so a long upload that hits an occasional transient error keeps going. Retry needs a replayable source; see <<One-shot Degradation>>.
+
+Cancelling the returned `Uni` stops the loop: no further PATCH is issued and the source is released. The PATCH already on the wire is not aborted -- a cancelled Mutiny `Uni` over the Vert.x client only stops listening for the response -- so the server may still apply that one chunk. The upload URL is left for the server's expiration to reclaim (or `tusClient.protocol().terminate(url)` to remove now).
+
 == Configuration
 
-All client configuration is under the `quarkus.tus.client` prefix, and every property is a runtime property (overridable via `application.properties`, environment variables, or system properties) and can also be overridden per-request via `TusUploadRequest` or programmatically via `TusClientOptions`.
+All client configuration is under the `quarkus.tus.client` prefix, and every property is a runtime property (overridable via `application.properties`, environment variables, or system properties). Every one of them has a counterpart on `TusClientOptions` for programmatic construction; only `chunk-size`, `checksum-algorithm` and `parallelism` can additionally be overridden per request on `TusUploadRequest`.
+
+**Memory:** one chunk is held in memory per in-flight PATCH -- the checksum path collects it to digest it, and the plain path holds at most that much in the request pipeline -- so the heap footprint of an upload is roughly `parallelism × chunk-size`. A 10 MB chunk with `parallelism=4` is about 40 MB.
 
 [cols="3,1,1,3"]
 |===
@@ -233,7 +307,7 @@ All client configuration is under the `quarkus.tus.client` prefix, and every pro
 | `quarkus.tus.client.chunk-size`
 | `long`
 | `10485760` (10 MB)
-| Size, in bytes, of each PATCH the client sends.
+| Size, in bytes, of each PATCH the client sends. Must be between 1 and `Integer.MAX_VALUE`; anything else fails at boot (or at build time for `TusClientOptions`/`TusUploadRequest`).
 
 | `quarkus.tus.client.checksum-algorithm`
 | `String`
@@ -268,5 +342,5 @@ All client configuration is under the `quarkus.tus.client` prefix, and every pro
 | `quarkus.tus.client.request-timeout`
 | `Duration`
 | _(none)_
-| Per-request timeout. Unset means no explicit timeout beyond the underlying HTTP client's default.
+| Per-request timeout, applied as the Vert.x `RequestOptions` timeout. It spans the whole request, including sending a full chunk body, so it must comfortably exceed `chunk-size ÷ available bandwidth` -- a 10 MB chunk over a 10 Mbit/s link needs more than 8 s -- or every chunk times out and is retried until the budget runs out. Unset means no explicit timeout beyond the underlying HTTP client's default.
 |===

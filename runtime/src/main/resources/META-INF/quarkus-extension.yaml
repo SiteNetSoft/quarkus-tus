@@ -1,0 +1,14 @@
+name: "TUS resumable uploads"
+description: "Server for the tus 1.0.0 resumable-upload protocol: creation, termination, checksum, expiration, concatenation and defer-length, streaming bodies straight to a pluggable UploadStore"
+artifactId: "quarkus-tus"
+metadata:
+  keywords:
+    - "tus"
+    - "upload"
+    - "resumable"
+    - "file-upload"
+    - "streaming"
+  categories:
+    - "web"
+  status: "preview"
+  guide: "https://sitenetsoft.org/quarkus-tus/"

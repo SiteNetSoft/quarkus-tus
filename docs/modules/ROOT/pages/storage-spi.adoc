@@ -95,7 +95,7 @@ Every one of these rules is an assertion in the contract test below.
 
 == Implementing a Custom Backend
 
-Create a CDI bean annotated with `@Alternative` and `@Priority` to override `LocalFileUploadStore`. `@Priority` enables the alternative globally -- use it for production replacements. For test-only alternatives, omit `@Priority` and enable it via `QuarkusTestProfile.getEnabledAlternatives()` (see xref:testing.adoc[Testing]).
+Provide a CDI bean implementing `UploadStore`. `LocalFileUploadStore` is a `@DefaultBean`, so a plain `@ApplicationScoped` implementation replaces it by merely existing -- no `@Alternative` or `@Priority` is needed for a production replacement, though both still work as before. For test-only stores that must not replace the bundled one in every test, annotate the bean `@Alternative` (without `@Priority`) and enable it per test via `QuarkusTestProfile.getEnabledAlternatives()` (see xref:testing.adoc[Testing]).
 
 === The easy way: `BufferingUploadStore`
 
@@ -104,8 +104,6 @@ If your backend appends whole byte arrays and you do not mind holding one chunk 
 [source,java]
 ----
 @ApplicationScoped
-@Alternative
-@Priority(1)
 public class MyStore extends BufferingUploadStore {
 
     private final Map<String, UploadInfo> records = new ConcurrentHashMap<>();
@@ -135,8 +133,6 @@ A complete, working version of this sketch — `S3UploadStore` in the extension'
 [source,java]
 ----
 @ApplicationScoped
-@Alternative
-@Priority(1)
 public class S3UploadStore implements UploadStore {
 
     @Inject S3AsyncClient s3;   // your dependency, not the extension's

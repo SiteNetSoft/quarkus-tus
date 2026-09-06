@@ -23,6 +23,10 @@ class TusDevUIProcessor {
         return card;
     }
 
+    /**
+     * Dev UI registers the provider class as an unremovable bean itself, so this is the only
+     * registration {@code TusDevUIJsonRpcService} needs — and it exists in dev mode only.
+     */
     @BuildStep(onlyIf = IsDevelopment.class)
     JsonRPCProvidersBuildItem registerJsonRpc() {
         return new JsonRPCProvidersBuildItem(TusDevUIJsonRpcService.class);

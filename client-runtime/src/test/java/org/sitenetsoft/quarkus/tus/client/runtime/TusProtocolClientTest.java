@@ -62,6 +62,15 @@ class TusProtocolClientTest {
     }
 
     @Test
+    void optionsAccepts200AsWellAs204() {
+        // The spec allows either 200 or 204 for OPTIONS, and tusd answers 200.
+        server.enqueue(ScriptedTusServer.Canned.of(200, Map.of(
+                "Tus-Resumable", "1.0.0", "Tus-Version", "1.0.0", "Tus-Extension", "creation,termination")));
+        var caps = client.options().await().atMost(TIMEOUT);
+        assertTrue(caps.supports("termination"));
+    }
+
+    @Test
     void createSendsLengthAndMetadataAndResolvesRelativeLocation() {
         server.enqueue(ScriptedTusServer.Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/abc123")));
         var upload = client.create(TusCreateOptions.builder().length(42)
@@ -170,11 +179,31 @@ class TusProtocolClientTest {
         assertNull(sent.headers().get("Upload-Length")); // spec: final creation has no Upload-Length
     }
 
+    @Test
+    void httpClientOptionsHookConfiguresTheUnderlyingVertxClient() {
+        // The hook is what lets a deployment behind a private CA or an egress proxy configure TLS
+        // trust or a proxy on the Vert.x HttpClient. Observable end to end via a setting that
+        // changes the wire: decompression support makes Vert.x send Accept-Encoding.
+        client.close();
+        var seen = new java.util.concurrent.atomic.AtomicReference<io.vertx.core.http.HttpClientOptions>();
+        client = new TusProtocolClient(vertx, TusTarget.builder(server.url())
+                .httpClientOptions(opts -> {
+                    seen.set(opts);
+                    opts.setDecompressionSupported(true);
+                })
+                .build());
+        server.enqueue(ScriptedTusServer.Canned.of(200, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "0")));
+        client.offset(server.url() + "/abc").await().atMost(TIMEOUT);
+        assertTrue(seen.get() != null, "the hook must be handed the HttpClientOptions the client is built from");
+        assertTrue(server.recorded().getFirst().headers().contains("Accept-Encoding"),
+                "a setting made through the hook must reach the wire");
+    }
+
     /** Every row of the mapping table, exercised through a real HTTP exchange. */
     @ParameterizedTest
     @CsvSource({"404,TusUploadNotFoundException", "410,TusUploadNotFoundException",
             "412,TusVersionMismatchException", "413,TusPayloadTooLargeException",
-            "460,TusChecksumMismatchException", "500,TusServerErrorException",
+            "423,TusUploadLockedException", "460,TusChecksumMismatchException", "500,TusServerErrorException",
             "503,TusServerErrorException"})
     void errorStatusesAreTyped(int status, String exceptionSimpleName) {
         server.enqueue(ScriptedTusServer.Canned.of(status, Map.of("Tus-Resumable", "1.0.0")));

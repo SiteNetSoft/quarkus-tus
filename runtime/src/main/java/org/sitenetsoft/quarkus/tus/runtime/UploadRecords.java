@@ -9,7 +9,8 @@ import java.util.List;
 /**
  * Builds the {@link UploadInfo} records the framework hands to the store. Everything a record
  * says about the protocol — length, expiry, ownership, concatenation — is decided here, so a
- * store never has to.
+ * store never has to. An {@code expirationHours} of zero means the upload never expires: no
+ * deadline is recorded, so nothing enforces one.
  */
 final class UploadRecords {
 
@@ -27,7 +28,7 @@ final class UploadRecords {
         info.setUploaderId(uploaderId);
         Instant now = Instant.now();
         info.setLastActivity(now);
-        info.setExpiresAt(now.plus(expirationHours, ChronoUnit.HOURS));
+        info.setExpiresAt(expirationHours > 0 ? now.plus(expirationHours, ChronoUnit.HOURS) : null);
         return info;
     }
 
@@ -50,7 +51,7 @@ final class UploadRecords {
         info.setUploaderId(uploaderId);
         Instant now = Instant.now();
         info.setLastActivity(now);
-        info.setExpiresAt(now.plus(expirationHours, ChronoUnit.HOURS));
+        info.setExpiresAt(expirationHours > 0 ? now.plus(expirationHours, ChronoUnit.HOURS) : null);
         return info;
     }
 }

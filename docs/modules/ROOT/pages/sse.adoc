@@ -77,17 +77,15 @@ Opens an SSE connection that streams `upload-progress` events as chunks are writ
 curl http://localhost:8080/tus/progress/550e8400-e29b-41d4-a716-446655440000
 ----
 
-.Response
+Each `upload-progress` event carries the bytes stored so far, the declared size and the integer percentage:
+
+.Event payload
 [source,json]
 ----
-{
-    "uploadId": "550e8400-e29b-41d4-a716-446655440000",
-    "bytesUploaded": 524288,
-    "totalBytes": 1048576,
-    "percentComplete": 50.0,
-    "status": "uploading"
-}
+{"percentage": 50, "uploadedBytes": 524288, "totalBytes": 1048576}
 ----
+
+A subscriber that connects mid-upload receives the current state at once. The stream closes when the upload completes (after the 100% event) or is discarded.
 
 == SSE Event Types
 

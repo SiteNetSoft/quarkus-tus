@@ -38,11 +38,14 @@ public class TusProtocolClient {
         this.target = target;
         HttpClientOptions options = new HttpClientOptions();
         target.connectTimeout().ifPresent(d -> options.setConnectTimeout((int) d.toMillis()));
+        // Last, so the hook can override anything set above.
+        target.httpClientOptions().ifPresent(hook -> hook.customize(options));
         this.httpClient = Vertx.newInstance(vertx).createHttpClient(options);
     }
 
     public Uni<TusServerCapabilities> options() {
-        return request(HttpMethod.OPTIONS, target.url(), MultiMap.caseInsensitiveMultiMap(), null, -1, Set.of(204))
+        // The spec allows a 200 or a 204 for OPTIONS; tusd answers 200, this project's server 204.
+        return request(HttpMethod.OPTIONS, target.url(), MultiMap.caseInsensitiveMultiMap(), null, -1, Set.of(200, 204))
                 .map(this::toCapabilities);
     }
 

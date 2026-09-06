@@ -181,6 +181,20 @@ public class TusSseService {
         }
     }
 
+    /**
+     * The upload is gone. A stream held open past a completion that already happened has a
+     * consumer still working and a backstop already armed, so it is theirs to finish; any
+     * other stream for this upload has nobody left to write to it and is closed now — a hold
+     * placed on an upload that never completed included, since no backstop ever covers it.
+     */
+    public void onUploadDiscarded(String uploadId) {
+        if (uploadId == null) return;
+        if (heldOpen.contains(uploadId) && backstopTimers.containsKey(uploadId)) {
+            return;
+        }
+        unregisterUpload(uploadId);
+    }
+
     public void unregisterUpload(String uploadId) {
         if (uploadId == null) return;
         heldOpen.remove(uploadId);

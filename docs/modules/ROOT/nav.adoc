@@ -8,3 +8,4 @@
 * xref:parallel-uploads.adoc[Parallel Uploads]
 * xref:client.adoc[TUS Client]
 * xref:testing.adoc[Testing]
+* xref:releasing.adoc[Releasing]

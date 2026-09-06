@@ -1,13 +1,16 @@
 plugins {
     id 'io.quarkus.extension'
+    // Consumers compile against the SPI (Uni, Multi<Buffer>) and the CDI annotations, so the
+    // Quarkus dependencies must reach them at compile scope, as every upstream extension does.
+    id 'java-library'
 }
 
 dependencies {
     implementation enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
-    implementation 'io.quarkus:quarkus-arc'
-    implementation 'io.quarkus:quarkus-rest'
-    implementation 'io.quarkus:quarkus-scheduler'
-    implementation 'io.quarkus:quarkus-vertx'
+    api 'io.quarkus:quarkus-arc'
+    api 'io.quarkus:quarkus-rest'
+    api 'io.quarkus:quarkus-scheduler'
+    api 'io.quarkus:quarkus-vertx'
 
     compileOnly 'io.quarkus:quarkus-micrometer'
     compileOnly 'io.quarkus:quarkus-smallrye-health'

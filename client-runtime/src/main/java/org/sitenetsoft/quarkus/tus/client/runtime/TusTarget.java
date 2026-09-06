@@ -13,12 +13,14 @@ public final class TusTarget {
     private final Duration connectTimeout;
     private final Duration requestTimeout;
     private final TusRequestCustomizer customizer;
+    private final TusHttpClientCustomizer httpClientOptions;
 
     private TusTarget(Builder builder) {
         this.url = builder.url;
         this.connectTimeout = builder.connectTimeout;
         this.requestTimeout = builder.requestTimeout;
         this.customizer = builder.customizer;
+        this.httpClientOptions = builder.httpClientOptions;
     }
 
     public static Builder builder(String url) {
@@ -41,11 +43,16 @@ public final class TusTarget {
         return Optional.ofNullable(customizer);
     }
 
+    public Optional<TusHttpClientCustomizer> httpClientOptions() {
+        return Optional.ofNullable(httpClientOptions);
+    }
+
     public static final class Builder {
         private final String url;
         private Duration connectTimeout;
         private Duration requestTimeout;
         private TusRequestCustomizer customizer;
+        private TusHttpClientCustomizer httpClientOptions;
 
         private Builder(String url) {
             this.url = url;
@@ -63,6 +70,11 @@ public final class TusTarget {
 
         public Builder customizer(TusRequestCustomizer customizer) {
             this.customizer = customizer;
+            return this;
+        }
+
+        public Builder httpClientOptions(TusHttpClientCustomizer httpClientOptions) {
+            this.httpClientOptions = httpClientOptions;
             return this;
         }
 

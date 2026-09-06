@@ -75,9 +75,9 @@ public interface UploadStore {
 
     /**
      * Replaces the persisted record for {@code id}. The framework calls this after changing a
-     * protocol attribute of the record it obtained from {@link #findUploadInfo} — the uploader
-     * being set after creation, a deferred length becoming known. It is not used to advance the
-     * offset; {@link #commitChunk} does that.
+     * protocol attribute of the record it obtained from {@link #findUploadInfo} — today only a
+     * deferred length becoming known. It is not used to advance the offset;
+     * {@link #commitChunk} does that.
      * <p>
      * A no-op if the upload does not exist.
      */

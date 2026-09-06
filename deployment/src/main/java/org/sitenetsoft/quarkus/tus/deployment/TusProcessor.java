@@ -22,7 +22,6 @@ import org.sitenetsoft.quarkus.tus.runtime.auth.TusAuthFilter;
 import org.sitenetsoft.quarkus.tus.runtime.config.TusBuildTimeConfig;
 import org.sitenetsoft.quarkus.tus.runtime.ratelimit.TusRateLimitFilter;
 import org.sitenetsoft.quarkus.tus.runtime.ratelimit.TusRateLimitService;
-import org.sitenetsoft.quarkus.tus.runtime.devui.TusDevUIJsonRpcService;
 import org.sitenetsoft.quarkus.tus.runtime.health.TusHealthCheck;
 import org.sitenetsoft.quarkus.tus.runtime.metrics.TusMetricsService;
 import org.sitenetsoft.quarkus.tus.runtime.sse.TusProgressResource;
@@ -125,7 +124,6 @@ class TusProcessor {
                         LocalFileUploadStore.class,
                         UploadProgressService.class,
                         UploadExpirationScheduler.class,
-                        TusDevUIJsonRpcService.class,
                         TusRateLimitService.class
                 )
                 .build();

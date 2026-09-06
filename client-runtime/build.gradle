@@ -1,5 +1,8 @@
 plugins {
     id 'io.quarkus.extension'
+    // TusClient's public API exposes Vert.x, Mutiny-Vert.x and CDI types; consumers need them at
+    // compile scope.
+    id 'java-library'
 }
 
 quarkusExtension {
@@ -9,9 +12,9 @@ quarkusExtension {
 
 dependencies {
     implementation enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
-    implementation 'io.quarkus:quarkus-arc'
-    implementation 'io.quarkus:quarkus-vertx'
-    implementation 'io.smallrye.reactive:smallrye-mutiny-vertx-core'
+    api 'io.quarkus:quarkus-arc'
+    api 'io.quarkus:quarkus-vertx'
+    api 'io.smallrye.reactive:smallrye-mutiny-vertx-core'
 
     annotationProcessor enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
     annotationProcessor 'io.quarkus:quarkus-extension-processor'

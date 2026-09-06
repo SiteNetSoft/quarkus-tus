@@ -22,6 +22,9 @@ public class UploadExpirationScheduler {
     UploadProgressService uploadProgressService;
 
     @Inject
+    UploadEvents events;
+
+    @Inject
     TusRateLimitService rateLimitService;
 
     @Inject
@@ -34,7 +37,7 @@ public class UploadExpirationScheduler {
     public void cleanupExpiredUploads() {
         LOG.debug("Running scheduled cleanup of expired uploads");
         List<String> cleaned = uploadStore.cleanupExpiredUploads().await().atMost(CLEANUP_TIMEOUT);
-        cleaned.forEach(uploadProgressService::finishUpload);
+        cleaned.forEach(events::uploadDiscarded);
         if (!cleaned.isEmpty()) {
             LOG.infof("Scheduled cleanup removed %d expired uploads", cleaned.size());
         }
@@ -60,7 +63,7 @@ public class UploadExpirationScheduler {
         long staleHours = tusRuntimeConfig.staleUploadHours();
         if (staleHours > 0) {
             List<String> cleaned = uploadStore.cleanupStaleUploads(staleHours).await().atMost(CLEANUP_TIMEOUT);
-            cleaned.forEach(uploadProgressService::finishUpload);
+            cleaned.forEach(events::uploadDiscarded);
             if (!cleaned.isEmpty()) {
                 LOG.infof("Scheduled cleanup removed %d stale uploads", cleaned.size());
             }

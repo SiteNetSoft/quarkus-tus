@@ -9,7 +9,9 @@ import org.sitenetsoft.quarkus.tus.client.runtime.error.TusCapabilityException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusChecksumMismatchException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusOffsetMismatchException;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusProtocolException;
 import org.sitenetsoft.quarkus.tus.client.runtime.error.TusServerErrorException;
+import org.sitenetsoft.quarkus.tus.client.runtime.error.TusUploadLockedException;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusServerCapabilities;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUpload;
 import org.sitenetsoft.quarkus.tus.client.runtime.model.TusUploadProgress;
@@ -35,27 +37,33 @@ import java.util.function.Consumer;
  * High-level TUS client: capability discovery, creation, and the chunked upload loop, on top of the
  * low-level {@link TusProtocolClient}.
  *
- * <p><strong>Scope (Task 7):</strong> the sequential happy path — one chunk after another, in order,
- * over a single connection. Checksum digesting, defer-length and parallel upload are later tasks;
- * requesting them here fails fast with {@link UnsupportedOperationException} rather than silently
- * ignoring the option.
+ * <p>Covers the sequential chunk loop, checksum digesting ({@code Upload-Checksum} per chunk),
+ * defer-length and one-shot sources (a paced, single-pass drain), and parallel upload via the
+ * concatenation extension. Anything the server or the source can't support is rejected eagerly with
+ * a typed {@link TusClientException} before any request goes out, never silently downgraded.
  *
- * <p><strong>Retry/resume (Task 8):</strong> a chunk PATCH that fails with a retryable error — a 5xx
+ * <p><strong>Retry/resume:</strong> a chunk PATCH that fails with a retryable error — a 5xx
  * ({@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusServerErrorException}), a 409 offset
  * conflict ({@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusOffsetMismatchException}), a
- * 460 checksum mismatch
+ * 423 lock still held ({@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusUploadLockedException}),
+ * a 460 checksum mismatch
  * ({@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusChecksumMismatchException}), or any
  * failure that isn't a {@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException} at
  * all (treated as an I/O-level failure, e.g. a reset connection) — is retried, provided the source is
  * {@link UploadSource#replayable()}: the loop waits {@code min(retryBackoff * 2^attempt,
  * retryBackoffMax)} (via {@code Uni.onItem().delayIt()}, never a blocking sleep), re-resolves the true
  * offset with a HEAD ({@link TusProtocolClient#offset(String)}), and resumes the chunk loop from
- * there. Every other {@code TusClientException} (4xx client errors like 413, protocol errors, etc.)
- * fails fast with no retry. A retryable failure against a non-replayable source fails immediately with
- * a message naming that. Attempts are consecutive-failure counters: a successful chunk resets the
- * counter to zero, so {@code maxRetries} bounds a run of consecutive failures, not the whole upload.
- * The initial {@code create()} call itself is not retried by this loop — a failure there propagates
- * as-is.
+ * there. The resync HEAD is under the same budget: if it fails retryably too, that counts as one more
+ * consecutive failure and is backed off and re-issued. Every other {@code TusClientException} (4xx
+ * client errors like 413, protocol errors, etc.) fails fast with no retry. A retryable failure against
+ * a non-replayable source fails immediately with a message naming that. Attempts are
+ * consecutive-failure counters: a successful chunk resets the counter to zero, so {@code maxRetries}
+ * bounds a run of consecutive failures, not the whole upload. The initial {@code create()} call itself
+ * is not retried by this loop — a failure there propagates as-is.
+ *
+ * <p><strong>Memory:</strong> one chunk is held in memory per in-flight PATCH (the checksum path
+ * collects it to digest it; the plain path holds at most that much in the request pipeline), so the
+ * heap footprint is roughly {@code parallelism × chunkSize}.
  */
 public class TusClient {
 
@@ -105,6 +113,7 @@ public class TusClient {
         options.connectTimeout().ifPresent(targetBuilder::connectTimeout);
         options.requestTimeout().ifPresent(targetBuilder::requestTimeout);
         options.customizer().ifPresent(targetBuilder::customizer);
+        options.httpClientOptions().ifPresent(targetBuilder::httpClientOptions);
         TusProtocolClient protocol = new TusProtocolClient(vertx, targetBuilder.build());
         return new TusClient(options, protocol);
     }
@@ -158,7 +167,7 @@ public class TusClient {
         if (checksumAlgorithm != null) {
             if (!source.replayable()) {
                 // Checksumming re-reads the chunk to digest it before sending, and a mismatch is
-                // retried by re-sending the same chunk (Task 8) -- neither is possible against a
+                // retried by re-sending the same chunk -- neither is possible against a
                 // source that can only be consumed once. Fail fast, synchronously, before any request
                 // goes out, rather than discovering this mid-upload.
                 throw new TusClientException(
@@ -272,10 +281,14 @@ public class TusClient {
      * partials' URLs in their original range order regardless of which one finished uploading first.
      *
      * <p><strong>Fail-fast:</strong> {@code merge} propagates the first partial's failure as soon as
-     * it occurs and cancels every other still-in-flight partial's {@code Uni} (each of which cancels
-     * its own in-progress HTTP request in turn) rather than waiting for the remaining partials to
-     * finish first -- one partial exhausting its retry budget ends the whole parallel upload promptly
-     * instead of after every sibling partial has also run to completion or exhaustion.
+     * it occurs and cancels every other still-in-flight partial's {@code Uni} rather than waiting for
+     * the remaining partials to finish first -- one partial exhausting its retry budget ends the whole
+     * parallel upload promptly instead of after every sibling partial has also run to completion or
+     * exhaustion. Cancelling a partial stops its chunk loop (no further PATCH is issued and the source
+     * slice feeding the current one is cancelled), but it does <em>not</em> reset the Vert.x request
+     * already on the wire: a cancelled Mutiny {@code Uni} over {@code httpClient.request()} simply
+     * stops listening for the response, so the in-flight PATCH may still complete on the server. The
+     * partial's URL is left for the server's expiration to reclaim.
      */
     private Uni<TusUploadResult> uploadParallel(UploadSource source, long length, int parallelism, long chunkSize,
             Map<String, String> metadata, Consumer<TusUploadProgress> onProgress, String checksumAlgorithm) {
@@ -417,12 +430,9 @@ public class TusClient {
      *
      * <p>This is the single retry-budget entry point: it wraps one "attempt" — a run of
      * {@link #uploadChunks} over the whole remaining range — in exactly one failure handler per
-     * attempt, sharing a single mutable {@code attempt} counter across every retry. That single
-     * shared counter is the fix for the bug where a per-chunk-recursion-frame retry handler let a
-     * failure from a later chunk re-enter every earlier chunk's already-succeeded frame, each with
-     * its own fresh budget — multiplying the effective retry count by the number of chunks that had
-     * already succeeded. {@code uploadChunks} itself carries no failure handler of its own: a chunk
-     * failure propagates straight up through every earlier chunk's {@code flatMap} to this one
+     * attempt, sharing a single mutable {@code attempt} counter across every retry, so the budget
+     * is scoped to the whole range rather than to any one chunk. {@code uploadChunks} itself carries
+     * no failure handler of its own: a chunk failure propagates straight out of the loop to this one
      * recovery point, undecorated, no matter how many chunks preceded it.
      */
     private Uni<Long> uploadRange(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
@@ -436,7 +446,7 @@ public class TusClient {
      * retryably, hand off to {@link #retryFromOffset}. {@code confirmedOffset} and {@code attempt}
      * are shared, mutable, and updated in place by {@link #uploadChunks} as chunks succeed — they are
      * NOT re-created per attempt, which is what keeps the retry budget scoped to the whole upload
-     * rather than to whichever recursion frame happens to catch the failure.
+     * rather than to any single chunk.
      */
     private Uni<Long> attemptFromOffset(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
             Consumer<TusUploadProgress> onProgress, AtomicLong confirmedOffset,
@@ -448,12 +458,18 @@ public class TusClient {
     }
 
     /**
-     * Uploads {@code [from, to)} one {@code chunkSize} slice at a time, as a recursive {@code Uni}
-     * chain with NO failure handler attached anywhere in the recursion — a failure on any chunk
-     * propagates, undecorated, straight up to whichever single caller attached a handler (that's
-     * {@link #attemptFromOffset}, exactly once per attempt). Kept range-capable (rather than always
-     * starting at 0 and always running to the source's full length) so Task 11's partial-upload
-     * concatenation can reuse it for an arbitrary sub-range.
+     * Uploads {@code [from, to)} one {@code chunkSize} slice at a time, as an <em>iterative</em>
+     * repetition ({@code Multi.createBy().repeating()}) with NO failure handler attached anywhere —
+     * a failure on any chunk propagates, undecorated, straight out to whichever single caller attached
+     * a handler (that's {@link #attemptFromOffset}, exactly once per attempt).
+     *
+     * <p>Iterative on purpose: an earlier version chained one nested {@code flatMap} per chunk, so
+     * completing chunk N unwound through N frames. Past roughly ten thousand chunks that overflowed
+     * the stack — and on a Vert.x event loop a {@code StackOverflowError} is swallowed, so the
+     * {@code Uni} simply never completed. The repetition runs every chunk through the same shallow
+     * operator chain, so stack depth is constant regardless of chunk count. Kept range-capable
+     * (rather than always starting at 0 and running to the source's full length) so the parallel
+     * path can drive one partial's sub-range with it unchanged.
      */
     private Uni<Long> uploadChunks(TusUpload upload, UploadSource source, long from, long to, long chunkSize,
             Consumer<TusUploadProgress> onProgress, AtomicLong confirmedOffset,
@@ -461,26 +477,43 @@ public class TusClient {
         if (from >= to) {
             return Uni.createFrom().item(from);
         }
-        long end = Math.min(from + chunkSize, to);
-        long len = end - from;
-        Multi<Buffer> limited = BufferLimiter.limit(source.slice(from), len);
-
-        Uni<Long> patchCall = checksumAlgorithm == null
-                ? protocol.patch(upload.url(), from, limited, TusPatchOptions.builder().contentLength(len).build())
-                : digestAndPatch(upload, from, len, limited, checksumAlgorithm);
-
-        return patchCall
-                .invoke(newOffset -> {
-                    reportProgress(onProgress, newOffset, to);
-                    confirmedOffset.set(newOffset);
-                    // A successful chunk resets the attempt counter: only *consecutive* failures
-                    // count against maxRetries, so a long upload that hits one transient error every
-                    // so often keeps making progress instead of eventually exhausting its retry
-                    // budget on unrelated, already-recovered-from failures.
-                    attempt.set(0);
+        return Multi.createBy().repeating()
+                .uni(() -> new AtomicLong(from), cursor -> {
+                    long start = cursor.get();
+                    return sendChunk(upload, source, start, to, chunkSize, checksumAlgorithm)
+                            .invoke(newOffset -> {
+                                if (newOffset <= start) {
+                                    // A server that acknowledges a chunk without advancing would
+                                    // otherwise spin this loop forever re-sending the same bytes.
+                                    throw new TusProtocolException("Server did not advance Upload-Offset past "
+                                            + start + " (answered " + newOffset + ")");
+                                }
+                                cursor.set(newOffset);
+                                reportProgress(onProgress, newOffset, to);
+                                confirmedOffset.set(newOffset);
+                                // A successful chunk resets the attempt counter: only *consecutive*
+                                // failures count against maxRetries, so a long upload that hits one
+                                // transient error every so often keeps making progress instead of
+                                // eventually exhausting its retry budget on unrelated,
+                                // already-recovered-from failures.
+                                attempt.set(0);
+                            });
                 })
-                .flatMap(newOffset -> uploadChunks(upload, source, newOffset, to, chunkSize, onProgress,
-                        confirmedOffset, attempt, checksumAlgorithm));
+                // whilst() emits the item and then tests it, so the final offset (>= to) is emitted
+                // and ends the repetition; collect().last() is exactly that final offset.
+                .whilst(newOffset -> newOffset < to)
+                .collect().last();
+    }
+
+    /** One chunk's PATCH: {@code [start, min(start + chunkSize, to))} of {@code source}. */
+    private Uni<Long> sendChunk(TusUpload upload, UploadSource source, long start, long to, long chunkSize,
+            String checksumAlgorithm) {
+        long end = Math.min(start + chunkSize, to);
+        long len = end - start;
+        Multi<Buffer> limited = BufferLimiter.limit(source.slice(start), len);
+        return checksumAlgorithm == null
+                ? protocol.patch(upload.url(), start, limited, TusPatchOptions.builder().contentLength(len).build())
+                : digestAndPatch(upload, start, len, limited, checksumAlgorithm);
     }
 
     /**
@@ -522,7 +555,7 @@ public class TusClient {
     /**
      * Uploads a one-shot source -- one whose {@link UploadSource#slice(long)} can only ever be
      * called once, from offset zero -- one {@code chunkSize} slice at a time, over a single PATCH
-     * loop paced by the source's own demand rather than the recursive slice-per-chunk loop
+     * loop paced by the source's own demand rather than the slice-per-chunk loop
      * ({@link #uploadChunks}) the replayable path uses. Two callers share this: an unknown-length
      * source under the {@code creation-defer-length} extension ({@code knownLength == -1}, upload
      * created with {@code Upload-Defer-Length: 1}), and a known-length source that just happens not
@@ -537,6 +570,14 @@ public class TusClient {
      * matter how fast the source produces data or how slow the server is to accept it. There is no
      * retry here (a one-shot source cannot be replayed) and no capability check for checksums, since
      * a checksum requires a replayable source and that guard already fired earlier in {@link #upload}.
+     *
+     * <p><strong>Cancellation:</strong> the returned {@code Uni} is hand-rolled over an emitter, so
+     * a downstream cancel doesn't reach the source or the drain on its own. {@code onTermination}
+     * cancels the source subscription and flips {@code cancelled}, which every entry into the drain
+     * (and every chunk PATCH's success continuation) checks first -- so a cancelled upload issues no
+     * further PATCH and stops pulling from the source. The PATCH already on the wire at that moment
+     * is not reset (a cancelled Mutiny {@code Uni} over {@code httpClient.request()} only stops
+     * listening for the response), so the server may still apply that one chunk.
      *
      * <p>Once the source completes, any leftover partial chunk is flushed as an ordinary data PATCH.
      * Then: if {@code knownLength < 0} (defer-length), one final, empty-bodied PATCH declares
@@ -561,6 +602,18 @@ public class TusClient {
             // out of order. `sending` serializes every entry into tryDrain() to at most one in
             // flight at a time; onItem()/onCompletion() only ever update state and (re)try the gate.
             AtomicBoolean sending = new AtomicBoolean(false);
+            AtomicBoolean cancelled = new AtomicBoolean(false);
+
+            // Fires on completion and failure too, where cancelling an already-terminated upstream
+            // is a no-op; the gate matters only for a downstream cancel, which is otherwise invisible
+            // to this hand-rolled subscriber.
+            emitter.onTermination(() -> {
+                cancelled.set(true);
+                Flow.Subscription subscription = subscriptionRef.get();
+                if (subscription != null) {
+                    subscription.cancel();
+                }
+            });
 
             source.slice(0).subscribe().withSubscriber(new MultiSubscriber<Buffer>() {
                 @Override
@@ -617,7 +670,7 @@ public class TusClient {
                  * changed (a longer {@code pending}, or {@code upstreamCompleted} now true).
                  */
                 private void tryDrain() {
-                    if (!sending.compareAndSet(false, true)) {
+                    if (cancelled.get() || !sending.compareAndSet(false, true)) {
                         return;
                     }
                     Buffer buffered = pending.get();
@@ -669,6 +722,12 @@ public class TusClient {
                             .subscribe().with(newOffset -> {
                                 reportProgress(onProgress, newOffset, knownLength);
                                 offset.set(newOffset);
+                                if (cancelled.get()) {
+                                    // Cancelled while this PATCH was in flight (possibly from
+                                    // inside onProgress just now): the chunk landed, but nothing
+                                    // else may go out.
+                                    return;
+                                }
                                 onSuccess.run();
                             }, failure -> {
                                 // A failed chunk PATCH ends the upload right here (no retry -- the
@@ -701,7 +760,10 @@ public class TusClient {
     /**
      * Handles one retryable failure of the current attempt: gives up (propagating {@code failure})
      * if the source can't be replayed or the retry budget is exhausted, otherwise backs off, resyncs
-     * the true offset with a HEAD, and starts a fresh attempt from there.
+     * the true offset with a HEAD, and starts a fresh attempt from there. The HEAD itself is under
+     * the same budget: if it fails retryably (the outage that killed the PATCH is usually still going
+     * on), that is one more consecutive failure — backed off and re-issued through this same method
+     * — rather than a reason to end the upload with retries still unspent.
      */
     private Uni<Long> retryFromOffset(TusUpload upload, UploadSource source, long to, long chunkSize,
             Consumer<TusUploadProgress> onProgress, AtomicLong confirmedOffset,
@@ -721,7 +783,10 @@ public class TusClient {
                 nextAttempt, options.maxRetries());
         return Uni.createFrom().voidItem()
                 .onItem().delayIt().by(backoffFor(priorAttempt))
-                .flatMap(ignored -> protocol.offset(upload.url()))
+                .flatMap(ignored -> protocol.offset(upload.url())
+                        .onFailure(this::isRetryable)
+                        .recoverWithUni(headFailure -> retryFromOffset(upload, source, to, chunkSize, onProgress,
+                                confirmedOffset, attempt, headFailure, checksumAlgorithm)))
                 .invoke(confirmedOffset::set)
                 .flatMap(resyncedOffset -> attemptFromOffset(upload, source, resyncedOffset, to, chunkSize,
                         onProgress, confirmedOffset, attempt, checksumAlgorithm));
@@ -740,14 +805,15 @@ public class TusClient {
     }
 
     /**
-     * Retryable: a 5xx, a 409 offset conflict, a 460 checksum mismatch, or anything that isn't even a
-     * {@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException} (treated as an
-     * I/O-level failure). Every other {@code TusClientException} — 4xx client errors, protocol
-     * errors, etc. — fails fast.
+     * Retryable: a 5xx, a 409 offset conflict, a 423 lock still held, a 460 checksum mismatch, or
+     * anything that isn't even a {@link org.sitenetsoft.quarkus.tus.client.runtime.error.TusClientException}
+     * (treated as an I/O-level failure). Every other {@code TusClientException} — 4xx client errors,
+     * protocol errors, etc. — fails fast.
      */
     private boolean isRetryable(Throwable failure) {
         return failure instanceof TusServerErrorException
                 || failure instanceof TusOffsetMismatchException
+                || failure instanceof TusUploadLockedException
                 || failure instanceof TusChecksumMismatchException
                 || !(failure instanceof TusClientException);
     }

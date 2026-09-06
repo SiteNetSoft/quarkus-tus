@@ -18,7 +18,7 @@ A [Quarkus](https://quarkus.io/) extension implementing the [TUS resumable uploa
 
 ### Installation
 
-Add the extension to your Quarkus application:
+Add the server extension to your Quarkus application:
 
 #### Gradle
 
@@ -35,6 +35,8 @@ implementation("org.sitenetsoft:quarkus-tus:1.0.0")
     <version>1.0.0</version>
 </dependency>
 ```
+
+Two more artifacts are published under the same group. `quarkus-tus-client` is the client extension for uploading *to* a TUS server (see the [TUS Client](docs/modules/ROOT/pages/client.adoc) guide); it is independent of the server and can be used alone. `quarkus-tus-tck` is a test-scoped contract test for authors of a custom storage backend (see [Custom Storage Backends](docs/modules/ROOT/pages/storage-spi.adoc)).
 
 ### Minimal Configuration
 
@@ -66,6 +68,7 @@ The extension registers the following endpoints at the configured path (default 
 ### Quick Example: Observing Upload Events
 
 ```java
+import io.quarkus.logging.Log;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import org.sitenetsoft.quarkus.tus.runtime.event.*;

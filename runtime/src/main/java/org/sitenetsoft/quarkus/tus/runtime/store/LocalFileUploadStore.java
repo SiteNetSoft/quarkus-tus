@@ -1,5 +1,6 @@
 package org.sitenetsoft.quarkus.tus.runtime.store;
 
+import io.quarkus.arc.DefaultBean;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.buffer.Buffer;
@@ -30,9 +31,19 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
+/**
+ * The bundled store: uploads as files in a directory, records as JSON sidecars next to them.
+ * <p>
+ * A {@link DefaultBean}, so that an application's own {@link UploadStore} bean replaces it by
+ * merely existing — a plain {@code @ApplicationScoped} implementation is enough, no
+ * {@code @Alternative} and {@code @Priority} needed (though they still work).
+ */
 @ApplicationScoped
+@DefaultBean
 public class LocalFileUploadStore implements UploadStore {
 
     private static final Logger LOG = Logger.getLogger(LocalFileUploadStore.class);
@@ -41,11 +52,41 @@ public class LocalFileUploadStore implements UploadStore {
     private static final String META_TMP_SUFFIX = ".meta.tmp";
 
     private final Map<String, UploadInfo> uploads = new ConcurrentHashMap<>();
-    private final Map<String, Long> activeLocks = new ConcurrentHashMap<>();
+    private final Map<String, Lock> activeLocks = new ConcurrentHashMap<>();
+    private final AtomicLong lockGenerations = new AtomicLong();
     private final AtomicBoolean initValidated = new AtomicBoolean(false);
 
     private Path uploadBaseDir;
+    /** Zero disables reclamation: a lock is then held until released. */
     private long lockTimeoutMs;
+
+    /**
+     * One acquisition of an upload's lock. Reclaiming a stale lock creates a new generation
+     * rather than refreshing the old one, so that the holder it was taken from — which may
+     * still be streaming, its socket merely stalled — can be told apart from the new holder:
+     * a stage remembers the generation it started under and refuses to write, commit or roll
+     * anything back once that generation is no longer the one in the map.
+     * <p>
+     * The SPI carries no token, so a {@code releaseLock} cannot say whose it is. Every holder
+     * still owes exactly one release, and a reclaimed lock has two holders who each owe one:
+     * {@code owedReleases} counts them, and the lock only goes when the count reaches zero,
+     * which stops the displaced holder's release from freeing the lock underneath the new one.
+     * A holder that never releases leaves the entry idle, and {@link #cleanupStaleLocks} clears
+     * it after the timeout as it would any other abandoned lock.
+     */
+    private static final class Lock {
+        final long generation;
+        volatile long lastActivity;
+        final AtomicInteger owedReleases;
+        /** Stages running under this generation; a commit or abort cannot be theirs while one is. */
+        final AtomicInteger stagesInFlight = new AtomicInteger();
+
+        Lock(long generation, long now, int owedReleases) {
+            this.generation = generation;
+            this.lastActivity = now;
+            this.owedReleases = new AtomicInteger(owedReleases);
+        }
+    }
 
     @Inject
     Vertx vertx;
@@ -66,6 +107,15 @@ public class LocalFileUploadStore implements UploadStore {
 
         if (!Files.isWritable(uploadBaseDir)) {
             throw new RuntimeException("TUS uploads directory is not writable: " + uploadBaseDir);
+        }
+
+        if (tusRuntimeConfig.lockTimeoutSeconds() < 0) {
+            throw new RuntimeException("quarkus.tus.lock-timeout-seconds must not be negative (0 disables reclamation): "
+                    + tusRuntimeConfig.lockTimeoutSeconds());
+        }
+        if (tusRuntimeConfig.expirationHours() < 0) {
+            throw new RuntimeException("quarkus.tus.expiration-hours must not be negative (0 disables expiry): "
+                    + tusRuntimeConfig.expirationHours());
         }
 
         if (tusRuntimeConfig.maxChunkSize() > tusRuntimeConfig.maxSize()) {
@@ -267,6 +317,13 @@ public class LocalFileUploadStore implements UploadStore {
         Path file = safePath(id);
         OpenOptions openOptions = new OpenOptions().setWrite(true).setCreate(false);
 
+        // The generation this stage runs under. Null when the caller holds no lock at all,
+        // which the framework never does; then there is nothing to fence against.
+        Lock owner = activeLocks.get(id);
+        if (owner != null) {
+            owner.stagesInFlight.incrementAndGet();
+        }
+
         // An AsyncFile may only be used on the context that opened it, and the body's buffers
         // do not necessarily arrive there — over HTTP/2 they come in on the stream's context,
         // and a worker thread may have opened the file — so every write hops onto the file's
@@ -279,14 +336,29 @@ public class LocalFileUploadStore implements UploadStore {
                     return data
                             .emitOn(command -> fileContext.runOnContext(command))
                             .onItem().transformToUniAndConcatenate(buf -> {
+                                // A holder whose lock was reclaimed while it stalled must not
+                                // write another byte: someone else owns this offset now.
+                                if (isDisplaced(id, owner)) {
+                                    return Uni.createFrom().failure(displaced(id, owner));
+                                }
                                 // The lock spans the whole transfer; a slow client must not
                                 // look abandoned while its bytes are still arriving.
-                                touchLock(id);
+                                touchLock(id, owner);
                                 return asyncFile.write(io.vertx.mutiny.core.buffer.Buffer.newInstance(buf))
                                         .replaceWith((long) buf.length());
                             })
                             .collect().with(Collectors.summingLong(Long::longValue))
                             .eventually(asyncFile::close);
+                })
+                // A stage that ended after its lock was reclaimed staged nothing anyone may
+                // commit: its bytes are interleaved with the new holder's.
+                .chain(staged -> isDisplaced(id, owner)
+                        ? Uni.createFrom().failure(displaced(id, owner))
+                        : Uni.createFrom().item(staged))
+                .eventually(() -> {
+                    if (owner != null) {
+                        owner.stagesInFlight.decrementAndGet();
+                    }
                 })
                 .onFailure().call(e -> {
                     // Only our own file I/O is an error of ours; anything else came down the
@@ -296,14 +368,36 @@ public class LocalFileUploadStore implements UploadStore {
                     } else {
                         LOG.debugf("Staging of upload %s at %d stopped: %s", id, offset, e.getMessage());
                     }
-                    return abortChunk(id, offset)
+                    if (isDisplaced(id, owner)) {
+                        // The file is the new holder's now; whatever this stage left in it is
+                        // theirs to overwrite, and truncating would cut their bytes.
+                        return Uni.createFrom().voidItem();
+                    }
+                    return truncateStaged(id, offset)
                             .onFailure().recoverWithNull();
                 });
     }
 
+    /** True when {@code owner} was a lock that is no longer the upload's current one. */
+    private boolean isDisplaced(String id, Lock owner) {
+        return owner != null && activeLocks.get(id) != owner;
+    }
+
+    private OffsetMismatchException displaced(String id, Lock owner) {
+        UploadInfo info = uploads.get(id);
+        long current = info == null ? -1 : info.getOffset();
+        LOG.warnf("Upload %s: lock generation %d was reclaimed while its holder was still writing"
+                + " — its chunk is discarded", id, owner.generation);
+        return new OffsetMismatchException("Lock on upload " + id
+                + " was reclaimed while the chunk was in flight", current);
+    }
+
     /** Refreshes the lock's timestamp so activity, not acquisition time, decides staleness. */
-    private void touchLock(String id) {
-        activeLocks.computeIfPresent(id, (k, v) -> System.currentTimeMillis());
+    private void touchLock(String id, Lock owner) {
+        Lock current = activeLocks.get(id);
+        if (current != null && (owner == null || current == owner)) {
+            current.lastActivity = System.currentTimeMillis();
+        }
     }
 
     @Override
@@ -311,6 +405,10 @@ public class LocalFileUploadStore implements UploadStore {
         UploadInfo info = uploads.get(id);
         if (info == null) {
             return Uni.createFrom().failure(new UploadNotFoundException(id));
+        }
+        Throwable superseded = superseded(id, info, offset, "commit");
+        if (superseded != null) {
+            return Uni.createFrom().failure(superseded);
         }
         // Metadata persistence is blocking file I/O; keep it off the event loop.
         return vertx.executeBlocking(Uni.createFrom().item(() -> {
@@ -329,6 +427,47 @@ public class LocalFileUploadStore implements UploadStore {
 
     @Override
     public Uni<Void> abortChunk(String id, long offset) {
+        UploadInfo info = uploads.get(id);
+        if (info == null) {
+            // Nothing to roll back to; the discard took the file with it.
+            return Uni.createFrom().voidItem();
+        }
+        Throwable superseded = superseded(id, info, offset, "abort");
+        if (superseded != null) {
+            return Uni.createFrom().failure(superseded);
+        }
+        return truncateStaged(id, offset);
+    }
+
+    /**
+     * Whether a commit or abort "at {@code offset}" can still be about the chunk its caller
+     * staged. The SPI carries no token, so the caller's identity is inferred from what it says
+     * about the upload: the committed offset is the truth, and a caller who has it wrong staged
+     * under a lock that was since reclaimed and committed past. Likewise, while a stage is
+     * still running under the current lock the call cannot be that holder's — it does not
+     * commit or abort until its stage has ended — so it is the displaced holder's.
+     *
+     * @return the failure to answer with, or null if the call is genuine
+     */
+    private Throwable superseded(String id, UploadInfo info, long offset, String what) {
+        if (offset != info.getOffset()) {
+            LOG.warnf("Upload %s: %s at offset %d refused, the upload is at %d — the caller's lock was"
+                    + " reclaimed and its chunk superseded", id, what, offset, info.getOffset());
+            return new OffsetMismatchException("Cannot " + what + " at offset " + offset + ": upload "
+                    + id + " is at offset " + info.getOffset(), info.getOffset());
+        }
+        Lock current = activeLocks.get(id);
+        if (current != null && current.stagesInFlight.get() > 0) {
+            LOG.warnf("Upload %s: %s at offset %d refused, a chunk is still being staged under the"
+                    + " current lock — the caller's lock was reclaimed", id, what, offset);
+            return new OffsetMismatchException("Cannot " + what + " upload " + id
+                    + ": a chunk is being staged under a newer lock", info.getOffset());
+        }
+        return null;
+    }
+
+    /** Cuts the file back to {@code offset}, dropping whatever a stage left past it. */
+    private Uni<Void> truncateStaged(String id, long offset) {
         return vertx.executeBlocking(Uni.createFrom().item(() -> {
             Path file = safePath(id);
             if (Files.exists(file)) {
@@ -376,7 +515,7 @@ public class LocalFileUploadStore implements UploadStore {
                 .replaceWithVoid()
                 .onFailure().call(e -> {
                     LOG.errorf(e, "Failed to concatenate into %s — truncating partial merge", finalId);
-                    return abortChunk(finalId, 0).onFailure().recoverWithNull();
+                    return truncateStaged(finalId, 0).onFailure().recoverWithNull();
                 })
                 .onFailure().transform(e -> e instanceof UploadStoreException ? e
                         : new UploadStoreException("Failed to concatenate into " + finalId, e));
@@ -401,7 +540,7 @@ public class LocalFileUploadStore implements UploadStore {
         try {
             return discardLockedUpload(id);
         } finally {
-            activeLocks.remove(id);
+            release(id);
         }
     }
 
@@ -426,33 +565,51 @@ public class LocalFileUploadStore implements UploadStore {
 
     private boolean tryLock(String id) {
         long now = System.currentTimeMillis();
-        Long existing = activeLocks.putIfAbsent(id, now);
+        Lock existing = activeLocks.putIfAbsent(id, new Lock(lockGenerations.incrementAndGet(), now, 1));
         if (existing == null) {
             return true;
         }
-        // Check if existing lock has timed out
-        if (now - existing > lockTimeoutMs) {
-            if (activeLocks.replace(id, existing, now)) {
-                LOG.warnf("Reclaimed stale lock for upload %s (held for %d ms)", id, now - existing);
+        if (isStale(existing, now)) {
+            // A new generation, not a refreshed timestamp: the old holder may still be alive
+            // and must find out. It still owes its release, hence the carried-over count.
+            Lock reclaimed = new Lock(lockGenerations.incrementAndGet(), now, existing.owedReleases.get() + 1);
+            if (activeLocks.replace(id, existing, reclaimed)) {
+                LOG.warnf("Reclaimed stale lock for upload %s (idle for %d ms)", id, now - existing.lastActivity);
                 return true;
             }
         }
         return false;
     }
 
+    private boolean isStale(Lock lock, long now) {
+        return lockTimeoutMs > 0 && now - lock.lastActivity > lockTimeoutMs;
+    }
+
     @Override
     public Uni<Void> releaseLock(String id) {
-        activeLocks.remove(id);
+        release(id);
         return Uni.createFrom().voidItem();
     }
 
+    /** One holder's release; the lock goes when every holder that owes one has paid. */
+    private void release(String id) {
+        activeLocks.computeIfPresent(id, (k, lock) -> lock.owedReleases.decrementAndGet() <= 0 ? null : lock);
+    }
+
+    /**
+     * Drops idle locks nobody will release. A stale lock with a stage still in flight is left
+     * alone: its holder is stalled, not dead, and will release once its stream ends — removing
+     * the entry now would let that release free whichever lock a later request holds by then.
+     * {@link #tryLock} reclaims such a lock on demand instead, with the release accounted for.
+     */
     @Override
     public Uni<Void> cleanupStaleLocks() {
         long now = System.currentTimeMillis();
         activeLocks.entrySet().removeIf(entry -> {
-            boolean stale = now - entry.getValue() > lockTimeoutMs;
+            boolean stale = isStale(entry.getValue(), now) && entry.getValue().stagesInFlight.get() == 0;
             if (stale) {
-                LOG.warnf("Removing stale lock for upload %s (held for %d ms)", entry.getKey(), now - entry.getValue());
+                LOG.warnf("Removing stale lock for upload %s (idle for %d ms)", entry.getKey(),
+                        now - entry.getValue().lastActivity);
             }
             return stale;
         });

@@ -35,7 +35,7 @@ A Quarkus extension implementing the https://tus.io/protocols/resumable-upload[T
 == Prerequisites
 
 * Java 25+
-* Quarkus 3.31.4+
+* Quarkus {quarkus-version}+
 
 == Installation
 

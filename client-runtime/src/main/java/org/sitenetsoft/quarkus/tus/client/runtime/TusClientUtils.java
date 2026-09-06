@@ -80,6 +80,7 @@ public final class TusClientUtils {
             case 410 -> new TusUploadNotFoundException("Upload gone", expired);
             case 412 -> new TusVersionMismatchException("Protocol version mismatch");
             case 413 -> new TusPayloadTooLargeException("Payload too large");
+            case 423 -> new TusUploadLockedException("Upload is locked by another request");
             case 460 -> new TusChecksumMismatchException("Checksum mismatch");
             default -> {
                 if (status >= 500) {

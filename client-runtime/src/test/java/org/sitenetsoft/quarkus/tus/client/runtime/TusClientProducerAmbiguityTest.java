@@ -37,4 +37,12 @@ class TusClientProducerAmbiguityTest {
         assertTrue(reason != null && reason.contains("TusRequestCustomizer"),
                 "expected the reason to name TusRequestCustomizer, was: " + reason);
     }
+
+    @Test
+    void ambiguousHttpClientCustomizerNamesItsOwnType() {
+        assertNull(TusClientProducer.ambiguousHttpClientCustomizerReason(false));
+        String reason = TusClientProducer.ambiguousHttpClientCustomizerReason(true);
+        assertTrue(reason != null && reason.contains("TusHttpClientCustomizer"),
+                "expected the reason to name TusHttpClientCustomizer, was: " + reason);
+    }
 }

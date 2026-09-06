@@ -17,6 +17,13 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@link org.sitenetsoft.quarkus.tus.client.runtime.source.FileUploadSource} close its file handle
  * promptly instead of reading the rest of the file only to discard it.
  *
+ * <p><strong>Back-pressure and cancellation flow through.</strong> Downstream demand is forwarded to
+ * the upstream one-for-one (never {@code Long.MAX_VALUE}), so a file source is paced by how fast the
+ * PATCH body is actually being written rather than read at disk speed into the emitter's queue. And
+ * whenever the limited stream terminates — completes, fails, or is cancelled by a failed or cancelled
+ * PATCH — the upstream subscription is cancelled, so the source stops reading and releases its
+ * resource instead of running on to {@code maxBytes} for nobody.
+ *
  * <p>Subscribes with the raw {@code Flow.Subscription} (rather than the convenience {@code with(item,
  * failure, complete)} overload that only hands back a {@code Cancellable} after subscribing returns)
  * so the subscription is available for cancellation from inside the very first {@code onNext} — even
@@ -40,13 +47,46 @@ final class BufferLimiter {
         return Multi.createFrom().emitter(emitter -> {
             AtomicLong remaining = new AtomicLong(maxBytes);
             AtomicReference<Flow.Subscription> subscription = new AtomicReference<>();
+            // Demand that arrived before the upstream handed over its subscription (a downstream that
+            // requests inside its own onSubscribe does that) is parked here and flushed once it can be.
+            AtomicLong pendingDemand = new AtomicLong(0);
+            Runnable flushDemand = () -> {
+                Flow.Subscription s = subscription.get();
+                if (s == null) {
+                    return;
+                }
+                long demand = pendingDemand.getAndSet(0);
+                if (demand > 0) {
+                    s.request(demand);
+                }
+            };
+            emitter.onRequest(n -> {
+                pendingDemand.accumulateAndGet(n, BufferLimiter::saturatingAdd);
+                flushDemand.run();
+            });
+            // Mutiny hands the emitter to the downstream's onSubscribe BEFORE running this consumer,
+            // and most subscribers (collect(), the Vert.x body pipe) request from inside onSubscribe
+            // -- so that demand predates the onRequest callback above and would otherwise be lost.
+            // It is still visible as emitter.requested(); pick it up here. (A request racing this
+            // exact line can be counted twice; over-requesting the upstream by a chunk's worth is
+            // harmless -- the limit below still cuts at maxBytes -- whereas under-requesting hangs.)
+            pendingDemand.accumulateAndGet(emitter.requested(), BufferLimiter::saturatingAdd);
+            // Completion, failure, or downstream cancellation: the upstream never needs to produce
+            // another byte. Cancelling an already-terminated subscription is a no-op per Reactive
+            // Streams, so this is safe on every path.
+            emitter.onTermination(() -> {
+                Flow.Subscription s = subscription.get();
+                if (s != null) {
+                    s.cancel();
+                }
+            });
             upstream.subscribe().with(
                     s -> {
                         // Per Reactive Streams, onSubscribe always precedes onNext, so this runs
                         // (and the subscription is stored) before any buffer can arrive -- no race
-                        // with an eager/synchronous upstream that drains on the request() call below.
+                        // with an eager/synchronous upstream that drains on the first request().
                         subscription.set(s);
-                        s.request(Long.MAX_VALUE);
+                        flushDemand.run();
                     },
                     buffer -> {
                         long rem = remaining.get();
@@ -62,10 +102,6 @@ final class BufferLimiter {
                         }
                         if (remaining.get() <= 0) {
                             emitter.complete();
-                            Flow.Subscription s = subscription.get();
-                            if (s != null) {
-                                s.cancel();
-                            }
                         }
                     },
                     emitter::fail,
@@ -80,5 +116,10 @@ final class BufferLimiter {
                         }
                     });
         });
+    }
+
+    private static long saturatingAdd(long a, long b) {
+        long sum = a + b;
+        return sum < 0 ? Long.MAX_VALUE : sum;
     }
 }

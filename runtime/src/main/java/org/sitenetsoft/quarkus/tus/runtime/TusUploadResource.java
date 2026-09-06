@@ -548,25 +548,24 @@ public class TusUploadResource {
                 if (!locked) {
                     return Uni.createFrom().item(tus(423).entity("Upload is currently being processed").build());
                 }
-                // From here the lock is held, and every path below releases it: the rejections
-                // through releasingLock, the write through patchUnderLock's eventually. Validating
-                // the offset outside the lock allowed two requests to both pass validation and
-                // then write in turn, the second silently overwriting the first.
-                return patchUnderLockValidated(uploadID, offset, contentLength, uploadLength,
-                        expectedChecksum, bodyDigest, routingContext, stream);
+                // From here the lock is held for the whole of the locked section — the checks
+                // that need the record as it stands, a deferred length becoming known, and the
+                // write — and one eventually releases it whatever happens in there. Detached,
+                // because Quarkus REST cancels the response the moment the client goes away,
+                // and a cancelled pipeline would skip the release. Validating the offset outside
+                // the lock allowed two requests to both pass validation and then write in turn,
+                // the second silently overwriting the first.
+                return detached(patchUnderLockValidated(uploadID, offset, contentLength, uploadLength,
+                        expectedChecksum, bodyDigest, routingContext, stream)
+                        .eventually(() -> uploadStore.releaseLock(uploadID)));
             });
         });
-    }
-
-    /** Answers {@code response} after releasing the upload's lock. */
-    private Uni<Response> releasingLock(String uploadID, Response response) {
-        return uploadStore.releaseLock(uploadID).replaceWith(response);
     }
 
     /**
      * The checks that must happen under the upload's lock — the record as it stands now, a
      * deferred length becoming known, the offset — and then the write. The caller holds the
-     * lock; every path here releases it.
+     * lock and releases it when the returned pipeline terminates; nothing in here does.
      */
     private Uni<Response> patchUnderLockValidated(String uploadID, long uploadOffset, Long contentLength,
                                                   Long uploadLength, ChecksumInfo checksumInfo,
@@ -574,7 +573,7 @@ public class TusUploadResource {
                                                   AtomicReference<ChunkStream> stream) {
         return uploadStore.findUploadInfo(uploadID).chain(lockedInfoOpt -> {
             if (lockedInfoOpt.isEmpty()) {
-                return releasingLock(uploadID, tus(NOT_FOUND).build());
+                return Uni.createFrom().item(tus(NOT_FOUND).build());
             }
             UploadInfo info = lockedInfoOpt.get();
 
@@ -582,12 +581,21 @@ public class TusUploadResource {
             Uni<Boolean> stillDeferred;
             if (uploadLength != null && lengthStillDeferred) {
                 if (uploadLength < 0 || uploadLength > tusRuntimeConfig.maxSize()) {
-                    return releasingLock(uploadID, tus(BAD_REQUEST).entity("Failed to set upload length").build());
+                    return Uni.createFrom().item(tus(BAD_REQUEST).entity("Failed to set upload length").build());
+                }
+                // Bytes already stored past the declared length contradict it; the record is
+                // left untouched so the length stays deferred and a correct one can follow.
+                if (uploadLength < info.getOffset()) {
+                    return Uni.createFrom().item(tus(BAD_REQUEST)
+                            .entity("Upload-Length is below the upload's current offset").build());
                 }
                 info.setEntityLength(uploadLength);
                 info.setDeferredLength(false);
                 info.setLastActivity(Instant.now());
+                // Observers are application code and must not run on the event loop the store
+                // may have answered on.
                 stillDeferred = uploadStore.updateUploadInfo(uploadID, info)
+                        .emitOn(Infrastructure.getDefaultWorkerPool())
                         .invoke(() -> {
                             events.lengthKnown(uploadID, uploadLength);
                             LOG.infof("Set deferred length for upload %s to %d", uploadID, uploadLength);
@@ -616,14 +624,14 @@ public class TusUploadResource {
                 // there isn't one yet).
 
                 if (uploadOffset != info.getOffset()) {
-                    return releasingLock(uploadID, tus(CONFLICT)
+                    return Uni.createFrom().item(tus(CONFLICT)
                             .header("Upload-Offset", String.valueOf(info.getOffset()))
                             .entity("Upload offset mismatch").build());
                 }
 
                 if (!deferred && contentLength != null
                         && !fitsWithin(contentLength, uploadOffset, info.getEntityLength())) {
-                    return releasingLock(uploadID,
+                    return Uni.createFrom().item(
                             tus(CONFLICT).entity("Chunk exceeds declared upload size").build());
                 }
 
@@ -634,7 +642,7 @@ public class TusUploadResource {
                 // declared-length paths already use.
                 if (deferred && contentLength != null
                         && !fitsWithin(contentLength, uploadOffset, tusRuntimeConfig.maxSize())) {
-                    return releasingLock(uploadID,
+                    return Uni.createFrom().item(
                             tus(REQUEST_ENTITY_TOO_LARGE).entity("Upload exceeds maximum allowed size").build());
                 }
 
@@ -645,8 +653,8 @@ public class TusUploadResource {
     }
 
     /**
-     * Writes the body and builds the response. The caller must hold the upload's lock;
-     * ownership passes to the returned pipeline, which releases it on termination.
+     * Writes the body and builds the response. The caller holds the upload's lock for the
+     * whole of the returned pipeline and releases it afterwards.
      */
     private Uni<Response> patchUnderLock(String uploadID, UploadInfo info, long uploadOffset,
                                          RoutingContext routingContext, ChecksumInfo checksumInfo,
@@ -661,7 +669,7 @@ public class TusUploadResource {
                 : writer.write(uploadID, info, uploadOffset, routingContext, checksumInfo, digest,
                         contentLength, stream);
 
-        return detached(write
+        return write
                 .onItem().transform(newOffset -> {
                     Response.ResponseBuilder builder = tus(NO_CONTENT)
                             .header("Upload-Offset", String.valueOf(newOffset));
@@ -670,8 +678,7 @@ public class TusUploadResource {
                     }
                     return builder.build();
                 })
-                .plug(u -> recoverWriteFailures(u, uploadID))
-                .eventually(() -> uploadStore.releaseLock(uploadID)));
+                .plug(u -> recoverWriteFailures(u, uploadID));
     }
 
     /**

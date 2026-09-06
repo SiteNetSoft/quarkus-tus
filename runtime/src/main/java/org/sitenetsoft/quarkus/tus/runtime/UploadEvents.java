@@ -72,10 +72,21 @@ public class UploadEvents {
         sendProgress(uploadId, newOffset, entityLength);
     }
 
+    /**
+     * The last byte is in. The progress stream has already been told 100% by the chunk event
+     * and has nothing more to say, so it is closed here; the events stream is the bridge's,
+     * which closes it on the completion event unless a consumer holds it open.
+     */
     public void uploadCompleted(String uploadId, UploadInfo info) {
         uploadProgressService.finishUpload(uploadId);
-        uploadCompletedEvent.fire(new TusUploadCompletedEvent(
-                uploadId, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));
+        try {
+            uploadCompletedEvent.fire(new TusUploadCompletedEvent(
+                    uploadId, info.getEntityLength(), info.getMetadata(), info.getUploaderId()));
+        } finally {
+            if (sseServiceInstance.isResolvable()) {
+                sseServiceInstance.get().unregister(uploadId);
+            }
+        }
     }
 
     public void uploadTerminated(String uploadId) {
@@ -91,9 +102,18 @@ public class UploadEvents {
                 info.getMetadata(), info.getUploaderId()));
     }
 
-    /** An upload is gone — deleted, expired, merged away or abandoned. */
+    /**
+     * An upload is gone — deleted, expired, merged away or abandoned. Nothing will ever be
+     * sent about it again, so both of its streams close with it; a stream held open past a
+     * completion that already happened is left to its consumer's {@code finish} or the backstop.
+     */
     public void uploadDiscarded(String uploadId) {
         uploadProgressService.finishUpload(uploadId);
+        if (sseServiceInstance.isResolvable()) {
+            TusSseService sse = sseServiceInstance.get();
+            sse.unregister(uploadId);
+            sse.onUploadDiscarded(uploadId);
+        }
     }
 
     /**

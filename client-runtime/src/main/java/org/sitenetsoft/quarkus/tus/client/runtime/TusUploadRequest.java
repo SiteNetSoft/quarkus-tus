@@ -25,7 +25,9 @@ public final class TusUploadRequest {
     private TusUploadRequest(Builder builder) {
         this.source = builder.source;
         this.metadata = builder.metadata;
-        this.chunkSize = builder.chunkSize;
+        this.chunkSize = builder.chunkSize == null
+                ? null
+                : TusClientOptions.validateChunkSize(builder.chunkSize, "chunkSize");
         this.checksumAlgorithm = builder.checksumAlgorithm;
         this.parallelism = builder.parallelism;
         this.onProgress = builder.onProgress;

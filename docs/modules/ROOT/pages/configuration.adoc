@@ -66,7 +66,12 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `quarkus.tus.expiration-hours`
 | `long`
 | `24`
-| Hours before an incomplete upload expires. Expired uploads are automatically cleaned up by the expiration scheduler (runs hourly).
+| Hours after creation at which an upload expires, reported in `Upload-Expires`. The deadline is set once, when the upload is created, and applies to *completed uploads too*: an upload that finished but was never collected is removed like any other once its deadline passes. The extension ships primitives, not a destination -- an application observes `TusUploadCompletedEvent` and moves the file where it belongs before then. Expired uploads are removed by the expiration scheduler (runs hourly) and on the next HEAD or PATCH that finds them expired (answered with 410). `0` disables expiry: no deadline is recorded and nothing is ever removed for age (the `expiration` extension may then be dropped from `quarkus.tus.extensions`, as no `Upload-Expires` is sent). Negative values fail at boot.
+
+| `quarkus.tus.stale-upload-hours`
+| `long`
+| `6`
+| Hours without activity after which an *incomplete* upload is removed by the stale-upload scheduler (runs hourly), independently of its expiry deadline; activity is any committed chunk. `0` disables the cleanup. Completed uploads are never stale; only `expiration-hours` removes those.
 
 | `quarkus.tus.checksum-algorithms`
 | `String`
@@ -76,7 +81,7 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `quarkus.tus.store.local.upload-dir`
 | `String`
 | `${java.io.tmpdir}/quarkus-tus-uploads`
-| Directory where the default local file store writes upload data. Created automatically if it does not exist.
+| Directory where the default local file store writes upload data. Created automatically if it does not exist. *The default lives under `java.io.tmpdir`, which the operating system may clean at any time and which is rarely on the volume you want uploads on; a production deployment must set this to a dedicated directory.*
 
 | `quarkus.tus.max-chunk-size`
 | `long`
@@ -86,7 +91,7 @@ Runtime properties can be overridden at startup via `application.properties`, en
 | `quarkus.tus.lock-timeout-seconds`
 | `long`
 | `30`
-| Seconds of inactivity after which an upload's lock is considered abandoned and may be reclaimed. The lock is held for the whole of a chunk transfer and refreshed as bytes arrive, so this only bounds a holder that died or stalled; set it above the longest pause a healthy client may make mid-chunk. Applies to the bundled local file store.
+| Seconds of inactivity after which an upload's lock is considered abandoned and may be reclaimed. The lock is held for the whole of a chunk transfer and refreshed as bytes arrive, so this only bounds a holder that died or stalled; set it above the longest pause a healthy client may make mid-chunk. A holder whose lock was reclaimed is fenced: anything it still writes, commits or rolls back is refused, so a stalled request that wakes up cannot damage what the reclaimer stored. `0` disables reclamation: a lock is then held until its holder releases it, and a holder that never does leaves the upload locked (423) for good. Negative values fail at boot. Applies to the bundled local file store.
 
 | `quarkus.tus.sse-hold-open-timeout-seconds`
 | `long`
@@ -185,7 +190,7 @@ quarkus.tus.max-size=1073741824
 # Store uploads in a dedicated directory
 quarkus.tus.store.local.upload-dir=/var/data/uploads
 
-# Expire incomplete uploads after 12 hours
+# Remove uploads, finished or not, 12 hours after creation
 quarkus.tus.expiration-hours=12
 
 # Only support creation and termination extensions

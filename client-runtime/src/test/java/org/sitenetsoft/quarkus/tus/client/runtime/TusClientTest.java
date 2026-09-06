@@ -87,6 +87,16 @@ class TusClientTest {
     }
 
     @Test
+    void httpClientOptionsHookOnTheClientOptionsReachesTheVertxClient() {
+        client.close();
+        var invoked = new AtomicBoolean(false);
+        client = TusClient.create(vertx, TusClientOptions.builder(server.url())
+                .httpClientOptions(opts -> invoked.set(true))
+                .build());
+        assertTrue(invoked.get(), "TusClient.create must apply the hook when building the HTTP client");
+    }
+
+    @Test
     void aFailedCapabilitiesFetchDoesNotPoisonEveryLaterUpload() {
         // options().memoize().indefinitely() replays whatever the FIRST call produced, forever --
         // including a failure. A transient OPTIONS failure (server hiccup, cold start) must not
@@ -124,6 +134,25 @@ class TusClientTest {
     }
 
     @Test
+    void aVeryLongChunkLoopDoesNotOverflowTheStack() {
+        // 20,000 one-byte chunks. The chunk loop used to be a recursive Uni chain -- each chunk
+        // nested one more flatMap -- so on completion the stack unwound through every earlier
+        // chunk's frame; at this depth that is a StackOverflowError, which the Vert.x event loop
+        // swallows, leaving the Uni hanging forever rather than failing. The loop must be
+        // iterative: constant stack depth regardless of chunk count.
+        int chunks = 20_000;
+        enqueueOptions("creation");
+        server.enqueue(Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        for (int i = 1; i <= chunks; i++) {
+            server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", Integer.toString(i))));
+        }
+        var result = client.upload(TusUploadRequest.builder(sourceOf("x".repeat(chunks))).chunkSize(1).build())
+                .await().atMost(Duration.ofSeconds(120));
+        assertEquals(chunks, result.bytesUploaded());
+        assertEquals(chunks, server.recorded().stream().filter(r -> r.method().equals("PATCH")).count());
+    }
+
+    @Test
     void bufferLimiterTruncatesTheFinalBufferAcrossBufferBoundaries() {
         Multi<Buffer> upstream = Multi.createFrom().items(
                 Buffer.buffer("ab"), Buffer.buffer("cde"), Buffer.buffer("fghij"));
@@ -158,6 +187,41 @@ class TusClientTest {
     }
 
     @Test
+    void bufferLimiterCancelsTheUpstreamWhenTheDownstreamCancels() {
+        // A cancelled or failed PATCH cancels its body Multi; that must reach the source (so a
+        // FileUploadSource closes its file) instead of the limiter reading on until maxBytes.
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        Multi<Buffer> neverEnding = Multi.createFrom().<Buffer>emitter(e -> e.emit(Buffer.buffer("ab")))
+                .onCancellation().invoke(() -> cancelled.set(true));
+        var subscriber = BufferLimiter.limit(neverEnding, 100).subscribe()
+                .withSubscriber(io.smallrye.mutiny.helpers.test.AssertSubscriber.<Buffer>create(1));
+        subscriber.awaitItems(1);
+        subscriber.cancel();
+        assertTrue(cancelled.get(), "cancelling the limited stream must cancel the upstream subscription");
+    }
+
+    @Test
+    void bufferLimiterPropagatesDownstreamDemandInsteadOfDrainingEagerly() {
+        // Requesting Long.MAX_VALUE upstream read the whole chunk at disk speed into the emitter's
+        // queue regardless of how fast the request body was being written; demand must flow
+        // through one-for-one so the source is paced by the PATCH.
+        var requested = new java.util.concurrent.atomic.AtomicLong(0);
+        Multi<Buffer> upstream = Multi.createFrom().<Buffer>emitter(e -> e.onRequest(n -> {
+            requested.addAndGet(n);
+            for (long i = 0; i < Math.min(n, 1000); i++) {
+                e.emit(Buffer.buffer("a"));
+            }
+        }));
+        var subscriber = BufferLimiter.limit(upstream, 100).subscribe()
+                .withSubscriber(io.smallrye.mutiny.helpers.test.AssertSubscriber.<Buffer>create(0));
+        assertEquals(0, requested.get(), "nothing requested downstream, so nothing requested upstream");
+        subscriber.request(2);
+        subscriber.awaitItems(2);
+        assertEquals(2, requested.get());
+        subscriber.cancel();
+    }
+
+    @Test
     void bufferLimiterFailsWithATypedExceptionNamingBothLengthsOnAShortRead() {
         Multi<Buffer> upstream = Multi.createFrom().items(Buffer.buffer("ab"), Buffer.buffer("cd"));
         TusClientException e = assertThrows(TusClientException.class,
@@ -183,6 +247,88 @@ class TusClientTest {
         assertEquals(11, result.bytesUploaded());
         // Real sequence: OPTIONS(0), POST(1), PATCH-succeeds(2), PATCH-500(3), HEAD-resync(4), PATCH(5), PATCH(6).
         assertEquals("HEAD", server.recorded().get(4).method());   // the resync
+    }
+
+    @Test
+    void lockedUploadIsRetriedAfterAResync() {
+        // 423 Locked: the server still holds the lock from a PATCH whose connection dropped, and it
+        // is released moments later -- transient by nature, so it must be retried (with the usual
+        // backoff + HEAD resync), not treated as a fatal client error.
+        client.close();
+        client = TusClient.create(vertx,
+                TusClientOptions.builder(server.url()).retryBackoff(Duration.ofMillis(10)).build());
+        enqueueOptions("creation");
+        server.enqueue(Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(Canned.of(423, Map.of("Tus-Resumable", "1.0.0")));                        // PATCH @0 locked
+        server.enqueue(Canned.of(200, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "0")));  // HEAD resync
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "11")));
+        var result = client.upload(TusUploadRequest.builder(sourceOf("hello world")).chunkSize(11).build())
+                .await().atMost(TIMEOUT);
+        assertEquals(11, result.bytesUploaded());
+        assertEquals(List.of("OPTIONS", "POST", "PATCH", "HEAD", "PATCH"),
+                server.recorded().stream().map(ScriptedTusServer.Recorded::method).toList());
+    }
+
+    @Test
+    void lockedUploadIsRetriedInTheParallelPathToo() {
+        client.close();
+        client = TusClient.create(vertx,
+                TusClientOptions.builder(server.url()).retryBackoff(Duration.ofMillis(10)).build());
+        enqueueOptions("creation,concatenation");
+        server.route("POST", "/tus",
+                Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/p0")),
+                Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/p1")),
+                Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/final")));
+        server.route("PATCH", "/tus/p0",
+                Canned.of(423, Map.of("Tus-Resumable", "1.0.0")),
+                Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "6")));
+        server.route("HEAD", "/tus/p0", Canned.of(200, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "0")));
+        server.route("PATCH", "/tus/p1", Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "5")));
+        var result = client.upload(TusUploadRequest.builder(sourceOf("hello world")).parallelism(2).chunkSize(6).build())
+                .await().atMost(TIMEOUT);
+        assertEquals(11, result.bytesUploaded());
+        assertEquals(1, server.recorded().stream().filter(r -> r.method().equals("HEAD")).count());
+    }
+
+    @Test
+    void aFailedResyncHeadIsRetriedUnderTheSameBudget() {
+        // PATCH fails, then the HEAD resync itself fails once (the same outage that killed the
+        // PATCH is still going on), then HEAD succeeds and the upload completes. The HEAD failure
+        // must be retried under the same backoff and budget rather than ending the upload with
+        // retries still unspent.
+        client.close();
+        client = TusClient.create(vertx,
+                TusClientOptions.builder(server.url()).retryBackoff(Duration.ofMillis(10)).build());
+        enqueueOptions("creation");
+        server.enqueue(Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        server.enqueue(Canned.of(500, Map.of("Tus-Resumable", "1.0.0")));                        // PATCH dies
+        server.enqueue(Canned.of(503, Map.of("Tus-Resumable", "1.0.0")));                        // HEAD dies too
+        server.enqueue(Canned.of(200, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "0")));  // HEAD ok
+        server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", "11")));
+        var result = client.upload(TusUploadRequest.builder(sourceOf("hello world")).chunkSize(11).build())
+                .await().atMost(TIMEOUT);
+        assertEquals(11, result.bytesUploaded());
+        assertEquals(List.of("OPTIONS", "POST", "PATCH", "HEAD", "HEAD", "PATCH"),
+                server.recorded().stream().map(ScriptedTusServer.Recorded::method).toList());
+    }
+
+    @Test
+    void failedResyncHeadsSpendTheRetryBudget() {
+        // maxRetries = 3: PATCH 500 (attempt 1), HEAD 500 (attempt 2), HEAD 500 (attempt 3),
+        // HEAD 500 (would be attempt 4 -> exhausted). No further request must go out.
+        client.close();
+        client = TusClient.create(vertx,
+                TusClientOptions.builder(server.url()).retryBackoff(Duration.ofMillis(10)).build());
+        enqueueOptions("creation");
+        server.enqueue(Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        for (int i = 0; i < 5; i++) {
+            server.enqueue(Canned.of(500, Map.of("Tus-Resumable", "1.0.0")));
+        }
+        assertThrows(TusServerErrorException.class, () ->
+                client.upload(TusUploadRequest.builder(sourceOf("hello world")).chunkSize(11).build())
+                        .await().atMost(TIMEOUT));
+        assertEquals(List.of("OPTIONS", "POST", "PATCH", "HEAD", "HEAD", "HEAD"),
+                server.recorded().stream().map(ScriptedTusServer.Recorded::method).toList());
     }
 
     @Test
@@ -389,6 +535,35 @@ class TusClientTest {
                 client.upload(TusUploadRequest.builder(UploadSource.oneShot(data, -1)).chunkSize(4).build())
                         .await().atMost(TIMEOUT));
         assertTrue(cancelled.get());
+    }
+
+    @Test
+    void cancellingAOneShotUploadStopsPatchingAndCancelsTheSource() throws InterruptedException {
+        // An on-demand, never-ending source: each request(1) yields one more 4-byte item, so the
+        // paced drain would keep PATCHing forever. The upload is cancelled from inside onProgress,
+        // i.e. right after the first PATCH succeeds and before the drain asks the source for more.
+        // A cancelled upload must not issue another PATCH, and must cancel the source subscription.
+        enqueueOptions("creation,creation-defer-length");
+        server.enqueue(Canned.of(201, Map.of("Tus-Resumable", "1.0.0", "Location", "/tus/u1")));
+        for (int i = 1; i <= 5; i++) {
+            server.enqueue(Canned.of(204, Map.of("Tus-Resumable", "1.0.0", "Upload-Offset", Integer.toString(4 * i))));
+        }
+        var sourceCancelled = new AtomicBoolean(false);
+        Multi<Buffer> data = Multi.createBy().repeating().supplier(() -> Buffer.buffer("abcd")).indefinitely()
+                .onCancellation().invoke(() -> sourceCancelled.set(true));
+        var cancellable = new java.util.concurrent.atomic.AtomicReference<io.smallrye.mutiny.subscription.Cancellable>();
+        var firstPatchDone = new java.util.concurrent.CountDownLatch(1);
+        var upload = client.upload(TusUploadRequest.builder(UploadSource.oneShot(data, -1)).chunkSize(4)
+                .onProgress(p -> {
+                    cancellable.get().cancel();
+                    firstPatchDone.countDown();
+                }).build());
+        cancellable.set(upload.subscribe().with(item -> { }, failure -> { }));
+        assertTrue(firstPatchDone.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        Thread.sleep(300);
+        assertEquals(1, server.recorded().stream().filter(r -> r.method().equals("PATCH")).count(),
+                "no PATCH may go out after the upload was cancelled");
+        assertTrue(sourceCancelled.get(), "cancelling the upload must cancel the source subscription");
     }
 
     @Test

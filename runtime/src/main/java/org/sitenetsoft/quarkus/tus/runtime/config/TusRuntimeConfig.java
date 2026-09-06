@@ -32,7 +32,9 @@ public interface TusRuntimeConfig {
     String extensions();
 
     /**
-     * Hours before an incomplete upload expires.
+     * Hours after creation at which an upload expires and is removed, complete or not — the
+     * application is expected to have moved a finished upload on by then. Set to 0 to disable
+     * expiry (no deadline is recorded).
      */
     @WithDefault("24")
     long expirationHours();
@@ -77,7 +79,8 @@ public interface TusRuntimeConfig {
      * Seconds after which an upload lock that has seen no activity is considered abandoned and
      * may be reclaimed. A lock is refreshed as long as bytes are flowing, so this only bounds a
      * holder that died or stalled — set it above the longest pause a healthy client may make
-     * mid-chunk. Applies to the bundled local file store.
+     * mid-chunk. Set to 0 to disable reclamation: a lock is then held until released. Applies
+     * to the bundled local file store.
      */
     @WithDefault("30")
     long lockTimeoutSeconds();

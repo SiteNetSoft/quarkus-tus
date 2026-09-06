@@ -1,0 +1,13 @@
+name: "TUS client"
+description: "Client for the tus 1.0.0 resumable-upload protocol: one call per protocol operation, plus a resumable upload loop with progress, checksums, defer-length and parallel upload via concatenation"
+artifactId: "quarkus-tus-client"
+metadata:
+  keywords:
+    - "tus"
+    - "upload"
+    - "resumable"
+    - "client"
+  categories:
+    - "web"
+  status: "preview"
+  guide: "https://sitenetsoft.org/quarkus-tus/client/"
