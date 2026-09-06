@@ -1,4 +1,5 @@
 = Configuration Reference
+:description: Every quarkus.tus.* property of the server extension: build-time and runtime keys, defaults, and what each one asks of your store.
 
 include::./includes/attributes.adoc[]
 

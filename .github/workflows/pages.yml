@@ -1,0 +1,53 @@
+name: Deploy docs to GitHub Pages
+
+# The published site is generated from the Antora pages in docs/modules/ROOT,
+# so the docs cannot drift from the repository. Styling comes from
+# sitenetsoft.org's stylesheet at runtime, which is why no CSS is vendored
+# here. The build fails on any broken xref, so a bad link never reaches Pages.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - docs/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/site/package-lock.json
+
+      - run: npm ci
+        working-directory: docs/site
+
+      - name: Build the docs site
+        run: npm run build
+        working-directory: docs/site
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: build/site
+
+  deploy:
+    needs: build
+    uses: SiteNetSoft/GitHub-Actions/.github/workflows/deploy-pages.yml@master

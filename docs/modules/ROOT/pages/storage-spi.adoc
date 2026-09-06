@@ -197,7 +197,7 @@ If neither design suits, do not advertise `checksum`: a store that cannot honour
 
 The `org.sitenetsoft:quarkus-tus-tck` artifact contains `AbstractUploadStoreContractTest`, an abstract JUnit 5 class that checks a store against every rule above. Add it to your test classpath and extend it:
 
-[source,groovy]
+[source,groovy,subs="attributes+"]
 ----
 testImplementation 'org.sitenetsoft:quarkus-tus-tck:{project-version}'
 ----

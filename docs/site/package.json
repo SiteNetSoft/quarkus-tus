@@ -1,0 +1,21 @@
+{
+  "name": "quarkus-tus-docs",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Builds the quarkus-tus documentation site from the Antora pages in docs/modules/ROOT.",
+  "homepage": "https://sitenetsoft.org/quarkus-tus/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SiteNetSoft/quarkus-tus.git"
+  },
+  "author": "SiteNetSoft (https://sitenetsoft.org/)",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "node build.js"
+  },
+  "devDependencies": {
+    "asciidoctor": "^3.0.4",
+    "highlight.js": "^11.11.1"
+  }
+}

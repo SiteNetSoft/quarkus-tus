@@ -49,3 +49,6 @@ replay_pid*.log
 
 # Local tooling state
 .claude/
+
+# Documentation site tooling (docs/site)
+docs/site/node_modules/

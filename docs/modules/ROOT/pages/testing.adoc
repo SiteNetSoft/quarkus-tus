@@ -1,4 +1,5 @@
 = Testing
+:description: Testing an application that uses quarkus-tus: the in-memory store, REST-assured against the TUS endpoints, SSE, and integration tests in JVM and native mode.
 
 include::./includes/attributes.adoc[]
 
