@@ -51,6 +51,15 @@ class FileUploadSource implements UploadSource {
     private Multi<Buffer> readAndClose(AsyncFile asyncFile) {
         return asyncFile.toMulti()
                 .map(io.vertx.mutiny.core.buffer.Buffer::getDelegate)
-                .onTermination().call((failure, cancelled) -> asyncFile.close());
+                .onTermination().call((failure, cancelled) -> {
+                    // A slice is usually cancelled once a chunk's worth has been read, while the file
+                    // still has a read in flight. Closing completes that read with a
+                    // ClosedChannelException, which the stream's exception handler would hand to an
+                    // already-terminated subscriber and Mutiny would log as dropped. It is the
+                    // expected outcome of the close, so swallow it here. A null handler would be
+                    // worse: Vert.x then logs the exception itself.
+                    asyncFile.getDelegate().exceptionHandler(ignored -> { });
+                    return asyncFile.close();
+                });
     }
 }
