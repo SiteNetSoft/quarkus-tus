@@ -89,7 +89,7 @@ public class UploadEventHandler {
 
 ## Building from Source
 
-Requires **Java 25** and **Gradle 9.7.1** (wrapper included).
+Requires **Java 25** and **Gradle 9.8.0** (wrapper included).
 
 ```bash
 # Build all modules
@@ -126,7 +126,7 @@ Read the [full documentation](docs/modules/ROOT/pages/index.adoc) for detailed g
 
 | Extension Version | Quarkus Version | Java Version |
 |---|---|---|
-| 1.0.0 | 3.39.5 | 25 |
+| 1.0.0 | 3.40.1 | 25 |
 | 0.1.0 | 3.38.0 | 25 |
 
 ### Stability
